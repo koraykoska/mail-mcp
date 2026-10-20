@@ -1552,7 +1552,7 @@ export class MailService {
         special.archive ?? '',
       ];
       messages = dedupeMessages(messages, prefer);
-      const threadIds = threadIdSet(messages, seed);
+      const threadIds = threadIdSet(messages, [seed, ...outsideMessages]);
       const excludedMatches = walkedOutside
         ? excludedFromMentions(mentionsByMailbox(outsideMessages), paths, threadIds)
         : await this.excludedFolderHits(account.id, session, paths, threadIds);
@@ -3632,13 +3632,16 @@ function mentionIds(message: ConversationMessage): string[] {
     .filter((item) => item.length > 0);
 }
 
-/** Item ids, ids those items cite, and the seed's own ids. */
+/**
+ * Every id the closure discovered: item ids, ids those items cite, the seed's
+ * ids, and ids that appear only on out-of-scope messages, followed transitively.
+ */
 function threadIdSet(
   messages: readonly ConversationMessage[],
-  seed: ConversationMessage,
+  extras: readonly ConversationMessage[],
 ): string[] {
   const ids = new Set<string>();
-  for (const message of [...messages, seed]) {
+  for (const message of [...messages, ...extras]) {
     for (const id of mentionIds(message)) {
       ids.add(id);
     }
