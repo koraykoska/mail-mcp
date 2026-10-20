@@ -13,6 +13,6 @@ Integration tests need GreenMail on ports 3143 (IMAP), 3993 (IMAPS), 3025 (SMTP)
 
 The scripted IMAP tests do not start GreenMail. They cover authentication failure, a refused SEARCH, a server without MOVE or UIDPLUS, and a UIDVALIDITY change. GreenMail covers a smaller capability set. Dovecot covers THREAD, SORT, ESEARCH, CONDSTORE, QRESYNC, NAMESPACE, ID, SPECIAL-USE, and real STARTTLS, including the UIDPLUS-less and IDLE-less variants.
 
-End-to-end tests spawn the built server over stdio. `node scripts/pack-smoke.mjs node` runs the packed `mail-mcp` command through `npx`, a global install, and the symlink shim. `node scripts/pack-smoke.mjs bun` runs it through `bunx`. Each path prints the version, completes MCP initialize, and calls `mail_list_accounts`.
+End-to-end tests spawn the built server over stdio. `node scripts/pack-smoke.mjs node` runs the packed `mail-mcp` command through `npx`, a global install, and the symlink shim. `node scripts/pack-smoke.mjs bun` runs `bunx @koraykoska/mail-mcp`. The packed file is `koraykoska-mail-mcp-<version>.tgz`. Each path prints the version, completes MCP initialize, and calls `mail_list_accounts`.
 
 Fixtures in `test/fixtures/messages.ts` include multipart/mixed, multipart/alternative with encoded words, `message/rfc822`, a calendar part, an S/MIME signed wrapper, and a body whose charset is unknown.

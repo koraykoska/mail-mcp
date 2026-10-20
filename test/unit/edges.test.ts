@@ -23,7 +23,8 @@ import * as api from '../../src/index.js';
 describe('edges', () => {
   it('exports the public API and renders rough HTML', () => {
     expect(api.VERSION).toMatch(/\d+\.\d+\.\d+/);
-    expect(api.PACKAGE_NAME).toBe('mail-mcp');
+    expect(api.PACKAGE_NAME).toBe('@koraykoska/mail-mcp');
+    expect(api.SERVER_NAME).toBe('mail-mcp');
     expect(htmlToRoughText('<style>x</style><p>A &amp; B<br>&#65;</p>')).toContain('A & B');
     expect(
       findTextPart({

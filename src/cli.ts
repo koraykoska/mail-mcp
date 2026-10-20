@@ -9,7 +9,7 @@ import { createLogger, parseLogLevel } from './log.js';
 import { redactText, redactValue } from './redact.js';
 import { createRuntime } from './runtime.js';
 import { createMcpServer } from './server.js';
-import { PACKAGE_NAME, VERSION } from './version.js';
+import { SERVER_NAME, VERSION } from './version.js';
 
 interface ParsedArgs {
   help: boolean;
@@ -36,7 +36,7 @@ export async function run(argv: string[], env: NodeJS.ProcessEnv = process.env):
     return 0;
   }
   if (args.version) {
-    process.stdout.write(`${PACKAGE_NAME} ${VERSION}\n`);
+    process.stdout.write(`${SERVER_NAME} ${VERSION}\n`);
     return 0;
   }
   let config;

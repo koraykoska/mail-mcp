@@ -14,8 +14,8 @@ const packJson = execFileSync('npm', ['pack', '--json', '--ignore-scripts'], {
 });
 const packed = JSON.parse(packJson);
 const filename = packed[0]?.filename;
-if (!filename) {
-  throw new Error('npm pack did not produce a tarball');
+if (!filename || !/^koraykoska-mail-mcp-\d+\.\d+\.\d+.*\.tgz$/.test(filename)) {
+  throw new Error(`npm pack produced an unexpected tarball name: ${filename ?? 'none'}`);
 }
 const tarball = path.join(root, filename);
 const dir = mkdtempSync(path.join(tmpdir(), 'mail-mcp-pack-'));
@@ -32,7 +32,7 @@ try {
     await exercise(shim, [], dir);
   } else {
     const bun = process.env.BUN_BIN || 'bun';
-    await exercise(bun, ['x', '--bun', 'mail-mcp'], dir);
+    await exercise(bun, ['x', '--bun', '@koraykoska/mail-mcp'], dir);
   }
   process.stdout.write(`pack smoke ok (${mode})\n`);
 } finally {

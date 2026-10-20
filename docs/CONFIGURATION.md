@@ -125,4 +125,4 @@ Any client that launches a local stdio server can use:
 }
 ```
 
-`npx -y mail-mcp` or `bunx mail-mcp` can replace a global `mail-mcp` install. Add `--config` and the file path to `args` when you use a file.
+`npx -y @koraykoska/mail-mcp` or `bunx @koraykoska/mail-mcp` can replace a global `mail-mcp` install. Add `--config` and the file path to `args` when you use a file.
