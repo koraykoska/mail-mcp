@@ -1,6 +1,6 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { MailService } from './service/mail-service.js';
-import { PACKAGE_NAME, VERSION } from './version.js';
+import { SERVER_NAME, VERSION } from './version.js';
 import { registerPrompts } from './mcp/prompts.js';
 import { registerResources } from './mcp/resources.js';
 import { registerTools } from './tools/register.js';
@@ -12,7 +12,7 @@ import { registerTools } from './tools/register.js';
 export function createMcpServer(service: MailService): McpServer {
   const server = new McpServer(
     {
-      name: PACKAGE_NAME,
+      name: SERVER_NAME,
       version: VERSION,
       title: 'Mail',
       websiteUrl: 'https://github.com/koraykoska/mail-mcp',

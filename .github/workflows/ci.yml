@@ -126,7 +126,7 @@ jobs:
         if: matrix.runtime == 'node' && matrix.version == '22'
         run: |
           npm pack --json
-          sha256sum mail-mcp-*.tgz > mail-mcp.sha256
+          sha256sum koraykoska-mail-mcp-*.tgz > koraykoska-mail-mcp.sha256
 
       - name: Upload the tested tarball
         if: matrix.runtime == 'node' && matrix.version == '22'
@@ -134,8 +134,8 @@ jobs:
         with:
           name: package-tarball
           path: |
-            mail-mcp-*.tgz
-            mail-mcp.sha256
+            koraykoska-mail-mcp-*.tgz
+            koraykoska-mail-mcp.sha256
           if-no-files-found: error
 
       - name: Pack smoke (npx, global install, symlink)

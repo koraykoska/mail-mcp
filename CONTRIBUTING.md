@@ -15,15 +15,13 @@ Use a normal feature branch. The repository history is authored as Koray Koska `
 
 ## Package name
 
-The published name is the unscoped package `mail-mcp`, and the executable is also `mail-mcp`, so `npx -y mail-mcp` and `bunx mail-mcp` work.
-
-If the registry rejects that name, switch to the scoped package with one edit: set `"name"` in `package.json` to `@koraykoska/mail-mcp`. Leave `"bin"."mail-mcp"` as `./dist/cli.js`. Stage it with `npm stage publish --access public`. Clients then install `@koraykoska/mail-mcp`; the executable name stays `mail-mcp`. The release workflow reads the name from `package.json`, so it does not need a second change.
+The published name is `@koraykoska/mail-mcp`. The executable stays `mail-mcp`, from `"bin"."mail-mcp"`. Install it with `npx -y @koraykoska/mail-mcp` or `bunx @koraykoska/mail-mcp`. `npm pack` writes `koraykoska-mail-mcp-<version>.tgz`. Stage a release with `npm stage publish <tarball> --access public --provenance`.
 
 ## Release
 
 See `docs/RELEASING.md`. Short version:
 
-`0.0.1` is the manual bootstrap. `npm login`, then `npm stage publish --access public` of the tested tarball, approve with 2FA, then configure the trusted publisher on npmjs.com (owner `koraykoska`, repository `mail-mcp`, workflow filename `release.yml`, stage publish allowed). That configuration must complete its first CI publish within 2 days. Then set **Require two-factor authentication and disallow tokens**. There is no `NPM_TOKEN`.
+`0.0.1` is the manual bootstrap. `npm login`, then `npm publish koraykoska-mail-mcp-0.0.1.tgz --access public`, then configure the trusted publisher on the `@koraykoska/mail-mcp` package page (owner `koraykoska`, repository `mail-mcp`, workflow filename `release.yml`, stage publish allowed). That configuration must complete its first CI publish within 2 days. Then set **Require two-factor authentication and disallow tokens**. There is no `NPM_TOKEN`.
 
 `0.1.0` is the first tag-triggered trusted-publishing release. Bump the version on `main`, tag `v0.1.0` locally, push that tag, and approve the staged version the workflow prints. Later tags follow that same path. `workflow_dispatch` only bumps, commits, and pushes the branch. It does not push the tag.
 

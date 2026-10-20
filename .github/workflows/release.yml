@@ -63,8 +63,8 @@ jobs:
             echo "::error::Tag $tag does not match package version $version."
             exit 1
           fi
-          tarball=$(ls mail-mcp-*.tgz)
-          sha256sum -c mail-mcp.sha256
+          tarball=$(ls koraykoska-mail-mcp-*.tgz)
+          sha256sum -c koraykoska-mail-mcp.sha256
           dist_tag=latest
           case "$version" in
             *-*) dist_tag=next ;;
@@ -73,7 +73,7 @@ jobs:
           echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
           echo "dist_tag=$dist_tag" >> "$GITHUB_OUTPUT"
           if [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
-            echo "::error::Trusted publishing is not available to this job. id-token: write is required, and a trusted publisher for workflow release.yml must already exist on npmjs.com. v0.0.1 is published by hand first. See docs/RELEASING.md."
+            echo "::error::Trusted publishing is not available to this job. id-token: write is required, and a trusted publisher for @koraykoska/mail-mcp and workflow release.yml must already exist on the scoped package page. v0.0.1 is published by hand first. See docs/RELEASING.md."
             exit 1
           fi
 
@@ -88,7 +88,7 @@ jobs:
           printf '%s\n' "$output"
           if [ "$status" -ne 0 ]; then
             if printf '%s\n' "$output" | grep -Eqi 'ENEEDAUTH|unable to authenticate|trusted publisher|E401|E404|OIDC|npm whoami'; then
-              echo "::error::npm trusted publishing rejected this workflow. Publish v0.0.1 by hand, configure the trusted publisher for koraykoska/mail-mcp workflow release.yml with stage publish allowed, and complete the first CI publish within 2 days. See docs/RELEASING.md. There is no NPM_TOKEN fallback."
+              echo "::error::npm trusted publishing rejected this workflow. Publish v0.0.1 by hand with npm publish koraykoska-mail-mcp-0.0.1.tgz --access public, configure the trusted publisher on the @koraykoska/mail-mcp package page for koraykoska/mail-mcp workflow release.yml with stage publish allowed, and complete the first CI publish within 2 days. See docs/RELEASING.md. There is no NPM_TOKEN fallback."
             fi
             exit "$status"
           fi
@@ -125,7 +125,7 @@ jobs:
           {
             echo "## npm stage pending approval"
             echo
-            echo "Package \`mail-mcp@${version}\` is staged and not on the registry yet."
+            echo "Package \`@koraykoska/mail-mcp@${version}\` is staged and not on the registry yet."
             echo
             echo "- stage id: \`${stage}\`"
             echo "- dist-tag: \`${dist}\`"

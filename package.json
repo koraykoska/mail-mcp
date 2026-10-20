@@ -1,6 +1,9 @@
 {
-  "name": "mail-mcp",
+  "name": "@koraykoska/mail-mcp",
   "version": "0.0.1",
+  "publishConfig": {
+    "access": "public"
+  },
   "description": "IMAP and SMTP mail client exposed as a Model Context Protocol server",
   "type": "module",
   "license": "MIT",

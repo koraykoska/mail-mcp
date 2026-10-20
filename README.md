@@ -2,11 +2,11 @@
 
 IMAP and SMTP mail client as a [Model Context Protocol](https://modelcontextprotocol.io) server. An MCP client can list mailboxes, search and read messages, change flags, manage folders and drafts, and send mail over the same accounts a desktop client would use.
 
-The package name on npm is `mail-mcp`. The executable is `mail-mcp`.
+The package name on npm is `@koraykoska/mail-mcp`. The executable is `mail-mcp`.
 
 ```bash
-npx -y mail-mcp --help
-bunx mail-mcp --help
+npx -y @koraykoska/mail-mcp --help
+bunx @koraykoska/mail-mcp --help
 mail-mcp --version
 ```
 
@@ -43,7 +43,7 @@ Logs are written to stderr. Stdout is reserved for the protocol.
   "mcpServers": {
     "mail": {
       "command": "npx",
-      "args": ["-y", "mail-mcp"],
+      "args": ["-y", "@koraykoska/mail-mcp"],
       "env": {
         "MAIL_IMAP_HOST": "imap.example.com",
         "MAIL_IMAP_PORT": "993",
