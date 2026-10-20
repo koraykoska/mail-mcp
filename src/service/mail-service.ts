@@ -49,6 +49,7 @@ import {
   conversationThreadKey,
   dedupeMessages,
   normalizeMessageId,
+  threadKeyFor,
   type ConversationMessage,
   type LinkKind,
 } from '../thread/walk.js';
@@ -92,7 +93,6 @@ import { htmlToSafeText, quoteHtml, sanitizeHtml, textToHtml } from '../mime/htm
 import { hasHighOctets, stripBcc } from '../mime/transfer.js';
 import { headerValue, messageIds } from '../mime/headers.js';
 import {
-  allowlistedHeaderEntries,
   assertDraftHeaders,
   guardOutboundHeaders,
   readRawHeaderFields,
@@ -1332,7 +1332,7 @@ export class MailService {
       assertAllowedSender(account, address, label),
     );
     const parsed = await parseRawMessage(source);
-    const recipients = [...asMail(parsed.to), ...asMail(parsed.cc), ...asMail(parsed.bcc)];
+    const recipients = [...stored.to, ...stored.cc, ...stored.bcc];
     assertRecipients(account, recipients);
     const selected = selectIdentity({
       identities: account.identities,
@@ -1367,9 +1367,9 @@ export class MailService {
           );
     const built = await this.outboundFromParts(account, {
       from: identity.address,
-      to: asMail(parsed.to),
-      cc: asMail(parsed.cc),
-      bcc: asMail(parsed.bcc),
+      to: stored.to,
+      cc: stored.cc,
+      bcc: stored.bcc,
       ...(chosenReply.length > 0 ? { replyTo: chosenReply } : {}),
       subject: parsed.subject,
       ...(parsed.text !== undefined ? { text: parsed.text } : {}),
@@ -1398,7 +1398,7 @@ export class MailService {
     if (parsed.references.length > 0) {
       built.message.references = parsed.references.join(' ');
     }
-    const kept = { ...allowlistedHeaderEntries(parsed.headers), ...stored.kept };
+    const kept = { ...stored.rawHeaders, ...stored.kept };
     if (Object.keys(kept).length > 0) {
       built.message.headers = { ...(built.message.headers ?? {}), ...kept };
     }
@@ -1495,6 +1495,9 @@ export class MailService {
         : new Map<string, string>();
       const special = await this.special(account, session);
       const seeded = await this.seedMessage(session, account, input);
+      if (!seeded.seed) {
+        return excludedOnlyThread(account.id, input.messageId, order, seeded.folderHits);
+      }
       const seed = seeded.seed;
       const paths =
         input.folders !== undefined
@@ -1544,6 +1547,23 @@ export class MailService {
         special.archive ?? '',
       ];
       messages = dedupeMessages(messages, prefer);
+      const threadIds = messages.flatMap((item) => {
+        const id = normalizeMessageId(item.messageId);
+        return id ? [id] : [];
+      });
+      const seedId = normalizeMessageId(seed.messageId);
+      if (seedId) {
+        threadIds.push(seedId);
+      }
+      const inScope = new Set(paths);
+      const excludedMatches =
+        input.folders !== undefined
+          ? []
+          : seeded.folderHits.length > 0
+            ? seeded.folderHits
+                .filter((hit) => hit.count > 0 && !inScope.has(hit.mailbox))
+                .sort((left, right) => comparePath(left.mailbox, right.mailbox))
+            : await this.excludedFolderHits(session, paths, threadIds);
       if (cursor) {
         messages = messages.filter((item) => {
           const folder = cursor.folders.find((entry) => entry.mailbox === item.mailbox);
@@ -1684,10 +1704,6 @@ export class MailService {
           ...(input.includeBodies ? { text, textTruncated } : {}),
         });
       }
-      const inScope = new Set(paths);
-      const excludedMatches = seeded.folderHits
-        .filter((hit) => hit.count > 0 && !inScope.has(hit.mailbox))
-        .sort((left, right) => comparePath(left.mailbox, right.mailbox));
       return {
         ok: true as const,
         account: account.id,
@@ -2497,7 +2513,7 @@ export class MailService {
       folders?: unknown;
     },
   ): Promise<{
-    seed: ConversationMessage;
+    seed: ConversationMessage | null;
     matchedMailboxes: string[];
     folderHits: Array<{ mailbox: string; count: number }>;
   }> {
@@ -2507,7 +2523,29 @@ export class MailService {
         const summary = await this.requireSummary(box, input.uid ?? 0);
         return this.conversationFrom(box, summary, input.mailbox ?? 'INBOX', 'header');
       });
-      return { seed, matchedMailboxes: [seed.mailbox], folderHits: [] };
+      const matched = [seed.mailbox];
+      const seedId = normalizeMessageId(seed.messageId);
+      if (seedId && input.folders === undefined) {
+        const listed = await session.listMailboxes();
+        const special = await this.special(account, session);
+        const excluded = new Set(
+          [special.trash, special.junk].filter((item): item is string => Boolean(item)),
+        );
+        for (const mailbox of listed) {
+          if (
+            !mailboxSelectable(mailbox) ||
+            mailbox.path === seed.mailbox ||
+            excluded.has(mailbox.path)
+          ) {
+            continue;
+          }
+          const found = await this.searchHeaderIds(session, mailbox.path, [seedId]);
+          if (found.some((item) => normalizeMessageId(item.messageId) === seedId)) {
+            matched.push(mailbox.path);
+          }
+        }
+      }
+      return { seed, matchedMailboxes: uniquePaths(matched), folderHits: [] };
     }
     const id = normalizeMessageId(input.messageId);
     if (!id) {
@@ -2550,8 +2588,16 @@ export class MailService {
       matchedMailboxes.push(mailbox);
       openHits.push(...exact);
     }
-    const pool = openHits.length > 0 ? openHits : excludedHits;
-    const seed = [...pool].sort((left, right) => {
+    if (openHits.length === 0) {
+      if (excludedHits.length === 0) {
+        throw new MailError(
+          'NOT_FOUND',
+          `No message with Message-ID ${input.messageId} was found.`,
+        );
+      }
+      return { seed: null, matchedMailboxes: [], folderHits };
+    }
+    const seed = [...openHits].sort((left, right) => {
       const pref =
         (left.mailbox.toUpperCase() === 'INBOX' ? 0 : 1) -
         (right.mailbox.toUpperCase() === 'INBOX' ? 0 : 1);
@@ -2568,9 +2614,6 @@ export class MailService {
     })[0];
     if (!seed) {
       throw new MailError('NOT_FOUND', `No message with Message-ID ${input.messageId} was found.`);
-    }
-    if (openHits.length === 0) {
-      matchedMailboxes.push(seed.mailbox);
     }
     return {
       seed,
@@ -2634,6 +2677,31 @@ export class MailService {
       message.autoSubmitted = headers.autoSubmitted;
     }
     return message;
+  }
+
+  private async excludedFolderHits(
+    session: ImapSession,
+    paths: readonly string[],
+    ids: readonly string[],
+  ): Promise<Array<{ mailbox: string; count: number }>> {
+    const wanted = [...new Set(ids.map((item) => normalizeMessageId(item)).filter(Boolean))];
+    if (wanted.length === 0) {
+      return [];
+    }
+    const inScope = new Set(paths);
+    const listed = await session.listMailboxes();
+    const hits: Array<{ mailbox: string; count: number }> = [];
+    for (const mailbox of listed) {
+      if (!mailboxSelectable(mailbox) || inScope.has(mailbox.path)) {
+        continue;
+      }
+      const found = await this.searchHeaderIds(session, mailbox.path, wanted);
+      if (found.length > 0) {
+        hits.push({ mailbox: mailbox.path, count: found.length });
+      }
+    }
+    hits.sort((left, right) => comparePath(left.mailbox, right.mailbox));
+    return hits;
   }
 
   private async searchHeaderIds(
@@ -2878,7 +2946,7 @@ export class MailService {
   ): Promise<{ message: OutboundMessage; identity: IdentityChoice }> {
     const identity = this.resolveFrom(account, input.from);
     const from = identity.address;
-    const to = normalizeRecipients(input.to);
+    const to = replyAddresses(normalizeRecipients(input.to));
     if (to.length === 0 && !input.allowEmptyRecipients) {
       throw new MailError('INVALID_ARGUMENT', 'At least one To recipient is required.');
     }
@@ -2887,8 +2955,8 @@ export class MailService {
       to,
       subject: input.subject ?? '',
     };
-    const cc = normalizeRecipients(input.cc);
-    const bcc = normalizeRecipients(input.bcc);
+    const cc = replyAddresses(normalizeRecipients(input.cc));
+    const bcc = replyAddresses(normalizeRecipients(input.bcc));
     const replyTo = normalizeRecipients(input.replyTo);
     const chosenReply = replyAddresses(
       replyTo.length > 0 ? replyTo : configuredReplyTo(account, identity.email),
@@ -3168,6 +3236,36 @@ function publicHeaders(parsed: ParsedMessage): Record<string, unknown> {
     listUnsubscribe: parsed.headers['list-unsubscribe'] ?? null,
     autoSubmitted: parsed.headers['auto-submitted'] ?? null,
     authenticationResults: parsed.headers['authentication-results'] ?? null,
+  };
+}
+
+function excludedOnlyThread(
+  accountId: string,
+  messageId: string | undefined,
+  order: PageOrder,
+  folderHits: Array<{ mailbox: string; count: number }>,
+): Record<string, unknown> {
+  const excludedMatches = folderHits
+    .filter((hit) => hit.count > 0)
+    .sort((left, right) => comparePath(left.mailbox, right.mailbox));
+  const threadKey = messageId
+    ? threadKeyFor({ messageId, mailbox: '', uid: 0, uidValidity: '' })
+    : 'uid:::0';
+  return {
+    ok: true as const,
+    account: accountId,
+    threadKey,
+    tree: [],
+    rounds: 0,
+    items: [],
+    messages: [],
+    nextCursor: null,
+    total: 0,
+    offset: 0,
+    truncated: false,
+    order,
+    snapshot: { folders: [] },
+    excludedMatches,
   };
 }
 

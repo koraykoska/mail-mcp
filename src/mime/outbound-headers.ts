@@ -35,26 +35,59 @@ export const HEADER_ALLOWLIST = new Set([
 ]);
 
 /**
- * X- names that are aliases of routing or receipt headers. Other X-* fields stay allowed.
- * Documented in README and docs/SECURITY.md.
+ * Header names a custom header must not set. An X- name is denied when the
+ * remainder after the X- prefix equals one of these, or starts with resent- or
+ * apparently-.
  */
-export const DENIED_X_HEADERS = [
-  'X-Reply-To',
-  'X-Confirm-Reading-To',
-  'X-Sender',
-  'X-Envelope-From',
-  'X-Envelope-Sender',
-  'X-Envelope-To',
-  'X-Original-From',
-  'X-Original-Sender',
-  'X-Original-To',
-  'X-Original-Recipient',
-  'X-Apparently-From',
-  'X-Apparently-To',
-  'X-Rcpt-To',
-] as const;
+const ROUTING_HEADER_NAMES = new Set([
+  'from',
+  'sender',
+  'reply-to',
+  'to',
+  'cc',
+  'bcc',
+  'return-path',
+  'errors-to',
+  'disposition-notification-to',
+  'return-receipt-to',
+  'read-receipt-to',
+  'mail-reply-to',
+  'mail-followup-to',
+  'message-id',
+  'resent-from',
+  'resent-sender',
+  'resent-to',
+  'resent-cc',
+  'resent-bcc',
+  'resent-reply-to',
+  'resent-message-id',
+  'resent-date',
+  'apparently-from',
+  'apparently-to',
+  'original-from',
+  'original-sender',
+  'original-to',
+  'original-recipient',
+  'envelope-from',
+  'envelope-sender',
+  'envelope-to',
+  'confirm-reading-to',
+  'rcpt-to',
+]);
 
-const DENIED_X_HEADER_SET = new Set<string>(DENIED_X_HEADERS.map((name) => name.toLowerCase()));
+/** Substrings that mark an X- name as a routing or receipt alias. Hyphens are ignored. */
+const X_DENY_KEYWORDS = [
+  'reply',
+  'receipt',
+  'notification',
+  'errors',
+  'sender',
+  'envelope',
+  'rcpt',
+  'bounce',
+  'resent',
+  'followup',
+] as const;
 
 const STRUCTURED_FIELD: Record<string, string> = {
   from: 'from',
@@ -116,8 +149,15 @@ export function isHeaderToken(canonical: string): boolean {
 }
 
 function headerHint(canonical: string): string {
-  if (DENIED_X_HEADER_SET.has(canonical)) {
-    return `The ${canonical} header is an alias of a routing or receipt field. Use from, replyTo, to, cc, or bcc. Other X-* headers are allowed. Denied: ${DENIED_X_HEADERS.join(', ')}.`;
+  if (canonical.startsWith('x-') && routingHeaderDenied(canonical)) {
+    return (
+      'An X- header is rejected when the name after X- is a routing or receipt header ' +
+      '(From, Sender, Reply-To, To, Cc, Bcc, Resent-*, Return-Path, Errors-To, ' +
+      'Disposition-Notification-To, Return-Receipt-To, Read-Receipt-To, Mail-Reply-To, ' +
+      'Mail-Followup-To, Apparently-*, Original-*, Envelope-*), or when it contains ' +
+      'reply, receipt, notification, errors, sender, envelope, rcpt, bounce, resent, or followup. ' +
+      'Other X-* headers are allowed.'
+    );
   }
   const field = STRUCTURED_FIELD[canonical];
   if (field) {
@@ -130,8 +170,40 @@ export function isFieldName(name: string): boolean {
   return FIELD_NAME.test(name);
 }
 
+/**
+ * True when `canonical` is a routing or receipt header, or an X- alias of one.
+ * The remainder after a leading `x-` is compared to the rejected header names.
+ * A remainder that contains reply, receipt, notification, errors, sender,
+ * envelope, rcpt, bounce, resent, or followup is denied as well. Other X-* names
+ * are not denied here.
+ */
+export function routingHeaderDenied(canonical: string): boolean {
+  const name = canonical.toLowerCase();
+  if (routingNameDenied(name)) {
+    return true;
+  }
+  if (!name.startsWith('x-')) {
+    return false;
+  }
+  let remainder = name.slice(2);
+  while (remainder.startsWith('x-')) {
+    remainder = remainder.slice(2);
+  }
+  if (!remainder || routingNameDenied(remainder)) {
+    return true;
+  }
+  const flat = remainder.replace(/[-_]/g, '');
+  return X_DENY_KEYWORDS.some((word) => flat.includes(word));
+}
+
+function routingNameDenied(name: string): boolean {
+  return (
+    ROUTING_HEADER_NAMES.has(name) || name.startsWith('resent-') || name.startsWith('apparently-')
+  );
+}
+
 function headerAllowed(canonical: string): boolean {
-  if (DENIED_X_HEADER_SET.has(canonical)) {
+  if (routingHeaderDenied(canonical)) {
     return false;
   }
   return canonical.startsWith('x-') || HEADER_ALLOWLIST.has(canonical);
@@ -192,8 +264,16 @@ export interface DraftAddressHeaders {
   from: MailAddress[];
   sender: MailAddress[];
   replyTo: MailAddress[];
-  /** Address headers other than From, Sender, Reply-To, Bcc, and Resent-Bcc, already sanitized. */
+  to: MailAddress[];
+  cc: MailAddress[];
+  bcc: MailAddress[];
+  /** Address headers other than From, Sender, Reply-To, To, Cc, Bcc, and Resent-Bcc, already sanitized. */
   kept: Record<string, string>;
+  /**
+   * Allow-listed headers taken from the raw header block. Keys are the original
+   * field names and values are the raw field values, not mailparser keys.
+   */
+  rawHeaders: Record<string, string>;
 }
 
 const SINGLETON_HEADERS = ['from', 'sender', 'reply-to'] as const;
@@ -308,11 +388,18 @@ export function assertDraftHeaders(
   const from: MailAddress[] = [];
   const sender: MailAddress[] = [];
   const replyTo: MailAddress[] = [];
+  const to: MailAddress[] = [];
+  const cc: MailAddress[] = [];
+  const bcc: MailAddress[] = [];
   const keptLists = new Map<string, MailAddress[]>();
+  const rawKept = new Map<string, { name: string; values: string[] }>();
   for (const field of fields) {
     const canonical = field.name.toLowerCase();
     counts.set(canonical, (counts.get(canonical) ?? 0) + 1);
-    if (DENIED_X_HEADER_SET.has(canonical) || STORED_REJECTED_HEADERS.has(canonical)) {
+    if (
+      (canonical.startsWith('x-') && routingHeaderDenied(canonical)) ||
+      STORED_REJECTED_HEADERS.has(canonical)
+    ) {
       throw new MailError(
         'PERMISSION_DENIED',
         `The ${field.name} header cannot be sent from a draft.`,
@@ -326,7 +413,26 @@ export function assertDraftHeaders(
         headerHint(canonical),
       );
     }
+    if (canonical === 'to' || canonical === 'cc' || canonical === 'bcc') {
+      const sanitized = parseStoredAddresses(field.name, field.value);
+      if (canonical === 'to') {
+        to.push(...sanitized);
+      } else if (canonical === 'cc') {
+        cc.push(...sanitized);
+      } else {
+        bcc.push(...sanitized);
+      }
+      continue;
+    }
     if (!STORED_ADDRESS_HEADERS.has(canonical)) {
+      if (headerAllowed(canonical)) {
+        const existing = rawKept.get(canonical);
+        if (existing) {
+          existing.values.push(field.value);
+        } else {
+          rawKept.set(canonical, { name: field.name, values: [field.value] });
+        }
+      }
       continue;
     }
     const sanitized = parseStoredAddresses(field.name, field.value);
@@ -358,18 +464,32 @@ export function assertDraftHeaders(
   for (const [name, list] of keptLists) {
     kept[name] = formatAddressList(list);
   }
-  return { from, sender, replyTo, kept };
+  const rawHeaders: Record<string, string> = {};
+  for (const entry of rawKept.values()) {
+    rawHeaders[entry.name] = entry.values.join(', ');
+  }
+  return { from, sender, replyTo, to, cc, bcc, kept, rawHeaders };
 }
 
-/** Emit Reply-To from the parsed addresses. A display name that hides another address is dropped. */
+const ENCODED_WORD = /=\?[^?]+\?[bBqQ]\?[^?]*\?=/;
+
+/**
+ * Emit an address list. A display name that hides another address is dropped.
+ * The decoded name is NFKC-normalized before the `@` / `<>` check. A name that
+ * is still an encoded-word after decoding (an unknown charset) is dropped too.
+ */
 export function replyAddresses(addresses: readonly MailAddress[]): MailAddress[] {
   return addresses.map((item) => {
-    const visible = item.name ? decodeEncodedWords(item.name) : '';
-    if (!visible || /[@<>]/.test(visible)) {
+    const decoded = item.name ? decodeEncodedWords(item.name) : '';
+    if (!decoded || ENCODED_WORD.test(decoded) || unsafeDisplayName(decoded)) {
       return { address: item.address };
     }
-    return { name: visible, address: item.address };
+    return { name: decoded.normalize('NFKC'), address: item.address };
   });
+}
+
+function unsafeDisplayName(value: string): boolean {
+  return /[@<>]/.test(value.normalize('NFKC'));
 }
 
 function decodeEncodedWords(value: string): string {
@@ -387,7 +507,7 @@ function decodeEncodedWords(value: string): string {
           );
         return iconv.decode(Buffer.from(bytes, 'binary'), charset);
       } catch {
-        return value;
+        return _all;
       }
     },
   );

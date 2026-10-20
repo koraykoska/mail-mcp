@@ -22,7 +22,9 @@
 - A single-folder server SORT honors `maxSortCandidates` / `maxPerFolder` and reports `truncated`.
 - `mail_send_draft` always rebuilds `From`, `Sender`, and `Reply-To` from the checked addresses. A display name that contains another address is dropped, comments are removed, and a second copy or a field name with whitespace before the colon is `PERMISSION_DENIED`. `identityReason` is `stored-draft` when `from` is omitted.
 - Routing aliases `X-Reply-To`, `X-Confirm-Reading-To`, `X-Sender`, `X-Envelope-From`, `X-Envelope-Sender`, `X-Envelope-To`, `X-Original-From`, `X-Original-Sender`, `X-Original-To`, `X-Original-Recipient`, `X-Apparently-From`, `X-Apparently-To`, and `X-Rcpt-To` are rejected. Other `X-*` headers stay allowed.
-- A Message-ID seed with no `folders` uses the same scope as a mailbox and uid seed: the seed mailbox, INBOX, Sent, Archive, and All. Junk and Trash stay out. `excludedMatches` lists folders outside that scope that still hold a match.
+- A Message-ID seed with no `folders` uses the same scope as a mailbox and uid seed: the seed mailbox, INBOX, Sent, Archive, and All. Junk and Trash stay out. `excludedMatches` is the same list for both seeds, in path order. A message that exists only in Junk or Trash is left out of the items until `folders` names that mailbox.
+- `mail_send_draft` sanitizes display names on `To`, `Cc`, and `Bcc` the same way as `From`, and send, reply, and forward do the same for `To` and `Cc`. Names are NFKC-normalized, and a name that is still an encoded-word is dropped. Allow-listed headers are copied from the raw header block.
+- An `X-` header is rejected when the name after `X-` is a routing or receipt header, or when it contains reply, receipt, notification, errors, sender, envelope, rcpt, bounce, resent, or followup. Other `X-*` headers stay allowed.
 
 ## 0.1.0
 
