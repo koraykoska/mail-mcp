@@ -36,7 +36,7 @@ export function threadMessages(messages: ThreadableMessage[], bySubject = false)
     if (!message || !node) {
       continue;
     }
-    const parentId = parentReference(message);
+    const parentId = parentReference(message, byId, node);
     const parent = parentId ? byId.get(parentId) : undefined;
     if (parent && parent !== node) {
       parent.children.push(node);
@@ -54,13 +54,39 @@ export function threadMessages(messages: ThreadableMessage[], bySubject = false)
   return groupRootsBySubject(roots, messages);
 }
 
-function parentReference(message: ThreadableMessage): string | undefined {
+/**
+ * Nearest ancestor that is actually in this mailbox.
+ * In-Reply-To is tried first, then References from the end, skipping ids that are not present.
+ */
+function parentReference(
+  message: ThreadableMessage,
+  byId: Map<string, ThreadNode>,
+  self: ThreadNode,
+): string | undefined {
+  const ordered: string[] = [];
   if (message.inReplyTo) {
-    return normalizeId(message.inReplyTo);
+    ordered.push(message.inReplyTo);
   }
   const refs = message.references ?? [];
-  const last = refs[refs.length - 1];
-  return last ? normalizeId(last) : undefined;
+  for (let index = refs.length - 1; index >= 0; index -= 1) {
+    const ref = refs[index];
+    if (ref) {
+      ordered.push(ref);
+    }
+  }
+  const seen = new Set<string>();
+  for (const raw of ordered) {
+    const id = normalizeId(raw);
+    if (seen.has(id)) {
+      continue;
+    }
+    seen.add(id);
+    const parent = byId.get(id);
+    if (parent && parent !== self) {
+      return id;
+    }
+  }
+  return undefined;
 }
 
 function normalizeId(id: string): string {

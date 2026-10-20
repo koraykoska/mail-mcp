@@ -87,7 +87,7 @@ Annotations: readOnlyHint=true, destructiveHint=false, idempotentHint=true, open
 
 Get mailbox quota
 
-Return RFC 2087 / RFC 9208 quota resources for the account, or for one mailbox when mailbox is set. STORAGE is in kibibytes on most servers, MESSAGE is a count. Fails with CAPABILITY_UNSUPPORTED when QUOTA is not advertised. used and limit are numbers; a limit of 0 can mean unlimited on some servers.
+Return RFC 2087 / RFC 9208 quota resources for the account, or for one mailbox when mailbox is set. STORAGE used and limit are octets (bytes): the wire value is kibibytes and is converted by multiplying by 1024. MESSAGE is a count. QUOTA or QUOTA=RES-* is enough. A limit of 0 can mean unlimited on some servers.
 
 Annotations: readOnlyHint=true, destructiveHint=false, idempotentHint=true, openWorldHint=true.
 
@@ -182,7 +182,7 @@ Create mailbox
 
 Create a mailbox, including parents the server creates implicitly (CREATE of "a/b" often creates "a"). Idempotent on servers that answer "already exists" as success; otherwise a second call returns a protocol error. Blocked when the account is readOnly. Name is Unicode.
 
-Annotations: readOnlyHint=false, destructiveHint=false, idempotentHint=true, openWorldHint=true.
+Annotations: readOnlyHint=false, destructiveHint=false, idempotentHint=false, openWorldHint=true.
 
 ### Arguments
 
@@ -221,7 +221,7 @@ Delete mailbox
 
 Delete a mailbox and, on most servers, its messages. This is destructive and requires allowDelete. It does not merely unsubscribe. Refusing to delete INBOX is normal. There is no trash for the folder itself.
 
-Annotations: readOnlyHint=false, destructiveHint=true, idempotentHint=true, openWorldHint=true.
+Annotations: readOnlyHint=false, destructiveHint=true, idempotentHint=false, openWorldHint=true.
 
 ### Arguments
 
@@ -363,7 +363,7 @@ Annotations: readOnlyHint=true, destructiveHint=false, idempotentHint=true, open
 - `sort` (optional): Sort keys, most significant first. Default: arrival descending.
   - `field`: arrival is the internal received date. date is the Date header.
   - `reverse` (optional): true sorts descending. Default false (ascending). Newest-first is arrival + reverse.
-- `limit` (optional): Page size. Default is limits.pageSize (25). Values above limits.maxPageSize (100) are rejected.
+- `limit` (optional): Page size. Default is limits.pageSize (25). The schema allows up to 10000; the server rejects values above the configured limits.maxPageSize (default 100).
 - `cursor` (optional): Opaque cursor from the previous page's nextCursor. Cursors are tied to uidValidity and are not stable if the mailbox changes. Omit to start at the first page.
 - `uidValidity` (optional): Expected UIDVALIDITY decimal string from mail_get_mailbox_status or a previous list. When set, the call fails with UIDVALIDITY_CHANGED if the mailbox was recreated.
 - `includeSnippet` (optional): Include a text snippet. Default true. Set false for a faster list.
@@ -430,7 +430,7 @@ Annotations: readOnlyHint=true, destructiveHint=false, idempotentHint=true, open
 - `sort` (optional): 
   - `field`: arrival is the internal received date. date is the Date header.
   - `reverse` (optional): true sorts descending. Default false (ascending). Newest-first is arrival + reverse.
-- `limit` (optional): Page size. Default is limits.pageSize (25). Values above limits.maxPageSize (100) are rejected.
+- `limit` (optional): Page size. Default is limits.pageSize (25). The schema allows up to 10000; the server rejects values above the configured limits.maxPageSize (default 100).
 - `cursor` (optional): Opaque cursor from the previous page's nextCursor. Cursors are tied to uidValidity and are not stable if the mailbox changes. Omit to start at the first page.
 - `uidValidity` (optional): Expected UIDVALIDITY decimal string from mail_get_mailbox_status or a previous list. When set, the call fails with UIDVALIDITY_CHANGED if the mailbox was recreated.
 - `includeSnippet` (optional): Include a text snippet. Default true. Set false for a faster search.
@@ -537,7 +537,7 @@ Download an attachment
 
 Download one attachment chosen by filename, Content-ID (cid), or partIndex (0-based index in the attachment list from mail_get_message). Without savePath the bytes are base64 and must be under maxAttachmentBytes or the call fails with SIZE_LIMIT. With savePath the file is written on the machine running this server and the result contains savedPath and no base64. If attachmentsDir is configured, savePath must stay inside it.
 
-Annotations: readOnlyHint=false, destructiveHint=false, idempotentHint=true, openWorldHint=true.
+Annotations: readOnlyHint=false, destructiveHint=true, idempotentHint=false, openWorldHint=true.
 
 ### Arguments
 
@@ -609,7 +609,7 @@ Annotations: readOnlyHint=true, destructiveHint=false, idempotentHint=true, open
   - `or` (optional): Match if any nested object matches. Provide at least two clauses. IMAP OR is binary; longer lists are folded.
   - `and` (optional): Match if every nested object matches. Top-level fields are already ANDed; use this for grouped clauses.
 - `algorithm` (optional): Default REFERENCES.
-- `limit` (optional): Page size. Default is limits.pageSize (25). Values above limits.maxPageSize (100) are rejected.
+- `limit` (optional): Page size. Default is limits.pageSize (25). The schema allows up to 10000; the server rejects values above the configured limits.maxPageSize (default 100).
 - `cursor` (optional): Opaque cursor from the previous page's nextCursor. Cursors are tied to uidValidity and are not stable if the mailbox changes. Omit to start at the first page.
 - `uidValidity` (optional): Expected UIDVALIDITY decimal string from mail_get_mailbox_status or a previous list. When set, the call fails with UIDVALIDITY_CHANGED if the mailbox was recreated.
 
@@ -669,9 +669,9 @@ Annotations: readOnlyHint=false, destructiveHint=false, idempotentHint=false, op
 
 Move messages
 
-Move UIDs to another mailbox. Uses the MOVE extension when advertised. Otherwise copies, sets \Deleted, and expunges. Without UIDPLUS that expunge can remove other \Deleted messages, so the fallback is refused unless allowPermanentDelete is true. Requires allowDelete. Destination must exist.
+Move UIDs to another mailbox. Uses MOVE when the server advertises it. Otherwise copies, sets \Deleted, and UID EXPUNGEs, which requires UIDPLUS. Without MOVE and UIDPLUS the call is refused, because a plain EXPUNGE would remove every \Deleted message. allowPermanentDelete does not permit that. Requires allowDelete. Destination must exist.
 
-Annotations: readOnlyHint=false, destructiveHint=false, idempotentHint=false, openWorldHint=true.
+Annotations: readOnlyHint=false, destructiveHint=true, idempotentHint=false, openWorldHint=true.
 
 ### Arguments
 
@@ -691,9 +691,9 @@ Annotations: readOnlyHint=false, destructiveHint=false, idempotentHint=false, op
 
 Delete messages
 
-Delete UIDs. By default they are moved to the resolved Trash mailbox (special-use, config, or a well-known name). permanent true instead sets \Deleted and UID EXPUNGEs them; that requires allowPermanentDelete and is not the default. Deleting messages that are already in Trash requires permanent true. Requires allowDelete. Use mail_expunge_mailbox only when you intend to purge every \Deleted message in a mailbox.
+Delete UIDs. By default they are moved to the resolved Trash mailbox (special-use, config, or a well-known name). permanent true UID EXPUNGEs only those UIDs and requires both allowPermanentDelete and UIDPLUS. Without UIDPLUS the call is refused rather than expunging every \Deleted message. Deleting messages that are already in Trash requires permanent true. Requires allowDelete. Adding \Deleted via mail_set_flags is the same delete permission. Use mail_expunge_mailbox only when you intend to purge every \Deleted message in a mailbox.
 
-Annotations: readOnlyHint=false, destructiveHint=true, idempotentHint=true, openWorldHint=true.
+Annotations: readOnlyHint=false, destructiveHint=true, idempotentHint=false, openWorldHint=true.
 
 ### Arguments
 
@@ -701,7 +701,7 @@ Annotations: readOnlyHint=false, destructiveHint=true, idempotentHint=true, open
 - `mailbox`: Mailbox path as returned by mail_list_mailboxes, in Unicode (not modified UTF-7). Nested folders use the server delimiter, often "/" or ".". Examples: "INBOX", "Projects/2026", "Entwürfe".
 - `uidValidity` (optional): Expected UIDVALIDITY decimal string from mail_get_mailbox_status or a previous list. When set, the call fails with UIDVALIDITY_CHANGED if the mailbox was recreated.
 - `uids`: IMAP UIDs to change. The server limit is limits.maxBulk (default 200). Each UID is applied separately so a failure does not hide the others when the tool returns per-item results.
-- `permanent` (optional): true expunges immediately. Default false moves to Trash. Requires allowPermanentDelete when true.
+- `permanent` (optional): true expunges immediately. Default false moves to Trash. Requires allowPermanentDelete and UIDPLUS.
 
 ### Examples
 

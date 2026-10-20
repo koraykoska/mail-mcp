@@ -15,6 +15,7 @@ interface TokenResponse {
 }
 
 const cache = new Map<string, AccessToken>();
+const inflight = new Map<string, Promise<string>>();
 
 export interface OAuthRefreshInput {
   accountId: string;
@@ -34,6 +35,7 @@ export async function getAccessToken(
   accountId: string,
   fetchImpl: typeof fetch = fetch,
   now: () => number = Date.now,
+  options?: { force?: boolean },
 ): Promise<string | undefined> {
   if (auth.type === 'password') {
     return undefined;
@@ -41,15 +43,22 @@ export async function getAccessToken(
   if (auth.type === 'xoauth2') {
     return auth.accessToken;
   }
+  if (options?.force) {
+    cache.delete(accountId);
+  }
   const cached = cache.get(accountId);
   if (cached && cached.expiresAt - now() > 60_000) {
     return cached.token;
   }
-  if (!cached && auth.accessToken) {
-    cache.set(accountId, { token: auth.accessToken, expiresAt: now() + 60_000 });
+  if (!options?.force && !cached && auth.accessToken) {
+    cache.set(accountId, { token: auth.accessToken, expiresAt: now() + 3_600_000 });
     return auth.accessToken;
   }
-  const refreshed = await refreshAccessToken(
+  const pending = inflight.get(accountId);
+  if (pending) {
+    return pending;
+  }
+  const work = refreshAccessToken(
     {
       accountId,
       tokenUrl: auth.tokenUrl,
@@ -60,9 +69,16 @@ export async function getAccessToken(
     },
     fetchImpl,
     now,
-  );
-  cache.set(accountId, refreshed);
-  return refreshed.token;
+  ).then((refreshed) => {
+    cache.set(accountId, refreshed);
+    return refreshed.token;
+  });
+  inflight.set(accountId, work);
+  try {
+    return await work;
+  } finally {
+    inflight.delete(accountId);
+  }
 }
 
 export async function refreshAccessToken(
@@ -85,6 +101,7 @@ export async function refreshAccessToken(
       method: 'POST',
       headers: { 'content-type': 'application/x-www-form-urlencoded' },
       body,
+      signal: AbortSignal.timeout(20_000),
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'network error';

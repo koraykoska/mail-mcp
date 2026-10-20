@@ -61,7 +61,10 @@ interface ComposerMail {
  * Build an RFC 5322 message. The same bytes are used for SMTP submission and the Sent APPEND
  * so the stored copy matches what was transmitted.
  */
-export async function buildRawMessage(message: OutboundMessage): Promise<Buffer> {
+export async function buildRawMessage(
+  message: OutboundMessage,
+  options?: { keepBcc?: boolean },
+): Promise<Buffer> {
   if (!message.text && !message.html && !(message.attachments && message.attachments.length > 0)) {
     throw new MailError(
       'INVALID_ARGUMENT',
@@ -111,7 +114,11 @@ export async function buildRawMessage(message: OutboundMessage): Promise<Buffer>
   }
   const composer = new MailComposer(mail);
   try {
-    return await composer.compile().build();
+    const compiled = composer.compile();
+    if (options?.keepBcc) {
+      (compiled as { keepBcc?: boolean }).keepBcc = true;
+    }
+    return await compiled.build();
   } catch (error) {
     const detail = error instanceof Error ? error.message : 'compose failed';
     throw new MailError('INVALID_ARGUMENT', `Could not build the message: ${detail}`);

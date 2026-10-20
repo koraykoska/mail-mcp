@@ -2,15 +2,25 @@ import { MailError } from './errors.js';
 
 /**
  * Reject when `work` does not settle within `ms`.
- * The underlying operation is not cancelled; callers should still close sockets on shutdown.
+ * `onTimeout` should drop the socket or abort the request so the work cannot finish later and be retried.
  */
-export async function withTimeout<T>(ms: number, label: string, work: Promise<T>): Promise<T> {
+export async function withTimeout<T>(
+  ms: number,
+  label: string,
+  work: Promise<T>,
+  onTimeout?: () => void,
+): Promise<T> {
   if (!Number.isFinite(ms) || ms <= 0) {
     return work;
   }
   let timer: NodeJS.Timeout | undefined;
   const timeout = new Promise<never>((_resolve, reject) => {
     timer = setTimeout(() => {
+      try {
+        onTimeout?.();
+      } catch {
+        // The timeout result is what the caller handles.
+      }
       reject(
         new MailError(
           'TIMEOUT',

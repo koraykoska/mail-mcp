@@ -4,18 +4,30 @@ import { delay } from '../timeout.js';
 import type { ImapSession } from './session.js';
 
 export interface ImapPool {
-  use<T>(accountId: string, fn: (session: ImapSession) => Promise<T>): Promise<T>;
+  use<T>(
+    accountId: string,
+    fn: (session: ImapSession) => Promise<T>,
+    timeoutMs?: number,
+  ): Promise<T>;
   close(): Promise<void>;
+}
+
+interface Waiter {
+  resolve: (session: ImapSession) => void;
+  reject: (error: MailError) => void;
+  timer?: NodeJS.Timeout;
 }
 
 /**
  * Small pool of IMAP sessions per account.
- * A failed connection is discarded and the operation is retried once on a new session.
+ * A slot is reserved before connect, so parallel callers cannot all pass the size check.
+ * A command that already started is never run a second time. Connection setup may retry.
  */
 export class ImapConnectionPool implements ImapPool {
   private readonly idle = new Map<string, ImapSession[]>();
   private readonly all = new Map<string, Set<ImapSession>>();
-  private readonly waiters = new Map<string, Array<(session: ImapSession) => void>>();
+  private readonly opening = new Map<string, number>();
+  private readonly waiters = new Map<string, Waiter[]>();
   private closed = false;
 
   constructor(
@@ -24,39 +36,94 @@ export class ImapConnectionPool implements ImapPool {
     private readonly logger: Logger,
   ) {}
 
-  async use<T>(accountId: string, fn: (session: ImapSession) => Promise<T>): Promise<T> {
-    const session = await this.acquire(accountId);
+  async use<T>(
+    accountId: string,
+    fn: (session: ImapSession) => Promise<T>,
+    timeoutMs?: number,
+  ): Promise<T> {
+    const session = await this.acquire(accountId, timeoutMs);
+    let dropped = false;
     try {
-      return await fn(session);
+      return await this.runBounded(session, fn, timeoutMs);
     } catch (error) {
-      if (!isRetryableConnectionError(error)) {
-        throw error;
+      if (isTerminalSessionError(error)) {
+        dropped = true;
+        await this.drop(accountId, session);
       }
-      this.logger.warn('imap operation failed, opening a new connection', { accountId });
-      await this.drop(accountId, session);
-      const fresh = await this.acquire(accountId);
-      try {
-        return await fn(fresh);
-      } finally {
-        this.release(accountId, fresh);
-      }
+      throw error;
     } finally {
-      this.release(accountId, session);
+      if (!dropped) {
+        this.release(accountId, session);
+      }
     }
   }
 
   async close(): Promise<void> {
     this.closed = true;
+    for (const [accountId, queue] of this.waiters) {
+      for (const waiter of queue) {
+        if (waiter.timer) {
+          clearTimeout(waiter.timer);
+        }
+        waiter.reject(new MailError('CONNECTION_FAILED', 'The mail client is shutting down.'));
+      }
+      this.waiters.delete(accountId);
+    }
     const sessions: ImapSession[] = [];
     for (const set of this.all.values()) {
       sessions.push(...set);
     }
     this.all.clear();
     this.idle.clear();
+    this.opening.clear();
     await Promise.all(sessions.map((session) => session.logout().catch(() => session.close())));
   }
 
-  private async acquire(accountId: string): Promise<ImapSession> {
+  private async runBounded<T>(
+    session: ImapSession,
+    fn: (session: ImapSession) => Promise<T>,
+    timeoutMs: number | undefined,
+  ): Promise<T> {
+    if (!timeoutMs || timeoutMs <= 0) {
+      return fn(session);
+    }
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      return await new Promise<T>((resolve, reject) => {
+        timer = setTimeout(() => {
+          session.close();
+          reject(
+            new MailError(
+              'TIMEOUT',
+              `IMAP timed out after ${timeoutMs}ms.`,
+              'The connection was closed so the command is not retried.',
+            ),
+          );
+        }, timeoutMs);
+        timer.unref?.();
+        fn(session).then(
+          (value) => {
+            if (timer) {
+              clearTimeout(timer);
+            }
+            resolve(value);
+          },
+          (error: unknown) => {
+            if (timer) {
+              clearTimeout(timer);
+            }
+            reject(error);
+          },
+        );
+      });
+    } finally {
+      if (timer) {
+        clearTimeout(timer);
+      }
+    }
+  }
+
+  private async acquire(accountId: string, timeoutMs?: number): Promise<ImapSession> {
     if (this.closed) {
       throw new MailError('CONNECTION_FAILED', 'The mail client is shutting down.');
     }
@@ -76,34 +143,80 @@ export class ImapConnectionPool implements ImapPool {
         }
       }
     }
-    const existing = this.all.get(accountId)?.size ?? 0;
-    if (existing < this.size) {
-      const session = await this.factory(accountId);
+    if (this.reserved(accountId) < this.size) {
+      this.opening.set(accountId, (this.opening.get(accountId) ?? 0) + 1);
       try {
-        await this.connectWithBackoff(session);
-      } catch (error) {
-        session.close();
-        throw error;
+        const session = await this.factory(accountId);
+        try {
+          await this.connectWithBackoff(session);
+        } catch (error) {
+          session.close();
+          throw error;
+        }
+        const set = this.all.get(accountId) ?? new Set<ImapSession>();
+        set.add(session);
+        this.all.set(accountId, set);
+        return session;
+      } finally {
+        const left = (this.opening.get(accountId) ?? 1) - 1;
+        if (left <= 0) {
+          this.opening.delete(accountId);
+        } else {
+          this.opening.set(accountId, left);
+        }
       }
-      const set = this.all.get(accountId) ?? new Set<ImapSession>();
-      set.add(session);
-      this.all.set(accountId, set);
-      return session;
     }
-    return new Promise((resolve) => {
+    return this.waitForSlot(accountId, timeoutMs);
+  }
+
+  private reserved(accountId: string): number {
+    return (this.all.get(accountId)?.size ?? 0) + (this.opening.get(accountId) ?? 0);
+  }
+
+  private waitForSlot(accountId: string, timeoutMs?: number): Promise<ImapSession> {
+    return new Promise((resolve, reject) => {
+      const waiter: Waiter = { resolve, reject };
+      if (timeoutMs && timeoutMs > 0) {
+        waiter.timer = setTimeout(() => {
+          this.removeWaiter(accountId, waiter);
+          reject(
+            new MailError(
+              'TIMEOUT',
+              'Timed out waiting for a free IMAP connection.',
+              'Raise poolSize or lower the number of overlapping calls.',
+            ),
+          );
+        }, timeoutMs);
+        waiter.timer.unref?.();
+      }
       const queue = this.waiters.get(accountId) ?? [];
-      queue.push(resolve);
+      queue.push(waiter);
       this.waiters.set(accountId, queue);
     });
+  }
+
+  private removeWaiter(accountId: string, waiter: Waiter): void {
+    const queue = this.waiters.get(accountId);
+    if (!queue) {
+      return;
+    }
+    this.waiters.set(
+      accountId,
+      queue.filter((item) => item !== waiter),
+    );
   }
 
   private release(accountId: string, session: ImapSession): void {
     if (this.closed || !this.all.get(accountId)?.has(session)) {
       return;
     }
-    const waiter = this.waiters.get(accountId)?.shift();
+    const queue = this.waiters.get(accountId);
+    const waiter = queue?.shift();
     if (waiter) {
-      waiter(session);
+      if (waiter.timer) {
+        clearTimeout(waiter.timer);
+      }
+      waiter.resolve(session);
       return;
     }
     const list = this.idle.get(accountId) ?? [];
@@ -127,6 +240,17 @@ export class ImapConnectionPool implements ImapPool {
     } catch {
       session.close();
     }
+    const waiter = this.waiters.get(accountId)?.shift();
+    if (waiter && !this.closed && this.reserved(accountId) < this.size) {
+      if (waiter.timer) {
+        clearTimeout(waiter.timer);
+      }
+      this.acquire(accountId)
+        .then((fresh) => waiter.resolve(fresh))
+        .catch((error: unknown) =>
+          waiter.reject(error instanceof MailError ? error : mapTransportError(error)),
+        );
+    }
   }
 
   private async connectWithBackoff(session: ImapSession): Promise<void> {
@@ -135,6 +259,9 @@ export class ImapConnectionPool implements ImapPool {
     for (const wait of delays) {
       if (wait > 0) {
         await delay(wait);
+      }
+      if (this.closed) {
+        throw new MailError('CONNECTION_FAILED', 'The mail client is shutting down.');
       }
       try {
         await session.connect();
@@ -151,4 +278,11 @@ export class ImapConnectionPool implements ImapPool {
     }
     throw mapTransportError(last);
   }
+}
+
+function isTerminalSessionError(error: unknown): boolean {
+  if (error instanceof MailError) {
+    return error.code === 'TIMEOUT' || error.code === 'CONNECTION_FAILED';
+  }
+  return isRetryableConnectionError(error);
 }

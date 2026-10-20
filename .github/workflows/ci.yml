@@ -38,6 +38,12 @@ jobs:
           - 3465:3465
         env:
           GREENMAIL_OPTS: -Dgreenmail.setup.test.all -Dgreenmail.hostname=0.0.0.0 -Dgreenmail.users=user:secret@example.com
+        options: >-
+          --health-cmd "bash -c 'echo > /dev/tcp/127.0.0.1/3143'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 18
+          --health-start-period 20s
     env:
       MAIL_IT_IMAP_HOST: 127.0.0.1
       MAIL_IT_IMAP_PORT: 3143
@@ -86,8 +92,16 @@ jobs:
       - name: Docs
         run: npm run docs:check
 
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+
       - name: Test and coverage
+        if: matrix.runtime == 'node'
         run: npm run test:coverage
+
+      - name: Test and coverage with Bun
+        if: matrix.runtime == 'bun'
+        run: bun run test:coverage
 
       - name: Upload coverage
         if: matrix.runtime == 'node' && matrix.version == '22'
@@ -101,13 +115,34 @@ jobs:
         run: npm run build
 
       - name: End to end
+        if: matrix.runtime == 'node'
         run: npm run test:e2e
 
-      - name: Pack smoke (Node)
+      - name: End to end with Bun
+        if: matrix.runtime == 'bun'
+        run: bun run test:e2e
+
+      - name: Pack the tested tarball
+        if: matrix.runtime == 'node' && matrix.version == '22'
+        run: |
+          npm pack --json
+          sha256sum mail-mcp-*.tgz > mail-mcp.sha256
+
+      - name: Upload the tested tarball
+        if: matrix.runtime == 'node' && matrix.version == '22'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: package-tarball
+          path: |
+            mail-mcp-*.tgz
+            mail-mcp.sha256
+          if-no-files-found: error
+
+      - name: Pack smoke (npx, global install, symlink)
         if: matrix.runtime == 'node'
         run: node scripts/pack-smoke.mjs node
 
-      - name: Pack smoke (Bun)
+      - name: Pack smoke (bunx)
         if: matrix.runtime == 'bun'
         run: node scripts/pack-smoke.mjs bun
 

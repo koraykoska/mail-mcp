@@ -8,7 +8,6 @@ const ALIASES: Record<string, string> = {
   flagged: '\\Flagged',
   deleted: '\\Deleted',
   draft: '\\Draft',
-  recent: '\\Recent',
 };
 
 /**
@@ -20,7 +19,14 @@ export function normalizeFlag(flag: string): string {
   if (!trimmed) {
     throw new MailError('INVALID_ARGUMENT', 'A flag name was empty.');
   }
-  const alias = ALIASES[trimmed.toLowerCase().replace(/^\\/, '')];
+  const bare = trimmed.toLowerCase().replace(/^\\/, '');
+  if (bare === 'recent') {
+    throw new MailError(
+      'INVALID_ARGUMENT',
+      'The \\Recent flag is set by the server and cannot be stored by a client.',
+    );
+  }
+  const alias = ALIASES[bare];
   if (alias) {
     return alias;
   }
@@ -49,6 +55,10 @@ export function normalizeFlags(flags: readonly string[]): string[] {
     }
   }
   return out;
+}
+
+export function touchesDeleted(flags: readonly string[]): boolean {
+  return normalizeFlags(flags).includes('\\Deleted');
 }
 
 export function flagsToList(flags: Iterable<string> | undefined): string[] {

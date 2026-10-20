@@ -1,6 +1,6 @@
 {
   "name": "mail-mcp",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "description": "IMAP and SMTP mail client exposed as a Model Context Protocol server",
   "type": "module",
   "license": "MIT",
@@ -64,7 +64,7 @@
     "iconv-lite": "^0.6.3",
     "imapflow": "^2.5.8",
     "mailparser": "^3.7.4",
-    "nodemailer": "^7.0.6",
+    "nodemailer": "^10.1.7",
     "zod": "^4.1.11"
   },
   "devDependencies": {
@@ -72,12 +72,12 @@
     "@types/mailparser": "^3.4.6",
     "@types/node": "^22.18.6",
     "@types/nodemailer": "^6.4.17",
-    "@vitest/coverage-v8": "^3.2.4",
+    "@vitest/coverage-v8": "^5.0.5",
     "eslint": "^9.36.0",
     "prettier": "^3.6.2",
     "tsx": "^4.20.5",
     "typescript": "^5.9.2",
     "typescript-eslint": "^8.44.1",
-    "vitest": "^3.2.4"
+    "vitest": "^5.0.5"
   }
 }

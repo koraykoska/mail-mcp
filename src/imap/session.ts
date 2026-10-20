@@ -78,6 +78,20 @@ export interface FetchedPart {
   filename?: string;
   disposition?: string;
   encoding?: string;
+  /** True when maxLength cut the part before it was returned. */
+  truncated?: boolean;
+  cid?: string;
+}
+
+export interface FlagUpdate {
+  updated: number[];
+  modified: number[];
+  missing: number[];
+}
+
+export interface AclEntry {
+  identifier: string;
+  rights: string;
 }
 
 export interface BodyNode {
@@ -117,16 +131,20 @@ export interface OpenMailbox {
     flags: string[],
     operation: 'add' | 'remove' | 'set',
     unchangedSince?: string,
-  ): Promise<void>;
+  ): Promise<FlagUpdate>;
   setLabels(uids: number[], labels: string[], operation: 'add' | 'remove' | 'set'): Promise<void>;
   copy(uids: number[], destination: string): Promise<Record<string, number>>;
   move(uids: number[], destination: string): Promise<Record<string, number>>;
   expunge(uids?: number[]): Promise<void>;
-  /** Null when the server has no SORT extension or the command failed closed. */
-  serverSort(compiled: CompiledSearch, keys: SortKey[]): Promise<number[] | null>;
+  /** Null when the server has no SORT extension. A refused SORT throws. */
+  serverSort(
+    compiled: CompiledSearch,
+    keys: SortKey[],
+    window?: { start: number; count: number },
+  ): Promise<number[] | null>;
   /** Null when THREAD is unavailable. */
   serverThread(
-    algorithm: 'REFERENCES' | 'ORDEREDSUBJECT',
+    algorithm: 'REFERENCES' | 'ORDEREDSUBJECT' | 'REFS',
     compiled: CompiledSearch,
   ): Promise<ThreadNode[] | null>;
 }
@@ -151,6 +169,9 @@ export interface WaitResult {
 export interface ImapSession {
   readonly capabilities: ReadonlyMap<string, boolean | number>;
   hasCapability(name: string): boolean;
+  hasExactCapability(name: string): boolean;
+  /** True only after ENABLE recorded CONDSTORE, not merely because it was advertised. */
+  condstoreEnabled(): boolean;
   serverId(): Record<string, string> | null;
   namespaces(): Promise<{
     personal: Array<{ prefix: string; delimiter: string | null }>;
@@ -179,6 +200,10 @@ export interface ImapSession {
     fn: (box: OpenMailbox) => Promise<T>,
   ): Promise<T>;
   waitForChanges(path: string, timeoutMs: number): Promise<WaitResult>;
+  getAcl(path: string): Promise<AclEntry[]>;
+  setAcl(path: string, identifier: string, rights: string, action: 'set' | 'remove'): Promise<void>;
+  getMetadata(path: string, entries: string[]): Promise<Record<string, string | null>>;
+  setMetadata(path: string, entries: Record<string, string | null>): Promise<void>;
   connect(): Promise<void>;
   logout(): Promise<void>;
   close(): void;

@@ -266,9 +266,10 @@ const limit = z
   .number()
   .int()
   .positive()
+  .max(10_000)
   .optional()
   .describe(
-    'Page size. Default is limits.pageSize (25). Values above limits.maxPageSize (100) are rejected.',
+    'Page size. Default is limits.pageSize (25). The schema allows up to 10000; the server rejects values above the configured limits.maxPageSize (default 100).',
   );
 
 const cursor = z
@@ -279,9 +280,9 @@ const cursor = z
   );
 
 const ok = z
-  .literal(true)
+  .boolean()
   .describe(
-    'True when the call completed. Per-item failures, when a tool returns them, are inside results.',
+    'True when every requested item succeeded. Per-item failures are inside results when a tool returns them.',
   );
 
 export const fields = {
@@ -301,19 +302,12 @@ export const fields = {
 };
 
 /**
- * Tool output schema. Fields are optional so an error envelope `{ ok: false, error }`
- * validates alongside a successful payload. Unknown keys are kept.
+ * Strict tool output. Every returned key must be declared. Error results omit structuredContent
+ * so they are not validated against this success shape.
  */
-export function looseOutput(shape: z.ZodRawShape): z.ZodObject<z.ZodRawShape> {
-  const optionalShape: Record<string, z.ZodType> = {
-    ok: z.boolean().describe('True when the call completed, false when error is set.'),
-  };
-  for (const [key, value] of Object.entries(shape)) {
-    if (key === 'ok') {
-      continue;
-    }
-    const field = value as z.ZodType & { isOptional?: () => boolean };
-    optionalShape[key] = field.isOptional?.() ? field : field.optional();
-  }
-  return z.object(optionalShape).loose();
+export function strictOutput(shape: z.ZodRawShape): z.ZodObject<z.ZodRawShape> {
+  return z.object(shape).strict();
 }
+
+/** @deprecated Use strictOutput. Kept as a name alias so older call sites fail closed. */
+export const looseOutput = strictOutput;

@@ -1,4 +1,4 @@
-import { domainOf, type MailAddress } from './address.js';
+import { addressToAscii, domainOf, type MailAddress } from './address.js';
 
 export interface ReplyPlan {
   to: MailAddress[];
@@ -70,5 +70,10 @@ export function domainAllowed(address: string, allowList: readonly string[]): bo
     return true;
   }
   const domain = domainOf(address);
-  return allowList.some((allowed) => domain === allowed || domain.endsWith(`.${allowed}`));
+  return allowList.some((allowed) => {
+    const ascii = allowed.includes('@')
+      ? domainOf(allowed)
+      : domainOf(`x@${allowed}`) || addressToAscii(allowed).replace(/^x@/, '').toLowerCase();
+    return domain === ascii || domain.endsWith(`.${ascii}`);
+  });
 }

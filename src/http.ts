@@ -20,7 +20,10 @@ export async function startHttpServer(options: {
   logger: Logger;
   port: number;
   host: string;
+  token?: string;
+  maxBodyBytes?: number;
 }): Promise<{ url: string; close: () => Promise<void> }> {
+  const maxBodyBytes = options.maxBodyBytes ?? 1_048_576;
   const sessions = new Map<string, Session>();
   const http = createServer(async (req, res) => {
     try {
@@ -47,7 +50,14 @@ export async function startHttpServer(options: {
         res.writeHead(405).end('Method not allowed');
         return;
       }
-      const body = await readJson(req);
+      if (options.token) {
+        const authorization = header(req.headers.authorization);
+        if (authorization !== `Bearer ${options.token}`) {
+          res.writeHead(401).end('Unauthorized');
+          return;
+        }
+      }
+      const body = await readJson(req, maxBodyBytes);
       if (!isInitializeRequest(body)) {
         res.writeHead(400).end('Expected an initialize request');
         return;
@@ -100,10 +110,28 @@ function header(value: string | string[] | undefined): string | undefined {
   return value;
 }
 
-function readJson(req: IncomingMessage): Promise<unknown> {
+function readJson(req: IncomingMessage, maxBodyBytes: number): Promise<unknown> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    req.on('data', (chunk: Buffer) => chunks.push(chunk));
+    let received = 0;
+    const tooLarge = (): void => {
+      reject(new Error('HTTP body exceeds the configured limit'));
+    };
+    const declared = Number(req.headers['content-length'] ?? 0);
+    if (Number.isFinite(declared) && declared > maxBodyBytes) {
+      tooLarge();
+      req.resume();
+      return;
+    }
+    req.on('data', (chunk: Buffer) => {
+      received += chunk.length;
+      if (received > maxBodyBytes) {
+        req.destroy();
+        tooLarge();
+        return;
+      }
+      chunks.push(chunk);
+    });
     req.on('end', () => {
       if (chunks.length === 0) {
         resolve(undefined);

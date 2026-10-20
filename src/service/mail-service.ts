@@ -1,18 +1,26 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { MailError } from '../errors.js';
+import { confineToRoot, readBoundedFile } from '../fs-sandbox.js';
+import { redactText } from '../redact.js';
 import type { AppConfig, Identity, ResolvedAccount } from '../config/schema.js';
 import { requireAccount } from '../config/load.js';
 import type { Logger } from '../log.js';
 import { SlidingWindowLimiter } from '../rate-limit.js';
 import { assertMutation, assertRecipients } from '../safety.js';
-import { decodeCursor, encodeCursor, clampLimit } from '../pagination.js';
+import { decodeCursor, clampLimit, pageAfterUid } from '../pagination.js';
 import type { ImapPool } from '../imap/pool.js';
 import { assertSearchCapabilities, compileSearch, type SearchCriteria } from '../imap/search.js';
 import { sortMessages, type SortKey, type SortableMessage } from '../imap/sort.js';
 import { resolveSpecialUse, type ResolvedSpecialUse } from '../imap/special-use.js';
-import { normalizeFlags } from '../imap/flags.js';
-import type { ImapSession, MailboxInfo, MessageSummary, OpenMailbox } from '../imap/session.js';
+import { normalizeFlags, touchesDeleted } from '../imap/flags.js';
+import type {
+  BodyNode,
+  ImapSession,
+  MailboxInfo,
+  MessageSummary,
+  OpenMailbox,
+} from '../imap/session.js';
 import {
   formatAddress,
   parseAddress,
@@ -25,7 +33,9 @@ import {
   type OutboundAttachment,
   type OutboundMessage,
 } from '../mime/build.js';
-import { capText, parseRawMessage, renderHtml, type ParsedMessage } from '../mime/parse.js';
+import { capText, parseRawMessage, type ParsedMessage } from '../mime/parse.js';
+import { htmlToSafeText, quoteHtml, sanitizeHtml, textToHtml } from '../mime/html.js';
+import { hasHighOctets, stripBcc } from '../mime/transfer.js';
 import { headerValue, messageIds } from '../mime/headers.js';
 import { buildReferences, forwardSubject, replySubject } from '../mime/subject.js';
 import { flattenThread, threadMessages, type ThreadNode } from '../mime/thread.js';
@@ -125,7 +135,7 @@ export class MailService {
       if (!session.hasCapability('QUOTA')) {
         throw new MailError(
           'CAPABILITY_UNSUPPORTED',
-          'The server does not advertise the QUOTA extension.',
+          'The server does not advertise QUOTA or QUOTA=RES-*.',
         );
       }
       const quota = await session.quota(mailbox);
@@ -281,31 +291,42 @@ export class MailService {
           uidValidity: box.uidValidity,
           flags: summary.flags,
           structure,
-          parts: parts.map((part) => ({
-            partId: part.partId,
-            contentType: part.contentType ?? null,
-            filename: part.filename ?? null,
-            size: part.content.length,
-            text: part.contentType?.startsWith('text/')
-              ? capText(
-                  part.content.toString('utf8'),
-                  input.maxBodyChars ?? account.limits.maxBodyChars,
-                ).text
-              : undefined,
-            contentBase64: part.contentType?.startsWith('text/')
-              ? undefined
-              : part.content.toString('base64'),
-          })),
+          parts: parts.map((part) => {
+            const maxChars = input.maxBodyChars ?? account.limits.maxBodyChars;
+            const isText = (part.contentType ?? '').startsWith('text/');
+            const text = isText
+              ? capText(part.content.toString('utf8'), maxChars)
+              : { text: undefined, truncated: false };
+            return {
+              partId: part.partId,
+              contentType: part.contentType ?? null,
+              filename: part.filename ?? null,
+              size: part.content.length,
+              truncated: Boolean(part.truncated) || text.truncated,
+              text: text.text,
+              contentBase64: isText ? undefined : part.content.toString('base64'),
+            };
+          }),
         };
       }
-      if ((summary.size ?? 0) > account.limits.maxMessageBytes) {
+      const limit = account.limits.maxMessageBytes;
+      if ((summary.size ?? 0) > limit) {
         throw new MailError(
           'SIZE_LIMIT',
-          `Message UID ${input.uid} is ${summary.size} bytes, over the maxMessageBytes limit of ${account.limits.maxMessageBytes}.`,
+          `Message UID ${input.uid} is ${summary.size} bytes, over the maxMessageBytes limit of ${limit}.`,
           'Pass parts to fetch specific MIME sections, or raise limits.maxMessageBytes.',
         );
       }
-      const source = await box.fetchSource(input.uid);
+      const source = await box.fetchSource(
+        input.uid,
+        (summary.size ?? 0) > 0 ? undefined : limit + 1,
+      );
+      if (source && (summary.size ?? 0) === 0 && source.length > limit) {
+        throw new MailError(
+          'SIZE_LIMIT',
+          `Message UID ${input.uid} exceeds the maxMessageBytes limit of ${limit}.`,
+        );
+      }
       if (!source) {
         throw new MailError(
           'NOT_FOUND',
@@ -315,7 +336,8 @@ export class MailService {
       const parsed = await parseRawMessage(source);
       const maxChars = input.maxBodyChars ?? account.limits.maxBodyChars;
       const text = capText(parsed.text, maxChars);
-      const html = capText(parsed.html, maxChars);
+      const safeHtml = parsed.html ? sanitizeHtml(parsed.html) : undefined;
+      const html = capText(safeHtml, maxChars);
       return {
         ok: true as const,
         account: account.id,
@@ -332,9 +354,7 @@ export class MailService {
         textTruncated: text.truncated,
         html: html.text ?? null,
         htmlTruncated: html.truncated,
-        htmlAsText: parsed.html
-          ? capText(parsed.htmlAsText ?? renderHtml(parsed.html), maxChars).text
-          : null,
+        htmlAsText: safeHtml ? capText(htmlToSafeText(safeHtml), maxChars).text : null,
         attachments: parsed.attachments.map((attachment, index) => ({
           index,
           filename: attachment.filename ?? null,
@@ -361,7 +381,10 @@ export class MailService {
           'Use mail_get_message or mail_get_message_part instead of the full source.',
         );
       }
-      const source = await box.fetchSource(input.uid);
+      const source = await box.fetchSource(input.uid, limit + 1);
+      if (source && source.length > limit) {
+        throw new MailError('SIZE_LIMIT', `Raw message exceeds the limit of ${limit} bytes.`);
+      }
       if (!source) {
         throw new MailError('NOT_FOUND', `Message UID ${input.uid} was not found.`);
       }
@@ -417,8 +440,9 @@ export class MailService {
           'Part ids come from mail_get_message attachments or structure, for example "1" or "2.1".',
         );
       }
-      const truncated = part.content.length >= maxBytes;
+      const truncated = Boolean(part.truncated);
       const isText = (part.contentType ?? '').startsWith('text/');
+      const bytes = part.content.length;
       return {
         ok: true as const,
         account: account.id,
@@ -427,7 +451,7 @@ export class MailService {
         partId: part.partId,
         contentType: part.contentType ?? 'application/octet-stream',
         filename: part.filename ?? null,
-        bytes: part.content.length,
+        bytes,
         truncated,
         text: isText ? part.content.toString('utf8') : null,
         contentBase64: isText ? null : part.content.toString('base64'),
@@ -437,43 +461,97 @@ export class MailService {
 
   async downloadAttachment(input: DownloadInput): Promise<Record<string, unknown>> {
     const account = this.account(input.account);
-    const message = await this.loadParsed(account, input);
-    const attachment = pickAttachment(message.parsed, input);
-    if (!attachment.content) {
-      throw new MailError('NOT_FOUND', 'The attachment had no body.');
-    }
-    const bytes = attachment.content.length;
     if (input.savePath) {
-      const target = resolveSavePath(input.savePath, this.config.attachmentsDir);
+      assertMutation(account, 'message-write');
+    }
+    return this.withMailbox(account, input.mailbox, 'read', async (box) => {
+      this.assertUid(box, input.uidValidity);
+      const structure = await box.fetchStructure(input.uid);
+      let located: ReturnType<typeof locatePart> | undefined;
+      try {
+        located = locatePart(structure, input);
+      } catch (error) {
+        if (!(error instanceof MailError) || error.code !== 'NOT_FOUND') {
+          throw error;
+        }
+        const summary = await this.requireSummary(box, input.uid);
+        if ((summary.size ?? 0) > account.limits.maxMessageBytes) {
+          throw error;
+        }
+        const source = await box.fetchSource(input.uid, account.limits.maxMessageBytes + 1);
+        if (!source || source.length > account.limits.maxMessageBytes) {
+          throw error;
+        }
+        const parsed = await parseRawMessage(source);
+        const attachment = pickAttachment(parsed, input);
+        if (!attachment.content) {
+          throw new MailError('NOT_FOUND', 'The attachment had no body.');
+        }
+        if (attachment.content.length > account.limits.maxAttachmentBytes) {
+          throw new MailError(
+            'SIZE_LIMIT',
+            `Attachment is ${attachment.content.length} bytes, over the limit of ${account.limits.maxAttachmentBytes}.`,
+          );
+        }
+        return this.finishDownload(account, input, {
+          filename: attachment.filename ?? null,
+          contentType: attachment.contentType,
+          content: attachment.content,
+        });
+      }
+      const cap = account.limits.maxAttachmentBytes;
+      const parts = await box.fetchParts(input.uid, [{ key: located.partId, maxLength: cap + 1 }]);
+      const part = parts[0];
+      if (!part) {
+        throw new MailError('NOT_FOUND', 'The attachment had no body.');
+      }
+      if (part.content.length > cap || part.truncated) {
+        throw new MailError(
+          'SIZE_LIMIT',
+          `Attachment is over the limit of ${cap} bytes.`,
+          'Raise limits.maxAttachmentBytes.',
+        );
+      }
+      return this.finishDownload(account, input, {
+        filename: part.filename ?? located.filename ?? null,
+        contentType: part.contentType ?? located.contentType,
+        content: part.content,
+      });
+    });
+  }
+
+  private async finishDownload(
+    account: ResolvedAccount,
+    input: DownloadInput,
+    file: { filename: string | null; contentType: string; content: Buffer },
+  ): Promise<Record<string, unknown>> {
+    if (input.savePath) {
+      const target = await confineToRoot(
+        input.savePath,
+        requireAttachmentsDir(this.config.attachmentsDir),
+      );
       await mkdir(path.dirname(target), { recursive: true });
-      await writeFile(target, attachment.content);
+      await writeFile(target, file.content);
       return {
         ok: true as const,
         account: account.id,
         mailbox: input.mailbox,
         uid: input.uid,
-        filename: attachment.filename ?? null,
-        contentType: attachment.contentType,
-        bytes,
+        filename: file.filename,
+        contentType: file.contentType,
+        bytes: file.content.length,
         savedPath: target,
       };
-    }
-    if (bytes > account.limits.maxAttachmentBytes) {
-      throw new MailError(
-        'SIZE_LIMIT',
-        `Attachment is ${bytes} bytes, over the inline limit of ${account.limits.maxAttachmentBytes}.`,
-        'Pass savePath to write the file instead of returning base64.',
-      );
     }
     return {
       ok: true as const,
       account: account.id,
       mailbox: input.mailbox,
       uid: input.uid,
-      filename: attachment.filename ?? null,
-      contentType: attachment.contentType,
-      bytes,
-      contentBase64: attachment.content.toString('base64'),
+      filename: file.filename,
+      contentType: file.contentType,
+      bytes: file.content.length,
+      contentBase64: file.content.toString('base64'),
     };
   }
 
@@ -488,7 +566,8 @@ export class MailService {
       assertSearchCapabilities(compiled.requires, (name) => session.hasCapability(name));
       let threads: ThreadNode[] | null = null;
       let source: 'server' | 'client' = 'client';
-      if (session.hasCapability('THREAD')) {
+      let omitted = 0;
+      if (session.hasCapability('THREAD') || session.hasCapability(`THREAD=${algorithm}`)) {
         threads = await box.serverThread(algorithm, compiled);
         if (threads) {
           source = 'server';
@@ -496,6 +575,7 @@ export class MailService {
       }
       if (!threads) {
         const uids = await box.search(compiled);
+        omitted = Math.max(0, uids.length - account.limits.maxSortCandidates);
         const limited = uids.slice(0, account.limits.maxSortCandidates);
         const summaries = await box.fetchSummaries(limited, { snippet: false, snippetChars: 0 });
         const withRefs = await this.attachReferences(box, summaries);
@@ -512,11 +592,14 @@ export class MailService {
       }
       const flat = flattenThread(threads);
       const limit = clampLimit(input.limit, account.limits.pageSize, account.limits.maxPageSize);
-      const cursor = input.cursor
-        ? decodeCursor(input.cursor, box.uidValidity)
-        : { v: 1 as const, offset: 0 };
-      const pageUids = flat.slice(cursor.offset, cursor.offset + limit);
-      const nextOffset = cursor.offset + pageUids.length;
+      const cursor = input.cursor ? decodeCursor(input.cursor, box.uidValidity) : undefined;
+      const page = pageAfterUid(
+        flat,
+        limit,
+        cursor?.v === 2 ? cursor.afterUid : undefined,
+        box.uidValidity,
+      );
+      const pageSet = new Set(page.uids);
       return {
         ok: true as const,
         account: account.id,
@@ -525,39 +608,43 @@ export class MailService {
         algorithm,
         source,
         total: flat.length,
-        threads,
-        uids: pageUids,
-        nextCursor:
-          nextOffset < flat.length
-            ? encodeCursor({ v: 1, offset: nextOffset, uidValidity: box.uidValidity })
-            : null,
+        omitted,
+        truncated: omitted > 0,
+        threads: pruneThreads(threads, pageSet),
+        uids: page.uids,
+        nextCursor: page.nextCursor,
       };
     });
   }
 
   async setFlags(input: FlagInput): Promise<Record<string, unknown>> {
     const account = this.account(input.account);
-    assertMutation(account, 'message-write');
     const flags = normalizeFlags(input.flags);
+    if (touchesDeleted(flags)) {
+      assertMutation(account, 'delete');
+    } else {
+      assertMutation(account, 'message-write');
+    }
+    this.assertBulk(input.uids, account.limits.maxBulk);
     return this.withMailbox(account, input.mailbox, 'write', async (box, session) => {
       this.assertUid(box, input.uidValidity);
-      if (input.unchangedSince && !session.hasCapability('CONDSTORE')) {
+      if (input.unchangedSince && !session.condstoreEnabled()) {
         throw new MailError(
           'CAPABILITY_UNSUPPORTED',
-          'unchangedSince requires CONDSTORE.',
-          'Omit unchangedSince to update flags without a mod-sequence check.',
+          'unchangedSince requires CONDSTORE to be enabled.',
+          'Omit unchangedSince, or use a server that enables CONDSTORE.',
         );
       }
-      await this.perUid(input.uids, account.limits.maxBulk, async (uid) => {
-        await box.setFlags([uid], flags, input.operation, input.unchangedSince);
-      });
+      const update = await box.setFlags(input.uids, flags, input.operation, input.unchangedSince);
+      const results = flagResults(input.uids, update);
       return {
-        ok: true as const,
+        ok: results.every((item) => item.ok),
         account: account.id,
         mailbox: input.mailbox,
-        uids: input.uids,
+        uids: results.filter((item) => item.ok).map((item) => item.uid),
         operation: input.operation,
         flags,
+        results,
       };
     });
   }
@@ -567,31 +654,26 @@ export class MailService {
     assertMutation(account, move ? 'delete' : 'message-write');
     return this.withMailbox(account, input.mailbox, 'write', async (box, session) => {
       this.assertUid(box, input.uidValidity);
-      if (
-        move &&
-        !session.hasCapability('MOVE') &&
-        !session.hasCapability('UIDPLUS') &&
-        !account.allowPermanentDelete
-      ) {
+      if (move && !session.hasCapability('MOVE') && !session.hasCapability('UIDPLUS')) {
         throw new MailError(
           'CAPABILITY_UNSUPPORTED',
-          'This server has neither MOVE nor UIDPLUS. The COPY + EXPUNGE fallback would remove every \\Deleted message in the mailbox.',
-          'Use a server with MOVE, or set allowPermanentDelete to accept that fallback.',
+          'This server has neither MOVE nor UIDPLUS. Copying and then expunging would remove every \\Deleted message, not only the requested UIDs.',
+          'Use a server with MOVE or UIDPLUS. allowPermanentDelete is not consent to expunge unrelated messages.',
         );
       }
-      const results = await this.perUid(input.uids, account.limits.maxBulk, async (uid) => {
+      const rows = await this.perUid(input.uids, account.limits.maxBulk, async (uid) => {
         const map = move
           ? await box.move([uid], input.destination)
           : await box.copy([uid], input.destination);
         return map[String(uid)] ?? null;
       });
       return {
-        ok: true as const,
+        ok: rows.every((item) => item.ok),
         account: account.id,
         mailbox: input.mailbox,
         destination: input.destination,
         move,
-        results,
+        results: rows,
       };
     });
   }
@@ -600,17 +682,26 @@ export class MailService {
     const account = this.account(input.account);
     if (input.permanent) {
       assertMutation(account, 'permanent');
-      return this.withMailbox(account, input.mailbox, 'write', async (box) => {
+      return this.withMailbox(account, input.mailbox, 'write', async (box, session) => {
         this.assertUid(box, input.uidValidity);
-        await this.perUid(input.uids, account.limits.maxBulk, async (uid) => {
+        if (!session.hasCapability('UIDPLUS')) {
+          throw new MailError(
+            'CAPABILITY_UNSUPPORTED',
+            'Permanent delete of specific UIDs requires UIDPLUS. Without it, EXPUNGE removes every \\Deleted message in the mailbox.',
+            'Move the messages to Trash, or use a server that advertises UIDPLUS.',
+          );
+        }
+        const rows = await this.perUid(input.uids, account.limits.maxBulk, async (uid) => {
           await box.expunge([uid]);
+          return true;
         });
         return {
-          ok: true as const,
+          ok: rows.every((item) => item.ok),
           account: account.id,
           mailbox: input.mailbox,
           permanent: true,
-          uids: input.uids,
+          uids: rows.filter((item) => item.ok).map((item) => item.uid),
+          results: rows,
         };
       });
     }
@@ -684,6 +775,8 @@ export class MailService {
   }
 
   async bulk(input: BulkInput): Promise<Record<string, unknown>> {
+    const account = this.account(input.account);
+    this.assertBulk(input.uids, account.limits.maxBulk);
     const results: Array<Record<string, unknown>> = [];
     for (const uid of input.uids) {
       try {
@@ -745,8 +838,8 @@ export class MailService {
       }
     }
     return {
-      ok: true as const,
-      account: this.account(input.account).id,
+      ok: results.every((item) => item.ok === true),
+      account: account.id,
       mailbox: input.mailbox,
       action: input.action,
       results,
@@ -756,6 +849,9 @@ export class MailService {
   async saveDraft(input: DraftInput, replaceUid?: number): Promise<Record<string, unknown>> {
     const account = this.account(input.account);
     assertMutation(account, 'message-write');
+    if (replaceUid !== undefined) {
+      assertMutation(account, 'delete');
+    }
     const drafts = await this.withImap(account, async (session) => {
       if (input.mailbox) {
         return input.mailbox;
@@ -769,17 +865,34 @@ export class MailService {
         'Set draftsMailbox or create a Drafts folder.',
       );
     }
-    const raw = await buildRawMessage(await this.outboundFromParts(account, input));
+    const raw = await buildRawMessage(
+      await this.outboundFromParts(account, { ...input, allowEmptyRecipients: true }),
+      {
+        keepBcc: true,
+      },
+    );
     const appended = await this.withImap(account, (session) =>
-      session.append(drafts, raw, ['\\Draft', '\\Seen']),
+      session.append(drafts, raw, ['\\Draft']),
     );
     if (replaceUid !== undefined) {
-      await this.deleteMessages({
-        account: account.id,
-        mailbox: drafts,
-        uids: [replaceUid],
-        permanent: account.allowPermanentDelete,
-      });
+      try {
+        await this.deleteMessages({
+          account: account.id,
+          mailbox: drafts,
+          uids: [replaceUid],
+          permanent: account.allowPermanentDelete,
+        });
+      } catch (error) {
+        if (appended.uid !== undefined) {
+          await this.deleteMessages({
+            account: account.id,
+            mailbox: drafts,
+            uids: [appended.uid],
+            permanent: account.allowPermanentDelete,
+          }).catch(() => undefined);
+        }
+        throw error;
+      }
     }
     return {
       ok: true as const,
@@ -820,11 +933,17 @@ export class MailService {
       throw new MailError('CONFIG_ERROR', `Account "${account.id}" has no SMTP server configured.`);
     }
     const message = await this.outboundFromParts(account, input);
-    assertRecipients(account, [...message.to, ...(message.cc ?? []), ...(message.bcc ?? [])]);
+    const envelopeTo = (input.envelopeTo ?? envelopeRecipients(message)).map((address) =>
+      parseAddress(address),
+    );
+    assertRecipients(account, envelopeTo);
+    const envelopeFrom = input.envelopeFrom ?? message.from.address;
+    this.assertIdentity(account, envelopeFrom);
     if (account.sendRateLimit) {
       this.limiter.consume(account.id, account.sendRateLimit.max, account.sendRateLimit.windowMs);
     }
-    const raw = await buildRawMessage(message);
+    let raw = await buildRawMessage(message);
+    raw = stripBcc(raw);
     if (raw.length > account.limits.maxMessageBytes) {
       throw new MailError('SIZE_LIMIT', `Message is ${raw.length} bytes, over maxMessageBytes.`);
     }
@@ -836,11 +955,13 @@ export class MailService {
         sender.send({
           raw,
           envelope: {
-            from: input.envelopeFrom ?? message.from.address,
-            to: input.envelopeTo ?? envelopeRecipients(message),
+            from: envelopeFrom,
+            to: envelopeTo.map((item) => item.address),
           },
+          eightBit: hasHighOctets(raw),
           ...(input.dsn ? { dsn: input.dsn } : {}),
         }),
+        () => sender.close(),
       );
       let appended: Record<string, unknown> | null = null;
       if (input.appendSent !== false && this.shouldAppend(account)) {
@@ -876,36 +997,59 @@ export class MailService {
         'The original message has no reply address that is not this account.',
       );
     }
-    const quoted = quotePlain(
-      loaded.parsed.text || loaded.parsed.htmlAsText || '',
-      formatAddress(original.from[0] ?? { address: 'unknown' }),
-      loaded.parsed.date ?? 'an unknown date',
-    );
+    const label = formatAddress(original.from[0] ?? { address: 'unknown' });
+    const when = loaded.parsed.date ?? 'an unknown date';
+    const quoted = quotePlain(loaded.parsed.text || loaded.parsed.htmlAsText || '', label, when);
     const text = `${input.text ?? ''}${input.text ? '\n\n' : ''}${quoted}`;
-    return this.send({
+    const originalHtml = loaded.parsed.html
+      ? quoteHtml(loaded.parsed.html, label, when)
+      : quoteHtml(textToHtml(loaded.parsed.text || ''), label, when);
+    const html = input.html ? `${input.html}${originalHtml}` : originalHtml;
+    const sent = await this.send({
       account: account.id,
       to,
       cc,
       subject: input.subject ?? replySubject(loaded.parsed.subject),
       text,
-      html: input.html,
+      html,
       attachments: input.attachments,
       inReplyTo: loaded.parsed.messageId,
       references: buildReferences(loaded.parsed.references, loaded.parsed.messageId),
       appendSent: input.appendSent,
     });
+    await this.setFlags({
+      account: account.id,
+      mailbox: input.mailbox,
+      uidValidity: input.uidValidity,
+      uids: [input.uid],
+      flags: ['\\Answered'],
+      operation: 'add',
+    }).catch(() => undefined);
+    return sent;
   }
 
   async forward(input: ForwardInput): Promise<Record<string, unknown>> {
     const account = this.account(input.account);
     const loaded = await this.loadParsed(account, input);
-    const quoted = quotePlain(
-      loaded.parsed.text || loaded.parsed.htmlAsText || '',
-      formatAddress(asMail(loaded.parsed.from)[0] ?? { address: 'unknown' }),
-      loaded.parsed.date ?? 'an unknown date',
-    );
+    const label = formatAddress(asMail(loaded.parsed.from)[0] ?? { address: 'unknown' });
+    const when = loaded.parsed.date ?? 'an unknown date';
+    const quoted = quotePlain(loaded.parsed.text || loaded.parsed.htmlAsText || '', label, when);
     const text = `${input.text ?? ''}${input.text ? '\n\n' : ''}---------- Forwarded message ----------\n${quoted}`;
+    const originalHtml = loaded.parsed.html
+      ? quoteHtml(loaded.parsed.html, label, when)
+      : quoteHtml(textToHtml(loaded.parsed.text || ''), label, when);
+    const html = input.html ? `${input.html}${originalHtml}` : originalHtml;
+    const source = await this.withMailbox(account, input.mailbox, 'read', async (box) =>
+      box.fetchSource(input.uid, account.limits.maxMessageBytes),
+    );
     const attachments: OutboundAttachment[] = [...(input.attachments ?? [])];
+    if (source) {
+      attachments.push({
+        filename: 'forwarded.eml',
+        contentType: 'message/rfc822',
+        contentBase64: source.toString('base64'),
+      });
+    }
     if (input.includeAttachments !== false) {
       for (const attachment of loaded.parsed.attachments) {
         if (!attachment.content || attachment.inline) {
@@ -918,16 +1062,25 @@ export class MailService {
         });
       }
     }
-    return this.send({
+    const sent = await this.send({
       account: account.id,
       to: input.to,
       cc: input.cc,
       subject: input.subject ?? forwardSubject(loaded.parsed.subject),
       text,
-      html: input.html,
+      html,
       attachments,
       appendSent: input.appendSent,
     });
+    await this.setFlags({
+      account: account.id,
+      mailbox: input.mailbox,
+      uidValidity: input.uidValidity,
+      uids: [input.uid],
+      flags: ['$Forwarded'],
+      operation: 'add',
+    }).catch(() => undefined);
+    return sent;
   }
 
   async sendDraft(input: UidInput & { appendSent?: boolean }): Promise<Record<string, unknown>> {
@@ -935,7 +1088,16 @@ export class MailService {
     assertMutation(account, 'send');
     const source = await this.withMailbox(account, input.mailbox, 'read', async (box) => {
       this.assertUid(box, input.uidValidity);
-      return box.fetchSource(input.uid);
+      const summary = await this.requireSummary(box, input.uid);
+      const limit = account.limits.maxMessageBytes;
+      if ((summary.size ?? 0) > limit) {
+        throw new MailError('SIZE_LIMIT', `Draft UID ${input.uid} exceeds maxMessageBytes.`);
+      }
+      const raw = await box.fetchSource(input.uid, limit + 1);
+      if (raw && raw.length > limit) {
+        throw new MailError('SIZE_LIMIT', `Draft UID ${input.uid} exceeds maxMessageBytes.`);
+      }
+      return raw;
     });
     if (!source) {
       throw new MailError('NOT_FOUND', `Draft UID ${input.uid} was not found.`);
@@ -943,18 +1105,21 @@ export class MailService {
     const parsed = await parseRawMessage(source);
     const recipients = [...asMail(parsed.to), ...asMail(parsed.cc), ...asMail(parsed.bcc)];
     assertRecipients(account, recipients);
+    const from = asMail(parsed.from)[0]?.address ?? account.email;
+    this.assertIdentity(account, from);
     if (account.sendRateLimit) {
       this.limiter.consume(account.id, account.sendRateLimit.max, account.sendRateLimit.windowMs);
     }
     if (!account.smtp) {
       throw new MailError('CONFIG_ERROR', `Account "${account.id}" has no SMTP server configured.`);
     }
+    const wire = stripBcc(source);
     const sender = await this.smtpFactory(account);
     try {
-      const from = asMail(parsed.from)[0]?.address ?? account.email;
       const result = await sender.send({
-        raw: source,
+        raw: wire,
         envelope: { from, to: recipients.map((item) => item.address) },
+        eightBit: hasHighOctets(wire),
       });
       let appended: Record<string, unknown> | null = null;
       if (input.appendSent !== false && this.shouldAppend(account)) {
@@ -1016,7 +1181,21 @@ export class MailService {
       const keys = input.sort ?? [{ field: 'arrival', reverse: true }];
       let ordered: number[];
       let sortSource: 'server' | 'client' | 'uid' = 'uid';
-      const serverSorted = await box.serverSort(compiled, keys);
+      const limitForPage = clampLimit(
+        input.limit,
+        account.limits.pageSize,
+        account.limits.maxPageSize,
+      );
+      const decoded = input.cursor ? decodeCursor(input.cursor, box.uidValidity) : undefined;
+      const serverSorted = session.hasCapability('SORT')
+        ? await box.serverSort(
+            compiled,
+            keys,
+            session.hasCapability('ESORT')
+              ? { start: 1, count: Math.max(matched.length, limitForPage) }
+              : undefined,
+          )
+        : null;
       if (serverSorted) {
         const allow = new Set(matched);
         ordered = serverSorted.filter((uid) => allow.has(uid));
@@ -1024,7 +1203,7 @@ export class MailService {
       } else if (matched.length > account.limits.maxSortCandidates) {
         throw new MailError(
           'SIZE_LIMIT',
-          `This mailbox slice has ${matched.length} matches and the server cannot SORT them. The client-side cap is ${account.limits.maxSortCandidates}.`,
+          `This mailbox slice has ${matched.length} matches and the server does not advertise SORT. The client-side cap is ${account.limits.maxSortCandidates}.`,
           'Narrow the search, or use a server with the SORT extension.',
         );
       } else {
@@ -1042,11 +1221,14 @@ export class MailService {
         ordered = sortMessages(sortable, keys).map((item) => item.uid);
         sortSource = 'client';
       }
-      const limit = clampLimit(input.limit, account.limits.pageSize, account.limits.maxPageSize);
-      const cursor = input.cursor
-        ? decodeCursor(input.cursor, box.uidValidity)
-        : { v: 1 as const, offset: 0 };
-      const pageUids = ordered.slice(cursor.offset, cursor.offset + limit);
+      const limit = limitForPage;
+      const paged = pageAfterUid(
+        ordered,
+        limit,
+        decoded?.v === 2 ? decoded.afterUid : undefined,
+        box.uidValidity,
+      );
+      const pageUids = paged.uids;
       const messages = await box.fetchSummaries(pageUids, {
         snippet: input.includeSnippet !== false,
         snippetChars: input.snippetChars ?? 160,
@@ -1055,22 +1237,18 @@ export class MailService {
       const orderedMessages = pageUids
         .map((uid) => byUid.get(uid))
         .filter((item): item is MessageSummary => Boolean(item));
-      const nextOffset = cursor.offset + pageUids.length;
       return {
         ok: true as const,
         account: account.id,
         mailbox,
         uidValidity: box.uidValidity,
         total: ordered.length,
-        offset: cursor.offset,
+        offset: paged.offset,
         sort: keys,
         sortSource,
         search: fromSearch,
         messages: orderedMessages.map(publicSummary),
-        nextCursor:
-          nextOffset < ordered.length
-            ? encodeCursor({ v: 1, offset: nextOffset, uidValidity: box.uidValidity })
-            : null,
+        nextCursor: paged.nextCursor,
       };
     });
   }
@@ -1079,9 +1257,7 @@ export class MailService {
     account: ResolvedAccount,
     fn: (session: ImapSession) => Promise<T>,
   ): Promise<T> {
-    return this.pool.use(account.id, (session) =>
-      withTimeout(account.imap.timeoutMs, `IMAP ${account.id}`, fn(session)),
-    );
+    return this.pool.use(account.id, (session) => fn(session), account.imap.timeoutMs);
   }
 
   private async withMailbox<T>(
@@ -1093,6 +1269,52 @@ export class MailService {
     return this.withImap(account, (session) =>
       session.withMailbox(mailbox, mode, (box) => fn(box, session)),
     );
+  }
+
+  private assertIdentity(account: ResolvedAccount, from: string): void {
+    this.resolveFrom(account, from);
+  }
+
+  private assertBulk(uids: number[], max: number): void {
+    if (uids.length === 0) {
+      throw new MailError('INVALID_ARGUMENT', 'uids must contain at least one UID.');
+    }
+    if (uids.length > max) {
+      throw new MailError(
+        'SIZE_LIMIT',
+        `This call has ${uids.length} UIDs and the configured maximum is ${max}.`,
+        'Lower the UID list or raise limits.maxBulk.',
+      );
+    }
+  }
+
+  private async confineAttachments(
+    account: ResolvedAccount,
+    attachments: OutboundAttachment[],
+  ): Promise<OutboundAttachment[]> {
+    const root = this.config.attachmentsDir;
+    const out: OutboundAttachment[] = [];
+    for (const attachment of attachments) {
+      if (!attachment.path) {
+        out.push(attachment);
+        continue;
+      }
+      if (!root) {
+        throw new MailError(
+          'PERMISSION_DENIED',
+          'Attachment path reads require attachmentsDir to be configured.',
+        );
+      }
+      const file = await confineToRoot(attachment.path, root);
+      const content = await readBoundedFile(file, account.limits.maxMessageBytes);
+      const next: OutboundAttachment = {
+        ...attachment,
+        contentBase64: content.toString('base64'),
+      };
+      delete next.path;
+      out.push(next);
+    }
+    return out;
   }
 
   private assertUid(box: OpenMailbox, expected?: string): void {
@@ -1207,7 +1429,7 @@ export class MailService {
       message.html = input.html;
     }
     if (input.attachments) {
-      message.attachments = input.attachments;
+      message.attachments = await this.confineAttachments(account, input.attachments);
     }
     if (input.headers) {
       message.headers = input.headers;
@@ -1236,14 +1458,14 @@ export class MailService {
     const match = account.identities.find(
       (item) => item.email.toLowerCase() === parsed.address.toLowerCase(),
     );
-    if (!match) {
+    if (!match && parsed.address.toLowerCase() !== account.email.toLowerCase()) {
       throw new MailError(
         'PERMISSION_DENIED',
         `From address ${parsed.address} is not a configured identity for account "${account.id}".`,
         `Identities: ${account.identities.map((item) => item.email).join(', ')}.`,
       );
     }
-    if (!parsed.name && match.name) {
+    if (!parsed.name && match?.name) {
       parsed.name = match.name;
     }
     return parsed;
@@ -1298,7 +1520,12 @@ export class MailService {
         error instanceof MailError
           ? error
           : new MailError('CONNECTION_FAILED', 'IMAP check failed.');
-      return { ok: false, code: mapped.code, message: mapped.message, hint: mapped.hint ?? null };
+      return {
+        ok: false,
+        code: mapped.code,
+        message: redactText(mapped.message, this.config.secrets),
+        hint: mapped.hint ? redactText(mapped.hint, this.config.secrets) : null,
+      };
     }
   }
 
@@ -1319,7 +1546,12 @@ export class MailService {
       return mapped;
     });
     if (sender instanceof MailError) {
-      return { ok: false, code: sender.code, message: sender.message, hint: sender.hint ?? null };
+      return {
+        ok: false,
+        code: sender.code,
+        message: redactText(sender.message, this.config.secrets),
+        hint: sender.hint ? redactText(sender.hint, this.config.secrets) : null,
+      };
     }
     try {
       await withTimeout(account.smtp.timeoutMs, 'SMTP verify', sender.verify());
@@ -1334,7 +1566,12 @@ export class MailService {
         error instanceof MailError
           ? error
           : new MailError('CONNECTION_FAILED', 'SMTP check failed.');
-      return { ok: false, code: mapped.code, message: mapped.message, hint: mapped.hint ?? null };
+      return {
+        ok: false,
+        code: mapped.code,
+        message: redactText(mapped.message, this.config.secrets),
+        hint: mapped.hint ? redactText(mapped.hint, this.config.secrets) : null,
+      };
     } finally {
       sender.close();
     }
@@ -1491,7 +1728,8 @@ function pickAttachment(
     return found;
   }
   if (input.cid) {
-    const found = parsed.attachments.find((item) => item.cid === input.cid);
+    const wanted = stripCid(input.cid);
+    const found = parsed.attachments.find((item) => item.cid && stripCid(item.cid) === wanted);
     if (!found) {
       throw new MailError('NOT_FOUND', `No attachment with cid "${input.cid}".`);
     }
@@ -1509,11 +1747,12 @@ export function resolveSavePath(requested: string, root?: string): string {
   }
   const absolute = path.resolve(requested);
   if (!root) {
-    return absolute;
+    throw new MailError('PERMISSION_DENIED', 'savePath requires attachmentsDir to be configured.');
   }
   const rootAbs = path.resolve(root);
   const relative = path.relative(rootAbs, absolute);
-  if (relative.startsWith('..') || path.isAbsolute(relative)) {
+  const parts = relative.split(path.sep).filter((part) => part.length > 0);
+  if (parts.includes('..') || path.isAbsolute(relative)) {
     throw new MailError(
       'PERMISSION_DENIED',
       'savePath is outside the configured attachmentsDir.',
@@ -1521,6 +1760,114 @@ export function resolveSavePath(requested: string, root?: string): string {
     );
   }
   return absolute;
+}
+
+function requireAttachmentsDir(root: string | undefined): string {
+  if (!root) {
+    throw new MailError('PERMISSION_DENIED', 'savePath requires attachmentsDir to be configured.');
+  }
+  return root;
+}
+
+function stripCid(value: string): string {
+  return value.trim().replace(/^<|>$/g, '').toLowerCase();
+}
+
+function flagResults(
+  uids: number[],
+  update: { updated: number[]; modified: number[]; missing: number[] },
+): Array<{ uid: number; ok: boolean; code?: string; message?: string }> {
+  const updated = new Set(update.updated);
+  const modified = new Set(update.modified);
+  const missing = new Set(update.missing);
+  return uids.map((uid) => {
+    if (updated.has(uid)) {
+      return { uid, ok: true };
+    }
+    if (missing.has(uid)) {
+      return { uid, ok: false, code: 'NOT_FOUND', message: `UID ${uid} was not in the mailbox.` };
+    }
+    if (modified.has(uid)) {
+      return {
+        uid,
+        ok: false,
+        code: 'PROTOCOL_ERROR',
+        message: `UID ${uid} was not updated because its mod-sequence is newer than unchangedSince.`,
+      };
+    }
+    return { uid, ok: false, code: 'PROTOCOL_ERROR', message: `UID ${uid} was not updated.` };
+  });
+}
+
+function pruneThreads(nodes: ThreadNode[], allow: Set<number>): ThreadNode[] {
+  const pruned: ThreadNode[] = [];
+  for (const node of nodes) {
+    const children = pruneThreads(node.children, allow);
+    if ((node.uid !== undefined && allow.has(node.uid)) || children.length > 0) {
+      pruned.push({ ...node, children });
+    }
+  }
+  return pruned;
+}
+
+function locatePart(
+  structure: BodyNode | null,
+  input: DownloadInput,
+): { partId: string; filename?: string; contentType: string } {
+  const flat = flattenParts(structure);
+  if (input.partIndex !== undefined) {
+    const found = flat[input.partIndex];
+    if (!found) {
+      throw new MailError('NOT_FOUND', `Attachment index ${input.partIndex} does not exist.`);
+    }
+    return found;
+  }
+  if (input.filename) {
+    const found = flat.find((item) => item.filename === input.filename);
+    if (!found) {
+      throw new MailError('NOT_FOUND', `No attachment named "${input.filename}".`);
+    }
+    return found;
+  }
+  if (input.cid) {
+    const wanted = stripCid(input.cid);
+    const found = flat.find((item) => item.cid && stripCid(item.cid) === wanted);
+    if (!found) {
+      throw new MailError('NOT_FOUND', `No attachment with cid "${input.cid}".`);
+    }
+    return found;
+  }
+  const attachment = flat.find((item) => item.disposition === 'attachment' || item.filename);
+  if (!attachment) {
+    throw new MailError('NOT_FOUND', 'The message has no attachment.');
+  }
+  return attachment;
+}
+
+function flattenParts(node: BodyNode | null): Array<{
+  partId: string;
+  filename?: string;
+  contentType: string;
+  disposition?: string;
+  cid?: string;
+}> {
+  if (!node) {
+    return [];
+  }
+  const type = `${node.type}/${node.subtype ?? ''}`.replace(/\/$/, '');
+  const self =
+    node.children.length === 0
+      ? [
+          {
+            partId: node.part || '1',
+            filename: node.dispositionParameters.filename || node.parameters.name,
+            contentType: type || 'application/octet-stream',
+            disposition: node.disposition,
+            cid: node.id,
+          },
+        ]
+      : [];
+  return [...self, ...node.children.flatMap((child) => flattenParts(child))];
 }
 
 export interface UidInput {

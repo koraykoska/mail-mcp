@@ -18,12 +18,12 @@ Implicit TLS is the default for the usual IMAP and submission ports. Cleartext i
 
 - `readOnly` accounts cannot create folders, change flags, append, delete, or send. If every account is read-only, mutating tools are not registered.
 - `allowPermanentDelete` defaults to false. Delete moves to Trash. Expunge and permanent UID delete stay off until the flag is set.
-- `recipientDomainAllowList` rejects SMTP recipients outside those domains.
+- `recipientDomainAllowList` is applied to the SMTP envelope (`envelopeTo` when set, otherwise To, Cc, and Bcc). `envelopeFrom` and a draft's From must be a configured identity.
 - `sendRateLimit` caps submissions per account inside this process. It is not a cluster-wide limit.
-- `attachmentsDir`, when set, refuses `savePath` values that escape the directory.
+- `attachmentsDir` is required for `savePath` writes and for attachment `path` reads. Both are resolved with `realpath` and must stay inside that directory. A `readOnly` account cannot write `savePath`. The byte cap is applied before the file is read or returned.
 
 ## Network
 
-The optional HTTP transport binds to `127.0.0.1` by default and does not add its own authentication. Do not expose it on a public interface without a reverse proxy that authenticates clients. Stdio does not listen.
+The optional HTTP transport binds to `127.0.0.1` by default. A non-loopback `--host` is refused unless `--http-token` or `MAIL_HTTP_TOKEN` is set, and that bearer token is required on `/mcp`. Request bodies are capped. Stdio does not listen.
 
 Attachment `path` values and `savePath` are local filesystem paths. A client that can call tools can read files the process can read and write files the process can write, subject to `attachmentsDir`.

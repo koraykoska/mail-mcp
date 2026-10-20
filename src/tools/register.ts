@@ -49,7 +49,6 @@ export function errorResult(
 ): {
   isError: true;
   content: Array<{ type: 'text'; text: string }>;
-  structuredContent: Record<string, unknown>;
 } {
   const message = redactText(error.message, secrets);
   const hint = error.hint ? redactText(error.hint, secrets) : undefined;
@@ -57,9 +56,5 @@ export function errorResult(
   return {
     isError: true,
     content: [{ type: 'text', text }],
-    structuredContent: {
-      ok: false,
-      error: { code: error.code, message, hint: hint ?? null },
-    },
   };
 }

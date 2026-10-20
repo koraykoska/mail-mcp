@@ -5,8 +5,13 @@ import {
   type ImapFlowOptions,
   type ListResponse,
   type MessageStructureObject,
+  type SearchObject,
 } from 'imapflow';
+import { searchCompiler } from 'imapflow/lib/search-compiler.js';
 import { MailError, mapTransportError } from '../errors.js';
+import { capabilityMatches, hasExactCapability as exactCapability } from './capabilities.js';
+import { decodeTransfer, parseSequenceSet } from '../mime/transfer.js';
+import { VERSION } from '../version.js';
 import type { ResolvedAccount } from '../config/schema.js';
 import type { Logger } from '../log.js';
 import { decodeBody } from '../charset.js';
@@ -23,6 +28,7 @@ import {
   type AddressParts,
   type BodyNode,
   type FetchedPart,
+  type FlagUpdate,
   type ImapSession,
   type MailboxInfo,
   type MailboxTree,
@@ -55,6 +61,8 @@ interface RawClient {
  * One IMAP connection backed by ImapFlow.
  * Mailbox names are passed as Unicode; ImapFlow encodes modified UTF-7 unless UTF8=ACCEPT is on.
  */
+export type AccessTokenProvider = (options?: { force?: boolean }) => Promise<string | undefined>;
+
 export class ImapFlowSession implements ImapSession {
   private client: ImapFlow | undefined;
   private connecting: Promise<void> | undefined;
@@ -62,18 +70,24 @@ export class ImapFlowSession implements ImapSession {
 
   constructor(
     private readonly account: ResolvedAccount,
-    private readonly accessToken: string | undefined,
+    private readonly accessToken: AccessTokenProvider,
     private readonly logger: Logger,
   ) {}
 
   hasCapability(name: string): boolean {
-    const upper = name.toUpperCase();
-    for (const key of this.capabilities.keys()) {
-      if (key.toUpperCase() === upper) {
-        return true;
-      }
+    return capabilityMatches(this.capabilities.keys(), name);
+  }
+
+  hasExactCapability(name: string): boolean {
+    return exactCapability(this.capabilities.keys(), name);
+  }
+
+  condstoreEnabled(): boolean {
+    const client = this.client;
+    if (!client) {
+      return false;
     }
-    return false;
+    return client.enabled.has('CONDSTORE') || client.enabled.has('QRESYNC');
   }
 
   serverId(): Record<string, string> | null {
@@ -153,7 +167,7 @@ export class ImapFlowSession implements ImapSession {
 
   async quota(path?: string): Promise<QuotaInfo | null> {
     const client = this.requireClient();
-    if (!this.hasCapability('QUOTA')) {
+    if (!this.hasCapability('QUOTA') && !this.hasCapability('QUOTA=RES')) {
       return null;
     }
     try {
@@ -377,6 +391,7 @@ export class ImapFlowSession implements ImapSession {
     client.on('expunge', onExpunge);
     client.on('flags', onFlags);
     let lock: { release: () => void } | undefined;
+    let early = (): void => undefined;
     try {
       lock = await client.getMailboxLock(path, { readOnly: true });
       let stop = (): void => undefined;
@@ -392,7 +407,7 @@ export class ImapFlowSession implements ImapSession {
         }
         stop();
       };
-      const early = (): void => {
+      early = () => {
         if (changes.length > 0) {
           breakIdle();
         }
@@ -400,6 +415,12 @@ export class ImapFlowSession implements ImapSession {
       client.on('exists', early);
       client.on('expunge', early);
       client.on('flags', early);
+      const idleSupportedNow = this.hasCapability('IDLE');
+      if (!idleSupportedNow) {
+        const pollMs = Math.min(1_000, Math.max(250, Math.floor(timeoutMs / 3)));
+        (client as ImapFlow & { maxIdleTime: number | false }).maxIdleTime = pollMs;
+      }
+      const beforeCount = client.mailbox ? client.mailbox.exists : 0;
       const idleResult = client.idle();
       await Promise.race([idleResult, done]);
       clearTimeout(timer);
@@ -419,6 +440,18 @@ export class ImapFlowSession implements ImapSession {
           highestModseq: true,
         })) || { path },
       );
+      if (
+        !idleSupported &&
+        (status.messages ?? 0) > beforeCount &&
+        !changes.some((change) => change.kind === 'exists')
+      ) {
+        changes.push({
+          kind: 'exists',
+          path,
+          count: status.messages,
+          prevCount: beforeCount,
+        });
+      }
       return { timedOut: changes.length === 0, idleSupported, changes, status };
     } catch (error) {
       throw mapTransportError(error);
@@ -427,7 +460,105 @@ export class ImapFlowSession implements ImapSession {
       client.off('exists', onExists);
       client.off('expunge', onExpunge);
       client.off('flags', onFlags);
+      client.off('exists', early);
+      client.off('expunge', early);
+      client.off('flags', early);
     }
+  }
+
+  async getAcl(path: string): Promise<Array<{ identifier: string; rights: string }>> {
+    if (!this.hasCapability('ACL')) {
+      throw new MailError('CAPABILITY_UNSUPPORTED', 'The server does not advertise ACL.');
+    }
+    const entries: Array<{ identifier: string; rights: string }> = [];
+    const raw = this.requireClient() as unknown as RawClient;
+    const response = await raw.exec('GETACL', [{ type: 'ATOM', value: path }], {
+      untagged: {
+        ACL: (untagged) => {
+          const values = (untagged.attributes ?? []).map((item) => String(item.value ?? ''));
+          for (let index = 1; index + 1 < values.length; index += 2) {
+            const identifier = values[index];
+            const rights = values[index + 1];
+            if (identifier && rights) {
+              entries.push({ identifier, rights });
+            }
+          }
+        },
+      },
+    });
+    response.next();
+    return entries;
+  }
+
+  async setAcl(
+    path: string,
+    identifier: string,
+    rights: string,
+    action: 'set' | 'remove',
+  ): Promise<void> {
+    if (!this.hasCapability('ACL')) {
+      throw new MailError('CAPABILITY_UNSUPPORTED', 'The server does not advertise ACL.');
+    }
+    const raw = this.requireClient() as unknown as RawClient;
+    const command = action === 'remove' ? 'DELETEACL' : 'SETACL';
+    const attributes =
+      action === 'remove'
+        ? [
+            { type: 'ATOM', value: path },
+            { type: 'ATOM', value: identifier },
+          ]
+        : [
+            { type: 'ATOM', value: path },
+            { type: 'ATOM', value: identifier },
+            { type: 'ATOM', value: rights },
+          ];
+    const response = await raw.exec(command, attributes);
+    response.next();
+  }
+
+  async getMetadata(path: string, entries: string[]): Promise<Record<string, string | null>> {
+    if (!this.hasCapability('METADATA') && !this.hasCapability('METADATA-SERVER')) {
+      throw new MailError('CAPABILITY_UNSUPPORTED', 'The server does not advertise METADATA.');
+    }
+    const found: Record<string, string | null> = {};
+    for (const entry of entries) {
+      found[entry] = null;
+    }
+    const raw = this.requireClient() as unknown as RawClient;
+    const response = await raw.exec(
+      'GETMETADATA',
+      [{ type: 'ATOM', value: path }, entries.map((entry) => ({ type: 'ATOM', value: entry }))],
+      {
+        untagged: {
+          METADATA: (untagged) => {
+            const values = untagged.attributes ?? [];
+            const pairs = values[1]?.attributes ?? values.slice(1);
+            for (let index = 0; index + 1 < pairs.length; index += 2) {
+              const key = String(pairs[index]?.value ?? '');
+              const rawValue = pairs[index + 1]?.value;
+              if (key) {
+                found[key] = rawValue === undefined ? null : String(rawValue);
+              }
+            }
+          },
+        },
+      },
+    );
+    response.next();
+    return found;
+  }
+
+  async setMetadata(path: string, entries: Record<string, string | null>): Promise<void> {
+    if (!this.hasCapability('METADATA') && !this.hasCapability('METADATA-SERVER')) {
+      throw new MailError('CAPABILITY_UNSUPPORTED', 'The server does not advertise METADATA.');
+    }
+    const pairs = Object.entries(entries).map(([key, value]) => [
+      { type: 'ATOM', value: key },
+      value === null ? { type: 'ATOM', value: 'NIL' } : { type: 'STRING', value },
+    ]);
+    const raw = this.requireClient() as unknown as RawClient;
+    const response = await raw.exec('SETMETADATA', [{ type: 'ATOM', value: path }, pairs]);
+    response.next();
   }
 
   private async open(): Promise<void> {
@@ -454,8 +585,9 @@ export class ImapFlowSession implements ImapSession {
       connectionTimeout: endpoint.timeoutMs,
       greetingTimeout: Math.min(endpoint.timeoutMs, 16_000),
       socketTimeout: endpoint.timeoutMs,
-      clientInfo: { name: 'mail-mcp', version: '0.1.0' },
-      auth: this.authOptions(),
+      clientInfo: { name: 'mail-mcp', version: VERSION },
+      auth: await this.authOptions(),
+      qresync: true,
     };
     if (!endpoint.secure) {
       options.doSTARTTLS =
@@ -465,12 +597,24 @@ export class ImapFlowSession implements ImapSession {
             ? false
             : undefined;
     }
-    const client = new ImapFlow(options);
+    let client = new ImapFlow(options);
     try {
       await client.connect();
     } catch (error) {
       client.close();
-      throw mapTransportError(error);
+      const mapped = mapTransportError(error);
+      if (mapped.code === 'AUTH_FAILED' && this.account.auth.type === 'oauth2') {
+        options.auth = await this.authOptions({ force: true });
+        client = new ImapFlow(options);
+        try {
+          await client.connect();
+        } catch (retryError) {
+          client.close();
+          throw mapTransportError(retryError);
+        }
+      } else {
+        throw mapped;
+      }
     }
     this.client = client;
     this.capabilities.clear();
@@ -484,14 +628,16 @@ export class ImapFlowSession implements ImapSession {
     });
   }
 
-  private authOptions(): ImapFlowOptions['auth'] {
+  private async authOptions(options?: { force?: boolean }): Promise<ImapFlowOptions['auth']> {
     if (this.account.auth.type === 'password') {
       return { user: this.account.user, pass: this.account.auth.password };
     }
-    if (!this.accessToken) {
+    const token = await this.accessToken(options);
+    if (!token) {
       throw new MailError('AUTH_FAILED', `Account "${this.account.id}" has no OAuth access token.`);
     }
-    return { user: this.account.user, accessToken: this.accessToken };
+    // ImapFlow prefers AUTH=OAUTHBEARER when the server advertises it, and otherwise uses XOAUTH2.
+    return { user: this.account.user, accessToken: token };
   }
 
   private requireClient(): ImapFlow {
@@ -526,11 +672,31 @@ class FlowMailbox implements OpenMailbox {
   }
 
   async search(compiled: CompiledSearch): Promise<number[]> {
-    const result = await this.client.search(compiled.query, { uid: true });
+    const esearch =
+      this.session.hasCapability('ESEARCH') || this.session.hasCapability('IMAP4REV2');
+    const result = esearch
+      ? await this.client.search(compiled.query as SearchObject, {
+          uid: true,
+          returnOptions: ['ALL', 'COUNT'],
+        })
+      : await this.client.search(compiled.query as SearchObject, { uid: true });
+    if (result === false) {
+      throw new MailError(
+        'PROTOCOL_ERROR',
+        'The server refused the SEARCH command.',
+        'The mailbox was not empty; the search itself failed. Narrow the criteria or check capabilities.',
+      );
+    }
     if (!result) {
       return [];
     }
-    return result;
+    if (Array.isArray(result)) {
+      return result;
+    }
+    if (result.all) {
+      return parseSequenceSet(result.all);
+    }
+    return [];
   }
 
   async fetchSummaries(
@@ -594,35 +760,63 @@ class FlowMailbox implements OpenMailbox {
     if (parts.length === 0) {
       return [];
     }
-    const row = await this.client.fetchOne(
-      String(uid),
-      {
-        uid: true,
-        bodyStructure: true,
-        bodyParts: parts.map((part) =>
-          part.maxLength ? { key: part.key, maxLength: part.maxLength } : part.key,
-        ),
-      },
-      { uid: true },
-    );
-    if (!row) {
-      return [];
-    }
-    const structure = toBodyNode(row.bodyStructure);
+    const structure = await this.fetchStructure(uid);
+    const binary = this.session.hasCapability('BINARY') || this.session.hasCapability('IMAP4REV2');
     const out: FetchedPart[] = [];
     for (const part of parts) {
-      const content = row.bodyParts?.get(part.key);
+      const meta =
+        findNode(structure, part.key) ??
+        (part.key === '1' && structure && structure.children.length === 0 ? structure : null);
+      let content: Buffer | undefined;
+      let truncated = false;
+      try {
+        const downloaded = await this.client.download(String(uid), part.key, {
+          uid: true,
+          binary,
+          ...(part.maxLength ? { maxBytes: part.maxLength + 1 } : {}),
+        });
+        if (downloaded.content) {
+          const chunks: Buffer[] = [];
+          for await (const chunk of downloaded.content) {
+            chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+          }
+          content = Buffer.concat(chunks);
+        }
+      } catch {
+        content = undefined;
+      }
+      if (!content) {
+        const row = await this.client.fetchOne(
+          String(uid),
+          {
+            uid: true,
+            bodyParts: [
+              part.maxLength ? { key: part.key, maxLength: part.maxLength + 1 } : part.key,
+            ],
+          },
+          { uid: true },
+        );
+        const raw = row ? row.bodyParts?.get(part.key) : undefined;
+        if (raw) {
+          content = decodeTransfer(Buffer.from(raw), meta?.encoding);
+          if (meta?.parameters.charset && (meta.type ?? '').toLowerCase() === 'text') {
+            content = Buffer.from(decodeBody(content, meta.parameters.charset), 'utf8');
+          }
+        }
+      }
       if (!content) {
         continue;
       }
-      const meta = findNode(structure, part.key);
-      const fetched: FetchedPart = { partId: part.key, content: Buffer.from(content) };
+      if (part.maxLength !== undefined && content.length > part.maxLength) {
+        content = content.subarray(0, part.maxLength);
+        truncated = true;
+      }
+      const fetched: FetchedPart = { partId: part.key, content, truncated };
       if (meta) {
         const type = meta.subtype ? `${meta.type}/${meta.subtype}` : meta.type;
         fetched.contentType = type;
-        const charset = meta.parameters.charset;
-        if (charset) {
-          fetched.charset = charset;
+        if (meta.parameters.charset) {
+          fetched.charset = meta.parameters.charset;
         }
         const filename = meta.dispositionParameters.filename || meta.parameters.name;
         if (filename) {
@@ -631,9 +825,10 @@ class FlowMailbox implements OpenMailbox {
         if (meta.disposition) {
           fetched.disposition = meta.disposition;
         }
-        if (meta.encoding) {
-          fetched.encoding = meta.encoding;
+        if (meta.id) {
+          fetched.cid = meta.id;
         }
+        fetched.encoding = 'binary';
       }
       out.push(fetched);
     }
@@ -657,16 +852,36 @@ class FlowMailbox implements OpenMailbox {
     flags: string[],
     operation: 'add' | 'remove' | 'set',
     unchangedSince?: string,
-  ): Promise<void> {
+  ): Promise<FlagUpdate> {
     if (uids.length === 0) {
-      return;
+      return { updated: [], modified: [], missing: [] };
     }
     const normalized = normalizeFlags(flags);
-    const options = {
-      uid: true,
-      ...(unchangedSince ? { unchangedSince: BigInt(unchangedSince) } : {}),
-    };
-    const range = uidList(uids);
+    const present = await this.search({ query: { uid: uids.join(',') }, requires: [] });
+    const presentSet = new Set(present);
+    const missing = uids.filter((uid) => !presentSet.has(uid));
+    const targets = uids.filter((uid) => presentSet.has(uid));
+    if (targets.length === 0) {
+      return { updated: [], modified: [], missing };
+    }
+    if (unchangedSince) {
+      if (!this.session.condstoreEnabled()) {
+        throw new MailError(
+          'CAPABILITY_UNSUPPORTED',
+          'unchangedSince requires CONDSTORE to be enabled on this connection.',
+          'The server must answer ENABLE with CONDSTORE. Advertising the token is not enough.',
+        );
+      }
+      const modified = await this.storeConditional(targets, normalized, operation, unchangedSince);
+      const modifiedSet = new Set(modified);
+      return {
+        updated: targets.filter((uid) => !modifiedSet.has(uid)),
+        modified,
+        missing,
+      };
+    }
+    const options = { uid: true };
+    const range = uidList(targets);
     const ok =
       operation === 'add'
         ? await this.client.messageFlagsAdd(range, normalized, options)
@@ -676,6 +891,34 @@ class FlowMailbox implements OpenMailbox {
     if (!ok) {
       throw new MailError('PROTOCOL_ERROR', 'The server rejected the flag update.');
     }
+    return { updated: targets, modified: [], missing };
+  }
+
+  private async storeConditional(
+    uids: number[],
+    flags: string[],
+    operation: 'add' | 'remove' | 'set',
+    unchangedSince: string,
+  ): Promise<number[]> {
+    const op =
+      operation === 'remove'
+        ? '-FLAGS.SILENT'
+        : operation === 'set'
+          ? 'FLAGS.SILENT'
+          : '+FLAGS.SILENT';
+    const raw = this.client as unknown as RawClient;
+    const response = await raw.exec('UID STORE', [
+      { type: 'SEQUENCE', value: uidList(uids) },
+      [
+        { type: 'ATOM', value: 'UNCHANGEDSINCE' },
+        { type: 'ATOM', value: unchangedSince },
+      ],
+      { type: 'ATOM', value: op },
+      flags.map((flag) => ({ type: 'ATOM', value: flag })),
+    ]);
+    const modified = modifiedFromResponse(response);
+    response.next();
+    return modified;
   }
 
   async setLabels(
@@ -731,72 +974,103 @@ class FlowMailbox implements OpenMailbox {
     response.next();
   }
 
-  async serverSort(compiled: CompiledSearch, keys: SortKey[]): Promise<number[] | null> {
+  async serverSort(
+    compiled: CompiledSearch,
+    keys: SortKey[],
+    window?: { start: number; count: number },
+  ): Promise<number[] | null> {
     if (!this.session.hasCapability('SORT') || keys.length === 0) {
       return null;
     }
-    if (!isMatchAll(compiled.query)) {
-      return null;
-    }
-    const criteria: unknown[] = [];
-    for (const key of keys) {
-      const imap = sortKeyToImap(key);
-      if (imap.startsWith('REVERSE ')) {
-        criteria.push({ type: 'ATOM', value: 'REVERSE' });
-        criteria.push({ type: 'ATOM', value: imap.slice('REVERSE '.length) });
-      } else {
-        criteria.push({ type: 'ATOM', value: imap });
+    const searchKey = searchAttributes(this.client, compiled);
+    const displays = this.session.hasCapability('SORT=DISPLAY') ? [true, false] : [false];
+    let lastError: unknown;
+    for (const display of displays) {
+      const criteria: unknown[] = [];
+      for (const key of keys) {
+        const imap = sortKeyToImap(key, display);
+        if (imap.startsWith('REVERSE ')) {
+          criteria.push({ type: 'ATOM', value: 'REVERSE' });
+          criteria.push({ type: 'ATOM', value: imap.slice('REVERSE '.length) });
+        } else {
+          criteria.push({ type: 'ATOM', value: imap });
+        }
+      }
+      const plain = [criteria, { type: 'ATOM', value: 'UTF-8' }, searchKey];
+      const attempts: unknown[][] = [];
+      if (this.session.hasCapability('ESORT') && window && !display) {
+        const end = window.start + window.count - 1;
+        attempts.push([
+          [
+            { type: 'ATOM', value: 'RETURN' },
+            [
+              { type: 'ATOM', value: 'PARTIAL' },
+              { type: 'ATOM', value: `${window.start}:${end}` },
+              { type: 'ATOM', value: 'COUNT' },
+            ],
+          ],
+          ...plain,
+        ]);
+      }
+      attempts.push(plain);
+      for (const commandArgs of attempts) {
+        const numbers: number[] = [];
+        let count: number | undefined;
+        try {
+          const raw = this.client as unknown as RawClient;
+          const response = await raw.exec('UID SORT', commandArgs, {
+            untagged: {
+              SORT: (untagged) => {
+                for (const attribute of untagged.attributes ?? []) {
+                  const value = Number(attribute.value);
+                  if (Number.isInteger(value)) {
+                    numbers.push(value);
+                  }
+                }
+              },
+              ESEARCH: (untagged) => {
+                const parsed = esearchNumbers(untagged.attributes ?? []);
+                numbers.push(...parsed.uids);
+                if (parsed.count !== undefined) {
+                  count = parsed.count;
+                }
+              },
+            },
+          });
+          response.next();
+          if (count === 0) {
+            return [];
+          }
+          return numbers;
+        } catch (error) {
+          lastError = error;
+        }
       }
     }
-    const numbers: number[] = [];
-    try {
-      const raw = this.client as unknown as RawClient;
-      const response = await raw.exec(
-        'UID SORT',
-        [criteria, { type: 'ATOM', value: 'UTF-8' }, { type: 'ATOM', value: 'ALL' }],
-        {
-          untagged: {
-            SORT: (untagged) => {
-              for (const attribute of untagged.attributes ?? []) {
-                const value = Number(attribute.value);
-                if (Number.isInteger(value)) {
-                  numbers.push(value);
-                }
-              }
-            },
-          },
-        },
-      );
-      response.next();
-      return numbers;
-    } catch (error) {
-      this.sessionHasSortFallback(error);
-      return null;
-    }
+    throw mapTransportError(lastError);
   }
 
   async serverThread(
-    algorithm: 'REFERENCES' | 'ORDEREDSUBJECT',
+    algorithm: 'REFERENCES' | 'ORDEREDSUBJECT' | 'REFS',
     compiled: CompiledSearch,
   ): Promise<ThreadNode[] | null> {
-    if (!this.session.hasCapability('THREAD') || !isMatchAll(compiled.query)) {
+    const token = `THREAD=${algorithm}`;
+    const bare = this.session.hasExactCapability('THREAD');
+    if (!this.session.hasCapability(token) && !bare) {
       return null;
     }
     const nodes: ThreadNode[] = [];
+    const searchKey = searchAttributes(this.client, compiled);
     try {
       const raw = this.client as unknown as RawClient;
       const response = await raw.exec(
         'UID THREAD',
-        [
-          { type: 'ATOM', value: algorithm },
-          { type: 'ATOM', value: 'UTF-8' },
-          { type: 'ATOM', value: 'ALL' },
-        ],
+        [{ type: 'ATOM', value: algorithm }, { type: 'ATOM', value: 'UTF-8' }, searchKey],
         {
           untagged: {
             THREAD: (untagged) => {
               for (const attribute of untagged.attributes ?? []) {
-                nodes.push(parseThreadNode(attribute));
+                nodes.push(parseThreadNode(asThreadAttr(attribute)));
               }
             },
           },
@@ -804,57 +1078,86 @@ class FlowMailbox implements OpenMailbox {
       );
       response.next();
       return nodes;
-    } catch {
-      return null;
+    } catch (error) {
+      throw mapTransportError(error);
     }
-  }
-
-  private sessionHasSortFallback(error: unknown): void {
-    const message = error instanceof Error ? error.message : 'sort failed';
-    void message;
   }
 
   private async fillSnippets(summaries: MessageSummary[], snippetChars: number): Promise<void> {
-    const groups = new Map<string, number[]>();
-    const kindByUid = new Map<number, 'plain' | 'html'>();
+    if (this.session.hasCapability('PREVIEW') || this.session.hasCapability('SNIPPET')) {
+      const preview = await this.fetchPreview(summaries.map((item) => item.uid));
+      if (preview.size > 0) {
+        for (const summary of summaries) {
+          const text = preview.get(summary.uid);
+          if (text) {
+            summary.snippet = makeSnippet(text, snippetChars);
+          }
+        }
+        return;
+      }
+    }
+    const limit = Math.max(512, snippetChars * 8);
     for (const summary of summaries) {
-      const row = summary;
-      const structure = summaryStructure.get(row);
-      const part = findTextPart(structure ?? null);
+      const structure = summaryStructure.get(summary) ?? null;
+      const part = findTextPart(structure);
       if (!part) {
         continue;
       }
-      kindByUid.set(row.uid, part.kind);
-      const list = groups.get(part.part) ?? [];
-      list.push(row.uid);
-      groups.set(part.part, list);
-    }
-    const textByUid = new Map<number, string>();
-    for (const [part, partUids] of groups) {
-      const rows = await this.client.fetchAll(
-        uidList(partUids),
-        { uid: true, bodyParts: [{ key: part, maxLength: Math.max(512, snippetChars * 8) }] },
-        { uid: true },
+      const node = findNode(structure, part.part);
+      const fetched = await this.fetchParts(summary.uid, [{ key: part.part, maxLength: limit }]);
+      const content = fetched[0]?.content;
+      if (!content) {
+        continue;
+      }
+      const charset = node?.parameters.charset ?? fetched[0]?.charset;
+      const decoded =
+        fetched[0]?.encoding === 'binary' ? content.toString('utf8') : decodeBody(content, charset);
+      summary.snippet = makeSnippet(
+        part.kind === 'html' ? htmlToRoughText(decoded) : decoded,
+        snippetChars,
       );
-      for (const row of rows) {
-        const content = row.bodyParts?.get(part);
-        if (!content) {
-          continue;
-        }
-        const charset = summaryStructure.get(
-          summaries.find((item) => item.uid === row.uid) ?? summaries[0]!,
-        )?.parameters.charset;
-        const decoded = decodeBody(Buffer.from(content), charset);
-        const kind = kindByUid.get(row.uid);
-        textByUid.set(row.uid, kind === 'html' ? htmlToRoughText(decoded) : decoded);
-      }
     }
-    for (const summary of summaries) {
-      const text = textByUid.get(summary.uid);
-      if (text) {
-        summary.snippet = makeSnippet(text, snippetChars);
-      }
+  }
+
+  private async fetchPreview(uids: number[]): Promise<Map<number, string>> {
+    const out = new Map<number, string>();
+    if (uids.length === 0) {
+      return out;
     }
+    try {
+      const raw = this.client as unknown as RawClient;
+      await raw
+        .exec(
+          'UID FETCH',
+          [{ type: 'SEQUENCE', value: uidList(uids) }, [{ type: 'ATOM', value: 'PREVIEW' }]],
+          {
+            untagged: {
+              FETCH: (untagged) => {
+                const values = untagged.attributes ?? [];
+                let uid: number | undefined;
+                let preview: string | undefined;
+                for (let index = 0; index < values.length; index += 1) {
+                  const token = String(values[index]?.value ?? '').toUpperCase();
+                  const next = values[index + 1]?.value;
+                  if (token === 'UID' && next !== undefined) {
+                    uid = Number(next);
+                  }
+                  if (token === 'PREVIEW' && typeof next === 'string') {
+                    preview = next;
+                  }
+                }
+                if (uid && preview) {
+                  out.set(uid, preview);
+                }
+              },
+            },
+          },
+        )
+        .then((response) => response.next());
+    } catch {
+      return out;
+    }
+    return out;
   }
 }
 
@@ -1062,7 +1365,7 @@ function findNode(node: BodyNode | null, part: string): BodyNode | null {
   if (!node) {
     return null;
   }
-  if (node.part === part) {
+  if (node.part === part || (!node.part && part === '1' && node.children.length === 0)) {
     return node;
   }
   for (const child of node.children) {
@@ -1101,9 +1404,89 @@ function uidMapToRecord(map: Map<number, number> | undefined): Record<string, nu
   return out;
 }
 
+function searchAttributes(client: ImapFlow, compiled: CompiledSearch): unknown {
+  if (isMatchAll(compiled.query)) {
+    return { type: 'ATOM', value: 'ALL' };
+  }
+  return searchCompiler(client, compiled.query as SearchObject);
+}
+
 function isMatchAll(query: Record<string, unknown>): boolean {
   const keys = Object.keys(query);
   return keys.length === 1 && keys[0] === 'all' && query.all === true;
+}
+
+function modifiedFromResponse(response: unknown): number[] {
+  const found: string[] = [];
+  collectModified(response, found);
+  return found.flatMap((value) => parseSequenceSet(value));
+}
+
+function collectModified(node: unknown, out: string[]): void {
+  if (Array.isArray(node)) {
+    for (let index = 0; index < node.length; index += 1) {
+      const item = node[index] as { value?: unknown } | undefined;
+      if (
+        item &&
+        typeof item === 'object' &&
+        String(item.value ?? '').toUpperCase() === 'MODIFIED'
+      ) {
+        const next = node[index + 1] as { value?: unknown } | undefined;
+        if (next && next.value !== undefined) {
+          out.push(String(next.value));
+        }
+      }
+      collectModified(node[index], out);
+    }
+    return;
+  }
+  if (node && typeof node === 'object') {
+    for (const value of Object.values(node as Record<string, unknown>)) {
+      collectModified(value, out);
+    }
+  }
+}
+
+function esearchNumbers(attributes: ImapAttr[]): { uids: number[]; count?: number } {
+  const uids: number[] = [];
+  let count: number | undefined;
+  const visit = (nodes: ImapAttr[]): void => {
+    for (let index = 0; index < nodes.length; index += 1) {
+      const token = String(nodes[index]?.value ?? '').toUpperCase();
+      const next = nodes[index + 1];
+      if (token === 'COUNT' && next?.value !== undefined) {
+        count = Number(next.value);
+      }
+      if ((token === 'ALL' || token === 'PARTIAL') && next) {
+        const text = sequenceText(next);
+        if (text) {
+          uids.push(...parseSequenceSet(text));
+        }
+      }
+      if (next?.attributes) {
+        visit(next.attributes);
+      }
+    }
+  };
+  visit(attributes);
+  return { uids, ...(count !== undefined ? { count } : {}) };
+}
+
+function sequenceText(node: ImapAttr): string {
+  if (node.value !== undefined && !node.attributes?.length) {
+    return String(node.value);
+  }
+  return (node.attributes ?? [])
+    .map((item) => (item.value !== undefined ? String(item.value) : ''))
+    .filter(Boolean)
+    .join(',');
+}
+
+function asThreadAttr(value: unknown): ImapAttr {
+  if (Array.isArray(value)) {
+    return { attributes: value.map((item) => asThreadAttr(item)) };
+  }
+  return value as ImapAttr;
 }
 
 export function parseThreadNode(attribute: ImapAttr): ThreadNode {

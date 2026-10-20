@@ -7,11 +7,12 @@ const KEY_PATTERN = /pass(word|wd)?|token|secret|authorization|credential|cookie
 
 /**
  * Remove credential-shaped substrings from a log or error string.
- * Known secret values (passwords, tokens) are replaced when they are at least 4 characters.
+ * Known secret values of any non-empty length are replaced. Shorter values are included
+ * so a server that echoes a short password cannot leak it.
  */
 export function redactText(value: string, secrets: readonly string[] = []): string {
   let out = value;
-  const unique = [...new Set(secrets.filter((secret) => secret.length >= 4))].sort(
+  const unique = [...new Set(secrets.filter((secret) => secret.length >= 1))].sort(
     (a, b) => b.length - a.length,
   );
   for (const secret of unique) {

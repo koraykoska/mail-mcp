@@ -49,15 +49,15 @@ The file may contain `//` and `/* */` comments and trailing commas. Strings may 
 
 ## Connection fields
 
-| Field                    | Meaning                                                                                                               |
-| ------------------------ | --------------------------------------------------------------------------------------------------------------------- |
-| `host`, `port`           | Server address.                                                                                                       |
-| `secure`                 | `true` for implicit TLS (typically 993 or 465).                                                                       |
-| `starttls`               | `required` (default when `secure` is false), `optional`, or `disabled`. `disabled` is cleartext and must be explicit. |
-| `timeoutMs`              | Connect and command budget, default 30000.                                                                            |
-| `tls.rejectUnauthorized` | Default `true`. `false` skips certificate checks. Unsafe except for a local bridge you trust.                         |
-| `tls.caFile`             | PEM file of extra CAs.                                                                                                |
-| `tls.servername`         | SNI / certificate name when it differs from `host`.                                                                   |
+| Field                    | Meaning                                                                                                                                                                                                                                                                                    |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `host`, `port`           | Server address.                                                                                                                                                                                                                                                                            |
+| `secure`                 | `true` for implicit TLS (typically 993 or 465).                                                                                                                                                                                                                                            |
+| `starttls`               | `required` (default when `secure` is false), `optional`, or `disabled`. `optional` stays on cleartext when the server does not offer STARTTLS. `disabled` is cleartext and must be explicit. The process logs a warning when `optional` is set and when `tls.rejectUnauthorized` is false. |
+| `timeoutMs`              | Connect and command budget, default 30000.                                                                                                                                                                                                                                                 |
+| `tls.rejectUnauthorized` | Default `true`. `false` skips certificate checks. Unsafe except for a local bridge you trust.                                                                                                                                                                                              |
+| `tls.caFile`             | PEM file of extra CAs.                                                                                                                                                                                                                                                                     |
+| `tls.servername`         | SNI / certificate name when it differs from `host`.                                                                                                                                                                                                                                        |
 
 ## Authentication
 

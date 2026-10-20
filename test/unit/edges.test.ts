@@ -141,7 +141,31 @@ describe('edges', () => {
     );
   });
 
-  it('retries a dropped IMAP connection once', async () => {
+  it('does not run an IMAP command again after the connection drops', async () => {
+    const session = {
+      async connect() {
+        return undefined;
+      },
+      async logout() {
+        return undefined;
+      },
+      close() {
+        return undefined;
+      },
+    } as unknown as ImapSession;
+    const pool = new ImapConnectionPool(async () => session, 1, createLogger({ level: 'silent' }));
+    let calls = 0;
+    await expect(
+      pool.use('work', async () => {
+        calls += 1;
+        throw new MailError('CONNECTION_FAILED', 'reset');
+      }),
+    ).rejects.toThrow(/reset/);
+    expect(calls).toBe(1);
+    await pool.close();
+  });
+
+  it('retries connecting before a command is sent', async () => {
     let connects = 0;
     const session = {
       async connect() {
@@ -158,15 +182,9 @@ describe('edges', () => {
       },
     } as unknown as ImapSession;
     const pool = new ImapConnectionPool(async () => session, 1, createLogger({ level: 'silent' }));
-    let calls = 0;
-    await pool.use('work', async () => {
-      calls += 1;
-      if (calls === 1) {
-        throw new MailError('CONNECTION_FAILED', 'reset');
-      }
-      return 'ok';
-    });
-    expect(calls).toBe(2);
+    const value = await pool.use('work', async () => 'ok');
+    expect(value).toBe('ok');
+    expect(connects).toBeGreaterThan(1);
     await pool.close();
   });
 });

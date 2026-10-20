@@ -1,10 +1,16 @@
+import {
+  capabilityMatches,
+  hasExactCapability as exactCapability,
+} from '../../src/imap/capabilities.js';
 import { MailError } from '../../src/errors.js';
 import type { CompiledSearch } from '../../src/imap/search.js';
 import type { SortKey } from '../../src/imap/sort.js';
 import type { ThreadNode } from '../../src/mime/thread.js';
 import type {
+  AclEntry,
   BodyNode,
   FetchedPart,
+  FlagUpdate,
   ImapSession,
   MailboxChange,
   MailboxInfo,
@@ -68,7 +74,15 @@ export class FakeSession implements ImapSession {
   }
 
   hasCapability(name: string): boolean {
-    return [...this.capabilities.keys()].some((key) => key.toUpperCase() === name.toUpperCase());
+    return capabilityMatches(this.capabilities.keys(), name);
+  }
+
+  hasExactCapability(name: string): boolean {
+    return exactCapability(this.capabilities.keys(), name);
+  }
+
+  condstoreEnabled(): boolean {
+    return this.hasCapability('CONDSTORE') || this.hasCapability('QRESYNC');
   }
 
   serverId(): Record<string, string> | null {
@@ -198,6 +212,32 @@ export class FakeSession implements ImapSession {
   ): Promise<T> {
     const stored = this.requireBox(path);
     return fn(new FakeBox(stored, this));
+  }
+
+  async getAcl(): Promise<AclEntry[]> {
+    if (!this.hasCapability('ACL')) {
+      throw new MailError('CAPABILITY_UNSUPPORTED', 'The server does not advertise ACL.');
+    }
+    return [{ identifier: 'user', rights: 'lrswipkxtecdan' }];
+  }
+
+  async setAcl(): Promise<void> {
+    if (!this.hasCapability('ACL')) {
+      throw new MailError('CAPABILITY_UNSUPPORTED', 'The server does not advertise ACL.');
+    }
+  }
+
+  async getMetadata(_path: string, entries: string[]): Promise<Record<string, string | null>> {
+    if (!this.hasCapability('METADATA')) {
+      throw new MailError('CAPABILITY_UNSUPPORTED', 'The server does not advertise METADATA.');
+    }
+    return Object.fromEntries(entries.map((entry) => [entry, null]));
+  }
+
+  async setMetadata(): Promise<void> {
+    if (!this.hasCapability('METADATA')) {
+      throw new MailError('CAPABILITY_UNSUPPORTED', 'The server does not advertise METADATA.');
+    }
   }
 
   async waitForChanges(path: string, _timeoutMs: number): Promise<WaitResult> {
@@ -351,9 +391,21 @@ class FakeBox implements OpenMailbox {
     uids: number[],
     flags: string[],
     operation: 'add' | 'remove' | 'set',
-  ): Promise<void> {
+    unchangedSince?: string,
+  ): Promise<FlagUpdate> {
+    const missing: number[] = [];
+    const modified: number[] = [];
+    const updated: number[] = [];
     for (const uid of uids) {
-      const message = this.require(uid);
+      const message = this.box.messages.find((item) => item.uid === uid);
+      if (!message) {
+        missing.push(uid);
+        continue;
+      }
+      if (unchangedSince === '0') {
+        modified.push(uid);
+        continue;
+      }
       if (operation === 'set') {
         message.flags = [...flags];
       } else if (operation === 'add') {
@@ -365,7 +417,9 @@ class FakeBox implements OpenMailbox {
       } else {
         message.flags = message.flags.filter((flag) => !flags.includes(flag));
       }
+      updated.push(uid);
     }
+    return { updated, modified, missing };
   }
 
   async setLabels(): Promise<void> {
@@ -412,7 +466,11 @@ class FakeBox implements OpenMailbox {
     this.box.messages = this.box.messages.filter((message) => !message.flags.includes('\\Deleted'));
   }
 
-  async serverSort(compiled: CompiledSearch, _keys: SortKey[]): Promise<number[] | null> {
+  async serverSort(
+    compiled: CompiledSearch,
+    _keys: SortKey[],
+    _window?: { start: number; count: number },
+  ): Promise<number[] | null> {
     if (!this.session.hasCapability('SORT')) {
       return null;
     }
@@ -420,7 +478,10 @@ class FakeBox implements OpenMailbox {
     return uids.sort((left, right) => right - left);
   }
 
-  async serverThread(): Promise<ThreadNode[] | null> {
+  async serverThread(
+    _algorithm: 'REFERENCES' | 'ORDEREDSUBJECT' | 'REFS',
+    _compiled: CompiledSearch,
+  ): Promise<ThreadNode[] | null> {
     if (!this.session.hasCapability('THREAD')) {
       return null;
     }

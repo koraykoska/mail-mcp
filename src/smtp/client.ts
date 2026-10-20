@@ -1,7 +1,8 @@
 import { readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import nodemailer from 'nodemailer';
 import type SMTPTransport from 'nodemailer/lib/smtp-transport/index.js';
-import { mapTransportError } from '../errors.js';
+import { MailError, mapTransportError } from '../errors.js';
 import type { EndpointSettings, ResolvedAccount } from '../config/schema.js';
 import { addressToAscii } from '../mime/address.js';
 
@@ -20,6 +21,8 @@ export interface SmtpSendInput {
   raw: Buffer;
   envelope: { from: string; to: string[] };
   dsn?: DsnOptions;
+  /** Ask for BODY=8BITMIME when the raw message contains octets above 7 bits. */
+  eightBit?: boolean;
 }
 
 export interface SmtpSendResult {
@@ -40,9 +43,8 @@ export function createSmtpSender(account: ResolvedAccount, accessToken?: string)
   if (!account.smtp) {
     throw mapTransportError(new Error(`Account ${account.id} has no SMTP endpoint configured`));
   }
-  const transport = nodemailer.createTransport(
-    transportOptions(account, account.smtp, accessToken),
-  );
+  const options = transportOptions(account, account.smtp, accessToken);
+  const transport = nodemailer.createTransport(options);
   return {
     async verify() {
       try {
@@ -53,14 +55,26 @@ export function createSmtpSender(account: ResolvedAccount, accessToken?: string)
     },
     async send(input) {
       try {
-        const info = await transport.sendMail({
+        if (input.eightBit) {
+          const offered = await extensionOffered(options, '8BITMIME');
+          if (!offered) {
+            throw new MailError(
+              'CAPABILITY_UNSUPPORTED',
+              'The message contains 8-bit octets and the SMTP server does not advertise 8BITMIME.',
+              'Send a 7-bit transfer encoding, or use a server that advertises 8BITMIME.',
+            );
+          }
+        }
+        const mail = {
           raw: input.raw,
           envelope: {
             from: addressToAscii(input.envelope.from),
             to: input.envelope.to.map(addressToAscii),
+            ...(input.eightBit ? { use8BitMime: true } : {}),
           },
           ...(input.dsn ? { dsn: toNodemailerDsn(input.dsn) } : {}),
-        });
+        };
+        const info = await transport.sendMail(mail);
         return {
           messageId: typeof info.messageId === 'string' ? info.messageId : undefined,
           accepted: asStrings(info.accepted),
@@ -125,6 +139,38 @@ function toNodemailerDsn(dsn: DsnOptions): Record<string, unknown> {
     ...(notify ? { notify } : {}),
     ...(dsn.orcpt ? { recipient: dsn.orcpt } : {}),
   };
+}
+
+async function extensionOffered(
+  options: SMTPTransport.Options,
+  extension: string,
+): Promise<boolean> {
+  const require = createRequire(import.meta.url);
+  const SMTPConnection = require('nodemailer/lib/smtp-connection/index.js') as new (
+    options: SMTPTransport.Options,
+  ) => {
+    connect(callback: (error?: Error) => void): void;
+    close(): void;
+    _supportedExtensions?: string[];
+    once(event: 'error', listener: (error: Error) => void): void;
+  };
+  return new Promise((resolve, reject) => {
+    const connection = new SMTPConnection({
+      ...options,
+      connectionTimeout: options.connectionTimeout,
+      greetingTimeout: options.greetingTimeout,
+    });
+    const finish = (error?: Error): void => {
+      connection.close();
+      if (error) {
+        reject(mapTransportError(error));
+        return;
+      }
+      resolve((connection._supportedExtensions ?? []).includes(extension));
+    };
+    connection.once('error', (error) => finish(error));
+    connection.connect((error) => finish(error ?? undefined));
+  });
 }
 
 function asStrings(value: unknown): string[] {

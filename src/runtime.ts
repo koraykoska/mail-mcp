@@ -25,12 +25,26 @@ export function createRuntime(options: RuntimeOptions): Runtime {
   const logger =
     options.logger ??
     createLogger({ level: options.config.logLevel, secrets: options.config.secrets });
+  for (const account of Object.values(options.config.accounts)) {
+    if (!account.imap.tls.rejectUnauthorized || account.smtp?.tls.rejectUnauthorized === false) {
+      logger.warn('tls certificate verification is disabled', { account: account.id });
+    }
+    if (account.imap.starttls === 'optional' || account.smtp?.starttls === 'optional') {
+      logger.warn('starttls optional can stay on cleartext if the server does not offer it', {
+        account: account.id,
+      });
+    }
+  }
   const fetchImpl = options.fetchImpl ?? fetch;
   const pool = new ImapConnectionPool(
     async (accountId) => {
       const account = requireAccount(options.config, accountId);
-      const token = await getAccessToken(account.auth, account.id, fetchImpl);
-      return new ImapFlowSession(account, token, logger.child({ account: accountId }));
+      return new ImapFlowSession(
+        account,
+        (tokenOptions) =>
+          getAccessToken(account.auth, account.id, fetchImpl, Date.now, tokenOptions),
+        logger.child({ account: accountId }),
+      );
     },
     options.config.poolSize,
     logger,

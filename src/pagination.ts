@@ -1,8 +1,10 @@
 import { MailError } from './errors.js';
 
 export interface PageCursor {
-  v: 1;
-  offset: number;
+  v: 1 | 2;
+  offset?: number;
+  /** Last UID returned on the previous page. The next page starts after this UID in the same order. */
+  afterUid?: number;
   uidValidity?: string;
 }
 
@@ -29,17 +31,39 @@ export function decodeCursor(value: string, expectedUidValidity?: string): PageC
       'Omit cursor to start from the first page.',
     );
   }
+  if (typeof parsed !== 'object' || parsed === null) {
+    throw new MailError('INVALID_ARGUMENT', 'The page cursor is not valid.');
+  }
+  const record = parsed as {
+    v?: unknown;
+    offset?: unknown;
+    afterUid?: unknown;
+    uidValidity?: unknown;
+  };
+  const version = record.v;
+  if (version !== 1 && version !== 2) {
+    throw new MailError('INVALID_ARGUMENT', 'The page cursor is not valid.');
+  }
   if (
-    typeof parsed !== 'object' ||
-    parsed === null ||
-    (parsed as { v?: unknown }).v !== 1 ||
-    typeof (parsed as { offset?: unknown }).offset !== 'number' ||
-    !Number.isInteger((parsed as { offset: number }).offset) ||
-    (parsed as { offset: number }).offset < 0
+    version === 1 &&
+    (typeof record.offset !== 'number' || !Number.isInteger(record.offset) || record.offset < 0)
   ) {
     throw new MailError('INVALID_ARGUMENT', 'The page cursor is not valid.');
   }
-  const cursor = parsed as PageCursor;
+  if (
+    version === 2 &&
+    (typeof record.afterUid !== 'number' ||
+      !Number.isInteger(record.afterUid) ||
+      record.afterUid < 1)
+  ) {
+    throw new MailError('INVALID_ARGUMENT', 'The page cursor is not valid.');
+  }
+  const cursor: PageCursor = {
+    v: version,
+    ...(typeof record.offset === 'number' ? { offset: record.offset } : {}),
+    ...(typeof record.afterUid === 'number' ? { afterUid: record.afterUid } : {}),
+    ...(typeof record.uidValidity === 'string' ? { uidValidity: record.uidValidity } : {}),
+  };
   if (expectedUidValidity && cursor.uidValidity && cursor.uidValidity !== expectedUidValidity) {
     throw new MailError(
       'UIDVALIDITY_CHANGED',
@@ -63,6 +87,27 @@ export function clampLimit(requested: number | undefined, fallback: number, max:
     );
   }
   return value;
+}
+
+/** Slice an ordered UID list after `afterUid`, so mail that arrives at the start does not shift the page. */
+export function pageAfterUid(
+  ordered: readonly number[],
+  limit: number,
+  afterUid: number | undefined,
+  uidValidity?: string,
+): { uids: number[]; nextCursor: string | null; offset: number } {
+  let start = 0;
+  if (afterUid !== undefined) {
+    const index = ordered.indexOf(afterUid);
+    start = index >= 0 ? index + 1 : 0;
+  }
+  const uids = ordered.slice(start, start + limit);
+  const last = uids[uids.length - 1];
+  const nextCursor =
+    last !== undefined && start + uids.length < ordered.length
+      ? encodeCursor({ v: 2, afterUid: last, ...(uidValidity ? { uidValidity } : {}) })
+      : null;
+  return { uids, nextCursor, offset: start };
 }
 
 export function paginate<T>(items: readonly T[], offset: number, limit: number): Page<T> {

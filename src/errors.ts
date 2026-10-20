@@ -88,7 +88,7 @@ export function mapTransportError(error: unknown): MailError {
     like.authenticationFailed === true ||
     name === 'AuthenticationFailure' ||
     code === 'AUTHENTICATIONFAILED' ||
-    /authentication failed|invalid credentials|login failed|auth(entication)?\s+fail|invalid login|bad credentials|535 |534 /.test(
+    /authentication failed|invalid credentials|invalid password|login failed|auth(entication)?\s+fail|invalid login|bad credentials|535 |534 /.test(
       lower,
     )
   ) {
@@ -100,7 +100,7 @@ export function mapTransportError(error: unknown): MailError {
   }
 
   if (
-    /certificate|self-signed|unable to verify|altname|err_tls|ssl routines|hostname\/ip does not match|tls/.test(
+    /certificate|self-signed|unable to verify|altname|err_tls|ssl routines|hostname\/ip does not match|tls handshake|starttls/.test(
       lower,
     ) ||
     code.startsWith('ERR_TLS') ||
@@ -185,8 +185,11 @@ export function mapTransportError(error: unknown): MailError {
   );
 }
 
-/** True when the pool should drop the session and try a fresh connection once. */
+/**
+ * True when a connection attempt failed before a command could have been applied.
+ * Timeouts are not retried: the command may already have reached the server.
+ */
 export function isRetryableConnectionError(error: unknown): boolean {
   const mapped = error instanceof MailError ? error : mapTransportError(error);
-  return mapped.code === 'CONNECTION_FAILED' || mapped.code === 'TIMEOUT';
+  return mapped.code === 'CONNECTION_FAILED';
 }

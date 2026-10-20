@@ -11,10 +11,6 @@ import { createSmtpSender } from '../../src/smtp/client.js';
 
 let greenmail: GreenMailEndpoints;
 
-beforeAll(async () => {
-  greenmail = await ensureGreenMail();
-}, 40_000);
-
 function runtimeFor(overrides: Partial<ReturnType<typeof account>> = {}) {
   const config = appConfig({
     imap: {
@@ -47,6 +43,10 @@ function runtimeFor(overrides: Partial<ReturnType<typeof account>> = {}) {
 }
 
 describe('GreenMail', () => {
+  beforeAll(async () => {
+    greenmail = await ensureGreenMail();
+  }, 40_000);
+
   it('verifies, lists capabilities, and rejects a bad password', async () => {
     const runtime = runtimeFor();
     const verified = await runtime.service.verify(undefined, { imap: true, smtp: true });
@@ -213,17 +213,13 @@ describe('GreenMail', () => {
           tls: { ...live.smtp.tls, caFile: '/etc/ssl/certs/ca-certificates.crt' },
         },
       });
-      try {
-        await sender.send({
-          raw: simpleMessage({ subject: `dsn ${stamp}`, to: greenmail.email }),
-          envelope: { from: greenmail.email, to: [greenmail.email] },
-          dsn: { id: 'env-1', ret: 'HDRS', notify: ['failure', 'delay'], orcpt: greenmail.email },
-        });
-      } catch {
-        // Some servers reject DSN. Building the request is what this checks.
-      } finally {
-        sender.close();
-      }
+      const dsn = await sender.send({
+        raw: simpleMessage({ subject: `dsn ${stamp}`, to: greenmail.email }),
+        envelope: { from: greenmail.email, to: [greenmail.email] },
+        dsn: { id: 'env-1', ret: 'HDRS', notify: ['failure', 'delay'], orcpt: greenmail.email },
+      });
+      expect(dsn.response.length).toBeGreaterThan(0);
+      sender.close();
     }
     await runtime.close();
 
@@ -361,7 +357,7 @@ describe('scripted IMAP fallbacks', () => {
     });
     expect(listed.ok).toBe(true);
     const threads = await runtime.service.listThreads({ mailbox: 'INBOX', limit: 10 });
-    expect(threads.source === 'server' || threads.source === 'client').toBe(true);
+    expect(threads.source).toBe('server');
     await runtime.service.setFlags({
       mailbox: 'INBOX',
       uids: [1],

@@ -17,13 +17,15 @@ Use a normal feature branch. The repository history is authored as Koray Koska `
 
 The published name is the unscoped package `mail-mcp`, and the executable is also `mail-mcp`, so `npx -y mail-mcp` and `bunx mail-mcp` work.
 
-If the registry rejects that name, switch to the scoped package with one edit: set `"name"` in `package.json` to `@koraykoska/mail-mcp`. Leave `"bin"."mail-mcp"` as `./dist/cli.js`. Publish with `npm publish --access public`. Clients then install `@koraykoska/mail-mcp`; the executable name stays `mail-mcp`. The release workflow reads the name from `package.json`, so it does not need a second change.
+If the registry rejects that name, switch to the scoped package with one edit: set `"name"` in `package.json` to `@koraykoska/mail-mcp`. Leave `"bin"."mail-mcp"` as `./dist/cli.js`. Stage it with `npm stage publish --access public`. Clients then install `@koraykoska/mail-mcp`; the executable name stays `mail-mcp`. The release workflow reads the name from `package.json`, so it does not need a second change.
 
 ## Release
 
-Tag `vX.Y.Z` matching `package.json`. The release workflow runs the full verification again and, only if it passes, publishes to npm with provenance. Pre-release tags such as `v1.2.0-rc.1` publish under the `next` dist-tag. The workflow needs the `NPM_TOKEN` repository secret (automation token with publish rights). Trusted publishing with GitHub OIDC can replace that secret later; the workflow already requests `id-token: write`.
+See `docs/RELEASING.md`. Short version:
 
-`npm run release -- patch|minor|major|prerelease` bumps the version, updates `CHANGELOG.md`, commits, tags, and pushes. Pushing the tag starts the publish workflow.
+`0.0.1` is the manual bootstrap. `npm login`, then `npm stage publish --access public` of the tested tarball, approve with 2FA, then configure the trusted publisher on npmjs.com (owner `koraykoska`, repository `mail-mcp`, workflow filename `release.yml`, stage publish allowed). That configuration must complete its first CI publish within 2 days. Then set **Require two-factor authentication and disallow tokens**. There is no `NPM_TOKEN`.
+
+`0.1.0` is the first tag-triggered trusted-publishing release. Bump the version, tag `v0.1.0`, push the tag, and approve the staged version the workflow prints. Later tags follow that same path. `workflow_dispatch` only bumps, commits, and tags.
 
 ## Docs
 

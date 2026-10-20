@@ -59,7 +59,7 @@ describe('stdio MCP server', () => {
       arguments: { account: 'missing' },
     });
     expect(missing.isError).toBe(true);
-    expect(JSON.stringify(missing.structuredContent)).toContain('INVALID_ARGUMENT');
+    expect(JSON.stringify(missing.content)).toContain('INVALID_ARGUMENT');
     await client.close();
   });
 

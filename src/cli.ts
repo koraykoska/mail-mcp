@@ -1,10 +1,12 @@
 #!/usr/bin/env node
+import { realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { loadConfig } from './config/load.js';
 import { MailError, isMailError } from './errors.js';
 import { startHttpServer } from './http.js';
 import { createLogger, parseLogLevel } from './log.js';
+import { redactText, redactValue } from './redact.js';
 import { createRuntime } from './runtime.js';
 import { createMcpServer } from './server.js';
 import { PACKAGE_NAME, VERSION } from './version.js';
@@ -19,6 +21,7 @@ interface ParsedArgs {
   host: string;
   logLevel?: string;
   account?: string;
+  httpToken?: string;
 }
 
 export async function run(argv: string[], env: NodeJS.ProcessEnv = process.env): Promise<number> {
@@ -26,7 +29,7 @@ export async function run(argv: string[], env: NodeJS.ProcessEnv = process.env):
   try {
     args = parseArgs(argv);
   } catch (error) {
-    return fail(error);
+    return fail(error, env);
   }
   if (args.help) {
     process.stdout.write(helpText());
@@ -40,13 +43,13 @@ export async function run(argv: string[], env: NodeJS.ProcessEnv = process.env):
   try {
     config = loadConfig({ configPath: args.config, env });
   } catch (error) {
-    return fail(error);
+    return fail(error, env);
   }
   if (args.logLevel) {
     try {
       config = { ...config, logLevel: parseLogLevel(args.logLevel) };
     } catch (error) {
-      return fail(error);
+      return fail(error, env, config?.secrets);
     }
   }
   const logger = createLogger({ level: config.logLevel, secrets: config.secrets });
@@ -54,21 +57,35 @@ export async function run(argv: string[], env: NodeJS.ProcessEnv = process.env):
   if (args.check) {
     try {
       const result = await runtime.service.verify(args.account, { imap: true, smtp: true });
-      process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+      process.stdout.write(`${JSON.stringify(redactValue(result, config.secrets), null, 2)}\n`);
       return result.ok === true ? 0 : 1;
     } catch (error) {
-      return fail(error);
+      return fail(error, env, config.secrets);
     } finally {
       await runtime.close();
     }
   }
   const server = createMcpServer(runtime.service);
   if (args.http) {
+    const token = args.httpToken || env.MAIL_HTTP_TOKEN;
+    if (!isLoopback(args.host) && !token) {
+      return fail(
+        new MailError(
+          'CONFIG_ERROR',
+          `Refusing to listen on ${args.host} without an HTTP credential.`,
+          'Pass --http-token or MAIL_HTTP_TOKEN, or bind to 127.0.0.1.',
+        ),
+        env,
+        config.secrets,
+      );
+    }
     const http = await startHttpServer({
       service: runtime.service,
       logger,
       port: args.port,
       host: args.host,
+      ...(token ? { token } : {}),
+      maxBodyBytes: 1_048_576,
     });
     logger.info('http listening', { url: http.url });
     process.stderr.write(`mail-mcp listening on ${http.url}\n`);
@@ -111,14 +128,46 @@ function installSignals(
   process.once('SIGTERM', once);
 }
 
-function fail(error: unknown): number {
-  const message = isMailError(error)
-    ? `${error.code}: ${error.message}${error.hint ? ` (${error.hint})` : ''}`
-    : error instanceof Error
-      ? error.message
-      : 'Unknown error';
+function fail(
+  error: unknown,
+  env: NodeJS.ProcessEnv = process.env,
+  extra: readonly string[] = [],
+): number {
+  const secrets = [...extra, ...envSecrets(env)];
+  const message = redactText(
+    isMailError(error)
+      ? `${error.code}: ${error.message}${error.hint ? ` (${error.hint})` : ''}`
+      : error instanceof Error
+        ? error.message
+        : 'Unknown error',
+    secrets,
+  );
   process.stderr.write(`${message}\n`);
   return 1;
+}
+
+function envSecrets(env: NodeJS.ProcessEnv): string[] {
+  const keys = [
+    'MAIL_PASSWORD',
+    'MAIL_ACCESS_TOKEN',
+    'MAIL_REFRESH_TOKEN',
+    'MAIL_CLIENT_SECRET',
+    'MAIL_HTTP_TOKEN',
+  ];
+  return keys.map((key) => env[key]).filter((value): value is string => Boolean(value));
+}
+
+export function isLoopback(host: string): boolean {
+  const normalized = host
+    .trim()
+    .toLowerCase()
+    .replace(/^\[|\]$/g, '');
+  return (
+    normalized === '127.0.0.1' ||
+    normalized === '::1' ||
+    normalized === 'localhost' ||
+    normalized === '0:0:0:0:0:0:0:1'
+  );
 }
 
 export function parseArgs(argv: string[]): ParsedArgs {
@@ -149,6 +198,9 @@ export function parseArgs(argv: string[]): ParsedArgs {
       index += 1;
     } else if (token === '--host') {
       args.host = requireValue(rest, index, token);
+      index += 1;
+    } else if (token === '--http-token') {
+      args.httpToken = requireValue(rest, index, token);
       index += 1;
     } else if (token === '--log-level') {
       args.logLevel = requireValue(rest, index, token);
@@ -218,8 +270,18 @@ export async function shutdownActive(): Promise<void> {
   }
 }
 
-const invokedDirectly =
-  Boolean(process.argv[1]) && import.meta.url === pathToFileURL(process.argv[1] ?? '').href;
+export function isDirectInvocation(argv1: string | undefined, moduleUrl: string): boolean {
+  if (!argv1) {
+    return false;
+  }
+  try {
+    return moduleUrl === pathToFileURL(realpathSync(argv1)).href;
+  } catch {
+    return moduleUrl === pathToFileURL(argv1).href;
+  }
+}
+
+const invokedDirectly = isDirectInvocation(process.argv[1], import.meta.url);
 
 /* v8 ignore start -- process entry; exercised by the packaged binary, not the in-process suite */
 if (invokedDirectly) {

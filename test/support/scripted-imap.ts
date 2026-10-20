@@ -18,6 +18,7 @@ export interface ScriptedOptions {
   dropAfterCommands?: number;
   /** When set, SELECT reports this UIDVALIDITY after the given number of selects. */
   bumpUidValidityAfter?: number;
+  refuseSearch?: boolean;
 }
 
 /**
@@ -209,7 +210,7 @@ export class ScriptedImap {
       socket.end();
       return;
     }
-    if (command === 'NOOP' || command === 'CHECK' || command === 'ENABLE') {
+    if (command === 'NOOP' || command === 'CHECK') {
       ok(`${command} completed`);
       return;
     }
@@ -270,9 +271,42 @@ export class ScriptedImap {
       return;
     }
     if (command === 'SEARCH' || (command === 'UID' && args.toUpperCase().startsWith('SEARCH'))) {
+      if (this.options.refuseSearch) {
+        no('SEARCH refused');
+        return;
+      }
       const uids = this.messages.map((message) => message.uid);
       ctx.write(`* SEARCH ${uids.join(' ')}\r\n`);
       ok('SEARCH completed');
+      return;
+    }
+    if (command === 'GETACL') {
+      ctx.write('* ACL INBOX user lrswipkxtecdan\r\n');
+      ok('GETACL completed');
+      return;
+    }
+    if (command === 'SETACL' || command === 'DELETEACL') {
+      ok(`${command} completed`);
+      return;
+    }
+    if (command === 'GETMETADATA') {
+      ctx.write('* METADATA INBOX ("/private/comment" "hello")\r\n');
+      ok('GETMETADATA completed');
+      return;
+    }
+    if (command === 'SETMETADATA') {
+      ok('SETMETADATA completed');
+      return;
+    }
+    if (command === 'ENABLE') {
+      const requested = args.split(/\s+/).filter(Boolean);
+      const enabled = requested.filter((item) =>
+        ctx.capabilities.some((capability) => capability.toUpperCase() === item.toUpperCase()),
+      );
+      if (enabled.length > 0) {
+        ctx.write(`* ENABLED ${enabled.join(' ')}\r\n`);
+      }
+      ok('ENABLE completed');
       return;
     }
     if (command === 'UID' && args.toUpperCase().startsWith('FETCH')) {

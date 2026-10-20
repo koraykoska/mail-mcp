@@ -84,7 +84,10 @@ function compareString(left: string | undefined, right: string | undefined): num
   return left.localeCompare(right, undefined, { sensitivity: 'base' });
 }
 
-export function sortKeyToImap(key: SortKey): string {
-  const name = key.field === 'arrival' ? 'ARRIVAL' : key.field.toUpperCase();
+export function sortKeyToImap(key: SortKey, display = false): string {
+  let name = key.field === 'arrival' ? 'ARRIVAL' : key.field.toUpperCase();
+  if (display && (key.field === 'from' || key.field === 'to' || key.field === 'subject')) {
+    name = `DISPLAY${name}`;
+  }
   return key.reverse ? `REVERSE ${name}` : name;
 }

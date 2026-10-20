@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import type { MailService } from '../service/mail-service.js';
 import type { MutationKind } from '../safety.js';
-import { fields, looseOutput } from './schema.js';
+import { fields, strictOutput } from './schema.js';
 
 export interface ToolAnnotations {
   readOnlyHint: boolean;
@@ -48,7 +48,7 @@ export const TOOLS: ToolDefinition[] = [
     description:
       'List every account this server can use, without secrets. Use it first when more than one account is configured, then pass the id as `account` on later calls. The default account is marked. Read-only metadata: provider, safety switches, whether SMTP is configured, and From identities. Does not open a network connection.',
     input: z.object({}).describe('No arguments.'),
-    output: looseOutput({
+    output: strictOutput({
       ok: fields.ok,
       accounts: z.array(z.record(z.string(), z.unknown())).describe('Account summaries.'),
     }),
@@ -74,7 +74,7 @@ export const TOOLS: ToolDefinition[] = [
       imap: z.boolean().optional().describe('Check IMAP. Default true.'),
       smtp: z.boolean().optional().describe('Check SMTP. Default true when SMTP is configured.'),
     }),
-    output: looseOutput({
+    output: strictOutput({
       ...baseOut,
       imap: z.record(z.string(), z.unknown()),
       smtp: z.record(z.string(), z.unknown()),
@@ -98,7 +98,7 @@ export const TOOLS: ToolDefinition[] = [
     description:
       'Return the capability tokens advertised after login (RFC 3501 / RFC 9051). Use this before relying on MOVE, SORT, THREAD, IDLE, CONDSTORE, QUOTA, NAMESPACE, ID, SPECIAL-USE, UIDPLUS, or X-GM-EXT-1. Missing tokens mean the matching tool will use a documented fallback or return CAPABILITY_UNSUPPORTED. Example tokens: "IMAP4rev1", "IDLE", "MOVE".',
     input: z.object({ account: fields.account }),
-    output: looseOutput({
+    output: strictOutput({
       ...baseOut,
       capabilities: z.array(z.string()).describe('Capability names.'),
       greeting: z.string().nullable().describe('Server greeting text, or null.'),
@@ -121,7 +121,7 @@ export const TOOLS: ToolDefinition[] = [
     description:
       'Return personal, other-user, and shared namespaces from RFC 2342. When the server has no NAMESPACE capability, the prefix and hierarchy delimiter are inferred from LIST "" "". delimiter is null for a flat namespace. Use the prefix when creating folders outside the personal namespace.',
     input: z.object({ account: fields.account }),
-    output: looseOutput({ ...baseOut, namespaces: z.record(z.string(), z.unknown()) }),
+    output: strictOutput({ ...baseOut, namespaces: z.record(z.string(), z.unknown()) }),
     annotations: {
       readOnlyHint: true,
       destructiveHint: false,
@@ -138,14 +138,14 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_get_quota',
     title: 'Get mailbox quota',
     description:
-      'Return RFC 2087 / RFC 9208 quota resources for the account, or for one mailbox when mailbox is set. STORAGE is in kibibytes on most servers, MESSAGE is a count. Fails with CAPABILITY_UNSUPPORTED when QUOTA is not advertised. used and limit are numbers; a limit of 0 can mean unlimited on some servers.',
+      'Return RFC 2087 / RFC 9208 quota resources for the account, or for one mailbox when mailbox is set. STORAGE used and limit are octets (bytes): the wire value is kibibytes and is converted by multiplying by 1024. MESSAGE is a count. QUOTA or QUOTA=RES-* is enough. A limit of 0 can mean unlimited on some servers.',
     input: z.object({
       account: fields.account,
       mailbox: fields.mailbox
         .optional()
         .describe('Optional mailbox path. Omit for the root quota.'),
     }),
-    output: looseOutput({ ...baseOut, quota: z.record(z.string(), z.unknown()).nullable() }),
+    output: strictOutput({ ...baseOut, quota: z.record(z.string(), z.unknown()).nullable() }),
     annotations: {
       readOnlyHint: true,
       destructiveHint: false,
@@ -165,7 +165,7 @@ export const TOOLS: ToolDefinition[] = [
     description:
       'Return the RFC 2971 ID fields the server sent (name, version, vendor, and anything else it offered). Fails with CAPABILITY_UNSUPPORTED when ID is absent. Useful for deciding provider-specific behaviour such as Gmail sent-mail handling.',
     input: z.object({ account: fields.account }),
-    output: looseOutput({ ...baseOut, server: z.record(z.string(), z.string()).nullable() }),
+    output: strictOutput({ ...baseOut, server: z.record(z.string(), z.string()).nullable() }),
     annotations: {
       readOnlyHint: true,
       destructiveHint: false,
@@ -190,7 +190,7 @@ export const TOOLS: ToolDefinition[] = [
         .optional()
         .describe('When true, only subscribed mailboxes. Default false (all listed).'),
     }),
-    output: looseOutput({ ...baseOut, mailboxes: z.array(z.record(z.string(), z.unknown())) }),
+    output: strictOutput({ ...baseOut, mailboxes: z.array(z.record(z.string(), z.unknown())) }),
     annotations: {
       readOnlyHint: true,
       destructiveHint: false,
@@ -210,7 +210,7 @@ export const TOOLS: ToolDefinition[] = [
     description:
       'Return the mailbox hierarchy as a tree. Each node has path, name, delimiter, flags, specialUse, and folders (children). Use mail_list_mailboxes when you only need a flat list. The root node may have an empty path and only a folders array.',
     input: z.object({ account: fields.account }),
-    output: looseOutput({ ...baseOut, tree: z.record(z.string(), z.unknown()) }),
+    output: strictOutput({ ...baseOut, tree: z.record(z.string(), z.unknown()) }),
     annotations: {
       readOnlyHint: true,
       destructiveHint: false,
@@ -229,7 +229,7 @@ export const TOOLS: ToolDefinition[] = [
     description:
       'STATUS for one mailbox: messages, unseen, recent, uidNext, uidValidity, highestModseq when CONDSTORE is available, and size when STATUS=SIZE or IMAP4rev2 is available. uidValidity is a decimal string. Call this before a long sequence of UID updates and pass the value back as uidValidity. Counts are numbers of messages, size is octets.',
     input: z.object({ account: fields.account, mailbox: fields.mailbox }),
-    output: looseOutput({ ...baseOut, status: z.record(z.string(), z.unknown()) }),
+    output: strictOutput({ ...baseOut, status: z.record(z.string(), z.unknown()) }),
     annotations: {
       readOnlyHint: true,
       destructiveHint: false,
@@ -249,11 +249,11 @@ export const TOOLS: ToolDefinition[] = [
     description:
       'Create a mailbox, including parents the server creates implicitly (CREATE of "a/b" often creates "a"). Idempotent on servers that answer "already exists" as success; otherwise a second call returns a protocol error. Blocked when the account is readOnly. Name is Unicode.',
     input: z.object({ account: fields.account, mailbox: fields.mailbox }),
-    output: looseOutput({ ...baseOut, path: z.string(), created: z.boolean() }),
+    output: strictOutput({ ...baseOut, path: z.string(), created: z.boolean() }),
     annotations: {
       readOnlyHint: false,
       destructiveHint: false,
-      idempotentHint: true,
+      idempotentHint: false,
       openWorldHint: true,
     },
     kind: 'mailbox-write',
@@ -273,7 +273,7 @@ export const TOOLS: ToolDefinition[] = [
       mailbox: fields.mailbox.describe('Existing mailbox path.'),
       newName: z.string().min(1).describe('New full mailbox path. Example: "Archive/2025".'),
     }),
-    output: looseOutput({ ...baseOut, mailbox: z.string(), newName: z.string() }),
+    output: strictOutput({ ...baseOut, mailbox: z.string(), newName: z.string() }),
     annotations: {
       readOnlyHint: false,
       destructiveHint: false,
@@ -293,11 +293,11 @@ export const TOOLS: ToolDefinition[] = [
     description:
       'Delete a mailbox and, on most servers, its messages. This is destructive and requires allowDelete. It does not merely unsubscribe. Refusing to delete INBOX is normal. There is no trash for the folder itself.',
     input: z.object({ account: fields.account, mailbox: fields.mailbox }),
-    output: looseOutput({ ...baseOut, mailbox: z.string(), deleted: z.boolean() }),
+    output: strictOutput({ ...baseOut, mailbox: z.string(), deleted: z.boolean() }),
     annotations: {
       readOnlyHint: false,
       destructiveHint: true,
-      idempotentHint: true,
+      idempotentHint: false,
       openWorldHint: true,
     },
     kind: 'delete',
@@ -313,7 +313,7 @@ export const TOOLS: ToolDefinition[] = [
     description:
       'SUBSCRIBE a mailbox so it shows up for clients that only list subscriptions. The mailbox must already exist. Blocked when readOnly. Use mail_unsubscribe_mailbox to reverse it.',
     input: z.object({ account: fields.account, mailbox: fields.mailbox }),
-    output: looseOutput({ ...baseOut, mailbox: z.string(), subscribed: z.boolean() }),
+    output: strictOutput({ ...baseOut, mailbox: z.string(), subscribed: z.boolean() }),
     annotations: {
       readOnlyHint: false,
       destructiveHint: false,
@@ -333,7 +333,7 @@ export const TOOLS: ToolDefinition[] = [
     description:
       'UNSUBSCRIBE a mailbox. The folder and its messages stay. Blocked when readOnly. Listing with subscribedOnly will hide it afterwards.',
     input: z.object({ account: fields.account, mailbox: fields.mailbox }),
-    output: looseOutput({ ...baseOut, mailbox: z.string(), subscribed: z.boolean() }),
+    output: strictOutput({ ...baseOut, mailbox: z.string(), subscribed: z.boolean() }),
     annotations: {
       readOnlyHint: false,
       destructiveHint: false,
@@ -353,7 +353,7 @@ export const TOOLS: ToolDefinition[] = [
     description:
       'Shortcut for mail_list_mailboxes with subscribedOnly true. Same result shape. Use it when a client only cares about the subscription list.',
     input: z.object({ account: fields.account }),
-    output: looseOutput({ ...baseOut, mailboxes: z.array(z.record(z.string(), z.unknown())) }),
+    output: strictOutput({ ...baseOut, mailboxes: z.array(z.record(z.string(), z.unknown())) }),
     annotations: {
       readOnlyHint: true,
       destructiveHint: false,
@@ -372,7 +372,7 @@ export const TOOLS: ToolDefinition[] = [
     description:
       'Resolve Inbox, Sent, Drafts, Trash, Junk, Archive, All, and Flagged. Order: account config overrides, SPECIAL-USE flags from the server, then provider name hints (Gmail "[Gmail]/Sent Mail", Outlook "Sent Items", and so on). sources says how each path was chosen: config, extension, or name. Send and delete tools use this automatically. Call it when you need the path yourself.',
     input: z.object({ account: fields.account }),
-    output: looseOutput({ ...baseOut, special: z.record(z.string(), z.unknown()) }),
+    output: strictOutput({ ...baseOut, special: z.record(z.string(), z.unknown()) }),
     annotations: {
       readOnlyHint: true,
       destructiveHint: false,
@@ -413,11 +413,42 @@ export const TOOLS: ToolDefinition[] = [
         .optional()
         .describe('Maximum snippet length. Default 160.'),
     }),
-    output: looseOutput({
+    output: strictOutput({
       ...baseOut,
       mailbox: z.string(),
+      uidValidity: z.string(),
       total: z.number().describe('Matches before paging.'),
-      messages: z.array(z.record(z.string(), z.unknown())),
+      offset: z.number(),
+      sort: z.array(z.object({ field: z.string(), reverse: z.boolean().optional() }).strict()),
+      sortSource: z.enum(['server', 'client', 'uid']),
+      search: z.boolean(),
+      messages: z.array(
+        z
+          .object({
+            uid: z.number(),
+            flags: z.array(z.string()),
+            size: z.number().nullable(),
+            date: z.string().nullable(),
+            internalDate: z.string().nullable(),
+            subject: z.string().nullable(),
+            from: z.array(
+              z.object({ name: z.string().optional(), address: z.string().optional() }).strict(),
+            ),
+            to: z.array(
+              z.object({ name: z.string().optional(), address: z.string().optional() }).strict(),
+            ),
+            cc: z.array(
+              z.object({ name: z.string().optional(), address: z.string().optional() }).strict(),
+            ),
+            messageId: z.string().nullable(),
+            hasAttachments: z.boolean(),
+            snippet: z.string().nullable(),
+            labels: z.array(z.string()),
+            threadId: z.string().nullable(),
+            modseq: z.string().nullable(),
+          })
+          .strict(),
+      ),
       nextCursor: z.string().nullable(),
     }),
     annotations: {
@@ -457,9 +488,15 @@ export const TOOLS: ToolDefinition[] = [
         .optional()
         .describe('Maximum snippet length in characters. Default 160.'),
     }),
-    output: looseOutput({
+    output: strictOutput({
       ...baseOut,
+      mailbox: z.string(),
+      uidValidity: z.string(),
       total: z.number(),
+      offset: z.number(),
+      sort: z.array(z.object({ field: z.string(), reverse: z.boolean().optional() }).strict()),
+      sortSource: z.enum(['server', 'client', 'uid']),
+      search: z.boolean(),
       messages: z.array(z.record(z.string(), z.unknown())),
       nextCursor: z.string().nullable(),
     }),
@@ -496,11 +533,25 @@ export const TOOLS: ToolDefinition[] = [
         .optional()
         .describe('MIME section ids to fetch instead of the whole message. Example: ["1","2"].'),
     }),
-    output: looseOutput({
+    output: strictOutput({
       ...baseOut,
+      mailbox: z.string(),
       uid: z.number(),
+      uidValidity: z.string(),
+      flags: z.array(z.string()),
+      size: z.number().optional(),
+      internalDate: z.string().nullable().optional(),
+      labels: z.array(z.string()).optional(),
+      threadId: z.string().nullable().optional(),
+      headers: z.record(z.string(), z.unknown()).optional(),
       text: z.string().nullable().optional(),
+      textTruncated: z.boolean().optional(),
       html: z.string().nullable().optional(),
+      htmlTruncated: z.boolean().optional(),
+      htmlAsText: z.string().nullable().optional(),
+      attachments: z.array(z.record(z.string(), z.unknown())).optional(),
+      structure: z.record(z.string(), z.unknown()).nullable().optional(),
+      parts: z.array(z.record(z.string(), z.unknown())).optional(),
     }),
     annotations: {
       readOnlyHint: true,
@@ -531,9 +582,11 @@ export const TOOLS: ToolDefinition[] = [
         .optional()
         .describe('Override the size cap, in octets.'),
     }),
-    output: looseOutput({
+    output: strictOutput({
       ...baseOut,
+      mailbox: z.string(),
       uid: z.number(),
+      uidValidity: z.string(),
       bytes: z.number(),
       contentBase64: z.string(),
     }),
@@ -560,7 +613,14 @@ export const TOOLS: ToolDefinition[] = [
       uid: fields.uid,
       uidValidity: fields.uidValidity,
     }),
-    output: looseOutput({ ...baseOut, uid: z.number(), raw: z.string(), truncated: z.boolean() }),
+    output: strictOutput({
+      ...baseOut,
+      mailbox: z.string(),
+      uid: z.number(),
+      uidValidity: z.string(),
+      raw: z.string(),
+      truncated: z.boolean(),
+    }),
     annotations: {
       readOnlyHint: true,
       destructiveHint: false,
@@ -591,11 +651,17 @@ export const TOOLS: ToolDefinition[] = [
         .optional()
         .describe('Maximum octets to return. Default limits.maxAttachmentBytes.'),
     }),
-    output: looseOutput({
+    output: strictOutput({
       ...baseOut,
+      mailbox: z.string(),
+      uid: z.number(),
       partId: z.string(),
+      contentType: z.string(),
+      filename: z.string().nullable(),
       bytes: z.number(),
       truncated: z.boolean(),
+      text: z.string().nullable(),
+      contentBase64: z.string().nullable(),
     }),
     annotations: {
       readOnlyHint: true,
@@ -632,17 +698,20 @@ export const TOOLS: ToolDefinition[] = [
         .optional()
         .describe('Local file path to write. Parent directories are created.'),
     }),
-    output: looseOutput({
+    output: strictOutput({
       ...baseOut,
+      mailbox: z.string(),
+      uid: z.number(),
       filename: z.string().nullable(),
+      contentType: z.string(),
       bytes: z.number(),
       savedPath: z.string().optional(),
       contentBase64: z.string().optional(),
     }),
     annotations: {
       readOnlyHint: false,
-      destructiveHint: false,
-      idempotentHint: true,
+      destructiveHint: true,
+      idempotentHint: false,
       openWorldHint: true,
     },
     kind: 'read',
@@ -668,10 +737,15 @@ export const TOOLS: ToolDefinition[] = [
       cursor: fields.cursor,
       uidValidity: fields.uidValidity,
     }),
-    output: looseOutput({
+    output: strictOutput({
       ...baseOut,
+      mailbox: z.string(),
+      uidValidity: z.string(),
+      algorithm: z.string(),
       source: z.enum(['server', 'client']),
       total: z.number(),
+      omitted: z.number(),
+      truncated: z.boolean(),
       threads: z.array(z.record(z.string(), z.unknown())),
       uids: z.array(z.number()),
       nextCursor: z.string().nullable(),
@@ -710,7 +784,23 @@ export const TOOLS: ToolDefinition[] = [
           'CONDSTORE mod-sequence. The update is skipped by the server when the message changed since this value.',
         ),
     }),
-    output: looseOutput({ ...baseOut, uids: z.array(z.number()), flags: z.array(z.string()) }),
+    output: strictOutput({
+      ...baseOut,
+      mailbox: z.string(),
+      uids: z.array(z.number()),
+      flags: z.array(z.string()),
+      operation: z.string(),
+      results: z.array(
+        z
+          .object({
+            uid: z.number(),
+            ok: z.boolean(),
+            code: z.string().optional(),
+            message: z.string().optional(),
+          })
+          .strict(),
+      ),
+    }),
     annotations: {
       readOnlyHint: false,
       destructiveHint: false,
@@ -735,9 +825,11 @@ export const TOOLS: ToolDefinition[] = [
       uids: fields.uids,
       destination: fields.mailbox.describe('Destination mailbox path. It must already exist.'),
     }),
-    output: looseOutput({
+    output: strictOutput({
       ...baseOut,
+      mailbox: z.string(),
       destination: z.string(),
+      move: z.boolean(),
       results: z.array(z.record(z.string(), z.unknown())),
     }),
     annotations: {
@@ -756,7 +848,7 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_move_messages',
     title: 'Move messages',
     description:
-      'Move UIDs to another mailbox. Uses the MOVE extension when advertised. Otherwise copies, sets \\Deleted, and expunges. Without UIDPLUS that expunge can remove other \\Deleted messages, so the fallback is refused unless allowPermanentDelete is true. Requires allowDelete. Destination must exist.',
+      'Move UIDs to another mailbox. Uses MOVE when the server advertises it. Otherwise copies, sets \\Deleted, and UID EXPUNGEs, which requires UIDPLUS. Without MOVE and UIDPLUS the call is refused, because a plain EXPUNGE would remove every \\Deleted message. allowPermanentDelete does not permit that. Requires allowDelete. Destination must exist.',
     input: z.object({
       account: fields.account,
       mailbox: fields.mailbox,
@@ -764,15 +856,16 @@ export const TOOLS: ToolDefinition[] = [
       uids: fields.uids,
       destination: fields.mailbox.describe('Destination mailbox path.'),
     }),
-    output: looseOutput({
+    output: strictOutput({
       ...baseOut,
+      mailbox: z.string(),
       destination: z.string(),
       move: z.boolean(),
       results: z.array(z.record(z.string(), z.unknown())),
     }),
     annotations: {
       readOnlyHint: false,
-      destructiveHint: false,
+      destructiveHint: true,
       idempotentHint: false,
       openWorldHint: true,
     },
@@ -786,7 +879,7 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_delete_messages',
     title: 'Delete messages',
     description:
-      'Delete UIDs. By default they are moved to the resolved Trash mailbox (special-use, config, or a well-known name). permanent true instead sets \\Deleted and UID EXPUNGEs them; that requires allowPermanentDelete and is not the default. Deleting messages that are already in Trash requires permanent true. Requires allowDelete. Use mail_expunge_mailbox only when you intend to purge every \\Deleted message in a mailbox.',
+      'Delete UIDs. By default they are moved to the resolved Trash mailbox (special-use, config, or a well-known name). permanent true UID EXPUNGEs only those UIDs and requires both allowPermanentDelete and UIDPLUS. Without UIDPLUS the call is refused rather than expunging every \\Deleted message. Deleting messages that are already in Trash requires permanent true. Requires allowDelete. Adding \\Deleted via mail_set_flags is the same delete permission. Use mail_expunge_mailbox only when you intend to purge every \\Deleted message in a mailbox.',
     input: z.object({
       account: fields.account,
       mailbox: fields.mailbox,
@@ -796,14 +889,22 @@ export const TOOLS: ToolDefinition[] = [
         .boolean()
         .optional()
         .describe(
-          'true expunges immediately. Default false moves to Trash. Requires allowPermanentDelete when true.',
+          'true expunges immediately. Default false moves to Trash. Requires allowPermanentDelete and UIDPLUS.',
         ),
     }),
-    output: looseOutput({ ...baseOut }),
+    output: strictOutput({
+      ...baseOut,
+      mailbox: z.string(),
+      permanent: z.boolean().optional(),
+      uids: z.array(z.number()).optional(),
+      results: z.array(z.record(z.string(), z.unknown())).optional(),
+      destination: z.string().optional(),
+      move: z.boolean().optional(),
+    }),
     annotations: {
       readOnlyHint: false,
       destructiveHint: true,
-      idempotentHint: true,
+      idempotentHint: false,
       openWorldHint: true,
     },
     kind: 'delete',
@@ -821,7 +922,7 @@ export const TOOLS: ToolDefinition[] = [
     description:
       'EXPUNGE the selected mailbox: permanently remove every message that already has \\Deleted. This does not set the flag itself. Requires allowPermanentDelete. Destructive and not limited to one UID. To remove specific UIDs use mail_delete_messages with permanent true, which uses UID EXPUNGE when UIDPLUS is available.',
     input: z.object({ account: fields.account, mailbox: fields.mailbox }),
-    output: looseOutput({ ...baseOut, mailbox: z.string(), expunged: z.boolean() }),
+    output: strictOutput({ ...baseOut, mailbox: z.string(), expunged: z.boolean() }),
     annotations: {
       readOnlyHint: false,
       destructiveHint: true,
@@ -865,10 +966,11 @@ export const TOOLS: ToolDefinition[] = [
         .optional()
         .describe('Allow append with no To, for drafts. Default false.'),
     }),
-    output: looseOutput({
+    output: strictOutput({
       ...baseOut,
       destination: z.string(),
       uid: z.number().optional(),
+      uidValidity: z.string().optional(),
       bytes: z.number(),
     }),
     annotations: {
@@ -882,7 +984,7 @@ export const TOOLS: ToolDefinition[] = [
       '{"mailbox":"INBOX","to":["ada@example.com"],"subject":"Note","text":"Hello","allowEmptyRecipients":false}',
     ],
     async run(args, service) {
-      return service.append({ ...(args as object), allowEmptyRecipients: true } as never);
+      return service.append(args as never);
     },
   }),
   define({
@@ -900,7 +1002,13 @@ export const TOOLS: ToolDefinition[] = [
         .enum(['add', 'remove', 'set'])
         .describe('add labels, remove labels, or replace the whole label set.'),
     }),
-    output: looseOutput({ ...baseOut, labels: z.array(z.string()), operation: z.string() }),
+    output: strictOutput({
+      ...baseOut,
+      mailbox: z.string(),
+      uids: z.array(z.number()),
+      labels: z.array(z.string()),
+      operation: z.string(),
+    }),
     annotations: {
       readOnlyHint: false,
       destructiveHint: false,
@@ -946,8 +1054,9 @@ export const TOOLS: ToolDefinition[] = [
       destination: z.string().optional().describe('Required for copy and move.'),
       permanent: z.boolean().optional().describe('For delete only. Default false.'),
     }),
-    output: looseOutput({
+    output: strictOutput({
       ...baseOut,
+      mailbox: z.string(),
       action: z.string(),
       results: z.array(z.record(z.string(), z.unknown())),
     }),
@@ -987,7 +1096,15 @@ export const TOOLS: ToolDefinition[] = [
         .optional()
         .describe('Extra headers. Do not set Bcc here; use bcc.'),
     }),
-    output: looseOutput({ ...baseOut, mailbox: z.string(), uid: z.number().optional() }),
+    output: strictOutput({
+      ...baseOut,
+      mailbox: z.string(),
+      uid: z.number().optional(),
+      uidValidity: z.string().optional(),
+      destination: z.string().optional(),
+      bytes: z.number().optional(),
+      replacedUid: z.number().nullable().optional(),
+    }),
     annotations: {
       readOnlyHint: false,
       destructiveHint: false,
@@ -1018,9 +1135,13 @@ export const TOOLS: ToolDefinition[] = [
       html: z.string().optional().describe('Replacement HTML body.'),
       attachments: z.array(fields.attachment).optional(),
     }),
-    output: looseOutput({
+    output: strictOutput({
       ...baseOut,
+      mailbox: z.string(),
       uid: z.number().optional(),
+      uidValidity: z.string().optional(),
+      destination: z.string().optional(),
+      bytes: z.number().optional(),
       replacedUid: z.number().nullable(),
     }),
     annotations: {
@@ -1051,7 +1172,7 @@ export const TOOLS: ToolDefinition[] = [
         .describe('Drafts mailbox. Default is the resolved Drafts folder.'),
       uid: fields.uid,
     }),
-    output: looseOutput({ ...baseOut }),
+    output: strictOutput({ ...baseOut }),
     annotations: {
       readOnlyHint: false,
       destructiveHint: true,
@@ -1124,7 +1245,12 @@ export const TOOLS: ToolDefinition[] = [
           'Force or skip the Sent APPEND. Default follows account appendSent (auto skips Gmail).',
         ),
     }),
-    output: looseOutput({ ...baseOut, bytes: z.number(), smtp: z.record(z.string(), z.unknown()) }),
+    output: strictOutput({
+      ...baseOut,
+      bytes: z.number(),
+      smtp: z.record(z.string(), z.unknown()),
+      sentAppend: z.record(z.string(), z.unknown()).nullable(),
+    }),
     annotations: {
       readOnlyHint: false,
       destructiveHint: false,
@@ -1168,7 +1294,12 @@ export const TOOLS: ToolDefinition[] = [
         .optional()
         .describe('Force or skip the Sent APPEND. Default follows the account setting.'),
     }),
-    output: looseOutput({ ...baseOut, smtp: z.record(z.string(), z.unknown()) }),
+    output: strictOutput({
+      ...baseOut,
+      bytes: z.number(),
+      smtp: z.record(z.string(), z.unknown()),
+      sentAppend: z.record(z.string(), z.unknown()).nullable(),
+    }),
     annotations: {
       readOnlyHint: false,
       destructiveHint: false,
@@ -1214,7 +1345,12 @@ export const TOOLS: ToolDefinition[] = [
         .optional()
         .describe('Force or skip the Sent APPEND. Default follows the account setting.'),
     }),
-    output: looseOutput({ ...baseOut, smtp: z.record(z.string(), z.unknown()) }),
+    output: strictOutput({
+      ...baseOut,
+      bytes: z.number(),
+      smtp: z.record(z.string(), z.unknown()),
+      sentAppend: z.record(z.string(), z.unknown()).nullable(),
+    }),
     annotations: {
       readOnlyHint: false,
       destructiveHint: false,
@@ -1242,7 +1378,7 @@ export const TOOLS: ToolDefinition[] = [
         .optional()
         .describe('Force or skip the Sent APPEND. Default follows the account setting.'),
     }),
-    output: looseOutput({ ...baseOut, uid: z.number(), smtp: z.record(z.string(), z.unknown()) }),
+    output: strictOutput({ ...baseOut, uid: z.number(), smtp: z.record(z.string(), z.unknown()) }),
     annotations: {
       readOnlyHint: false,
       destructiveHint: false,
@@ -1261,7 +1397,7 @@ export const TOOLS: ToolDefinition[] = [
     description:
       'Authenticate to the submission server and disconnect, without sending. Use this when mail_send_message fails and you want to separate SMTP problems from message construction. The result includes ok, and on failure a code such as AUTH_FAILED or TLS_FAILED plus a hint. No message is stored.',
     input: z.object({ account: fields.account }),
-    output: looseOutput({ ...baseOut, smtp: z.record(z.string(), z.unknown()) }),
+    output: strictOutput({ ...baseOut, smtp: z.record(z.string(), z.unknown()) }),
     annotations: {
       readOnlyHint: true,
       destructiveHint: false,
@@ -1290,12 +1426,13 @@ export const TOOLS: ToolDefinition[] = [
         .optional()
         .describe('How long to wait, in milliseconds. Default 25000.'),
     }),
-    output: looseOutput({
+    output: strictOutput({
       ...baseOut,
       mailbox: z.string(),
       timedOut: z.boolean(),
       idleSupported: z.boolean(),
       changes: z.array(z.record(z.string(), z.unknown())),
+      status: z.record(z.string(), z.unknown()),
     }),
     annotations: {
       readOnlyHint: true,
