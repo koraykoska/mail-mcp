@@ -1,0 +1,192 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version bump to commit and tag
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+          - prerelease
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  verify:
+    if: github.event_name == 'push'
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  stage:
+    needs: verify
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Pin npm CLI
+        run: npm install -g npm@11.21.1
+
+      - name: Download the tested tarball
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: package-tarball
+
+      - name: Check tag, checksum, and OIDC
+        id: meta
+        run: |
+          set -euo pipefail
+          version=$(node -p "require('./package.json').version")
+          tag="${GITHUB_REF_NAME}"
+          if [ "$tag" != "v$version" ]; then
+            echo "::error::Tag $tag does not match package version $version."
+            exit 1
+          fi
+          tarball=$(ls mail-mcp-*.tgz)
+          sha256sum -c mail-mcp.sha256
+          dist_tag=latest
+          case "$version" in
+            *-*) dist_tag=next ;;
+          esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+          echo "dist_tag=$dist_tag" >> "$GITHUB_OUTPUT"
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+            echo "::error::Trusted publishing is not available to this job. id-token: write is required, and a trusted publisher for workflow release.yml must already exist on npmjs.com. v0.0.1 is published by hand first. See docs/RELEASING.md."
+            exit 1
+          fi
+
+      - name: Stage the tested tarball
+        id: stage
+        run: |
+          set -euo pipefail
+          set +e
+          output=$(npm stage publish "${{ steps.meta.outputs.tarball }}" --json --access public --provenance --tag "${{ steps.meta.outputs.dist_tag }}" 2>&1)
+          status=$?
+          set -e
+          printf '%s\n' "$output"
+          if [ "$status" -ne 0 ]; then
+            if printf '%s\n' "$output" | grep -Eqi 'ENEEDAUTH|unable to authenticate|trusted publisher|E401|E404|OIDC|npm whoami'; then
+              echo "::error::npm trusted publishing rejected this workflow. Publish v0.0.1 by hand, configure the trusted publisher for koraykoska/mail-mcp workflow release.yml with stage publish allowed, and complete the first CI publish within 2 days. See docs/RELEASING.md. There is no NPM_TOKEN fallback."
+            fi
+            exit "$status"
+          fi
+          node --input-type=module -e "
+            import { writeFileSync } from 'node:fs';
+            const text = process.argv[1];
+            const start = text.indexOf('{');
+            const end = text.lastIndexOf('}');
+            if (start < 0 || end < start) {
+              console.error('npm stage publish did not return JSON');
+              process.exit(1);
+            }
+            const parsed = JSON.parse(text.slice(start, end + 1));
+            const ids = [];
+            const visit = (value) => {
+              if (!value || typeof value !== 'object') return;
+              if (typeof value.stageId === 'string') ids.push(value.stageId);
+              for (const inner of Object.values(value)) visit(inner);
+            };
+            visit(parsed);
+            if (!ids[0]) {
+              console.error('npm stage publish JSON had no stageId');
+              process.exit(1);
+            }
+            writeFileSync('stage-id.txt', ids[0]);
+          " "$output"
+          echo "id=$(cat stage-id.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Publish the job summary
+        run: |
+          version="${{ steps.meta.outputs.version }}"
+          stage="${{ steps.stage.outputs.id }}"
+          dist="${{ steps.meta.outputs.dist_tag }}"
+          {
+            echo "## npm stage pending approval"
+            echo
+            echo "Package \`mail-mcp@${version}\` is staged and not on the registry yet."
+            echo
+            echo "- stage id: \`${stage}\`"
+            echo "- dist-tag: \`${dist}\`"
+            echo "- tarball: \`${{ steps.meta.outputs.tarball }}\`"
+            echo
+            echo "Approve with 2FA:"
+            echo
+            echo "\`\`\`sh"
+            echo "npm stage view ${stage}"
+            echo "npm stage download ${stage}"
+            echo "npm stage approve ${stage}"
+            echo "\`\`\`"
+            echo
+            echo "Or open the Staged Packages tab on npmjs.com and approve there."
+            echo "Reject with \`npm stage reject ${stage}\`."
+            echo "The GitHub Release stays a draft until that approval is published."
+          } | tee -a "$GITHUB_STEP_SUMMARY" > release-notes.md
+
+      - name: Draft GitHub Release
+        uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631 # v2.2.2
+        with:
+          tag_name: v${{ steps.meta.outputs.version }}
+          draft: true
+          prerelease: ${{ contains(steps.meta.outputs.version, '-') }}
+          body_path: release-notes.md
+          generate_release_notes: true
+
+  bump:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          package-manager-cache: false
+
+      - name: Bump and commit
+        run: |
+          git config user.name "Koray Koska"
+          git config user.email "koray@koska.family"
+          npm version "${{ inputs.bump }}" --no-git-tag-version
+          node scripts/changelog-heading.mjs
+          git add package.json package-lock.json CHANGELOG.md
+          version=$(node -p "require('./package.json').version")
+          git commit -m "Release ${version}"
+          git push origin HEAD
+          {
+            echo "Bumped to ${version} and pushed that commit. This job does not create or push a tag, and it does not stage or publish."
+            echo
+            echo "A push made with GITHUB_TOKEN does not start the tag workflow. After this commit is on the default branch, tag it locally and push the tag with credentials that can start Actions:"
+            echo
+            echo '```'
+            echo "git tag v${version}"
+            echo "git push origin v${version}"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"

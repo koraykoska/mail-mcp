@@ -1,0 +1,166 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: ${{ matrix.runtime }} ${{ matrix.version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runtime: node
+            version: '22'
+          - runtime: node
+            version: '24'
+          - runtime: bun
+            version: latest
+    services:
+      greenmail:
+        image: greenmail/standalone:2.1.3
+        ports:
+          - 3143:3143
+          - 3993:3993
+          - 3025:3025
+          - 3465:3465
+        env:
+          GREENMAIL_OPTS: -Dgreenmail.setup.test.all -Dgreenmail.hostname=0.0.0.0 -Dgreenmail.users=user:secret@example.com
+        options: >-
+          --health-cmd "bash -c 'echo > /dev/tcp/127.0.0.1/3143'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 18
+          --health-start-period 20s
+    env:
+      MAIL_IT_IMAP_HOST: 127.0.0.1
+      MAIL_IT_IMAP_PORT: 3143
+      MAIL_IT_IMAPS_PORT: 3993
+      MAIL_IT_SMTP_PORT: 3025
+      MAIL_IT_SMTPS_PORT: 3465
+      MAIL_IT_USER: user
+      MAIL_IT_PASSWORD: secret
+      MAIL_IT_EMAIL: user@example.com
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup Node
+        if: matrix.runtime == 'node'
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ matrix.version }}
+          cache: npm
+
+      - name: Setup Bun
+        if: matrix.runtime == 'bun'
+        uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2.0.2
+        with:
+          bun-version: latest
+
+      - name: Setup Node for Bun job packaging
+        if: matrix.runtime == 'bun'
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Format
+        run: npm run format:check
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Docs
+        run: npm run docs:check
+
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Test and coverage
+        if: matrix.runtime == 'node'
+        run: npm run test:coverage
+
+      - name: Test and coverage with Bun
+        if: matrix.runtime == 'bun'
+        run: bun run test:coverage
+
+      - name: Upload coverage
+        if: matrix.runtime == 'node' && matrix.version == '22'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage
+          path: coverage
+          if-no-files-found: error
+
+      - name: Build
+        run: npm run build
+
+      - name: End to end
+        if: matrix.runtime == 'node'
+        run: npm run test:e2e
+
+      - name: End to end with Bun
+        if: matrix.runtime == 'bun'
+        run: bun run test:e2e
+
+      - name: Pack the tested tarball
+        if: matrix.runtime == 'node' && matrix.version == '22'
+        run: |
+          npm pack --json
+          sha256sum mail-mcp-*.tgz > mail-mcp.sha256
+
+      - name: Upload the tested tarball
+        if: matrix.runtime == 'node' && matrix.version == '22'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: package-tarball
+          path: |
+            mail-mcp-*.tgz
+            mail-mcp.sha256
+          if-no-files-found: error
+
+      - name: Pack smoke (npx, global install, symlink)
+        if: matrix.runtime == 'node'
+        run: node scripts/pack-smoke.mjs node
+
+      - name: Pack smoke (bunx)
+        if: matrix.runtime == 'bun'
+        run: node scripts/pack-smoke.mjs bun
+
+  desktop-smoke:
+    name: smoke ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: node dist/cli.js --help
+      - run: node dist/cli.js --version
+      - run: npm run test:e2e

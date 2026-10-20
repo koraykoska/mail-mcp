@@ -1,0 +1,7 @@
+dist
+coverage
+node_modules
+*.tgz
+package-lock.json
+CHANGELOG.md
+docs/TOOLS.md
