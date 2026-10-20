@@ -9,6 +9,8 @@ import {
   clampLimit,
   pageByPosition,
   pageAfterUid,
+  pageAnchored,
+  resumeIndex,
 } from '../../src/pagination.js';
 import { decodeModifiedUtf7, encodeModifiedUtf7 } from '../../src/utf7.js';
 import { decodeBody, encodeBody } from '../../src/charset.js';
@@ -125,6 +127,40 @@ describe('pagination', () => {
     expect(() => decodeCursor(encodeCursor({ v: 2, afterUid: 0 }))).toThrow(MailError);
     expect(pageAfterUid([4, 3, 2, 1], 2, undefined).nextCursor).toEqual(expect.any(String));
     expect(paginate([1], 0, 2).nextCursor).toBeUndefined();
+    expect(decodeCursor(first.nextCursor ?? '').afterUid).toBe(3);
+    expect(resumeIndex([10, 20, 30], { position: 1, afterUid: 10 })).toBe(1);
+    expect(resumeIndex([10, 20, 30], { position: 1, afterUid: 99 })).toBe(1);
+    expect(resumeIndex([10, 20, 30], { position: 1, afterUid: 99 }, (uid) => uid > 15)).toBe(1);
+    expect(resumeIndex([10, 20, 30], { position: 0, afterUid: 99 }, () => false)).toBe(3);
+    expect(pageAnchored([10, 20, 30, 40], 1, { position: 0, afterUid: 10 }, '9').uids).toEqual([
+      20,
+    ]);
+    expect(() => resumeIndex([1], { position: -1 })).toThrow(MailError);
+    const anchored = encodeCursor({
+      v: 3,
+      position: 1,
+      afterUid: 4,
+      uidValidity: '9',
+      anchor: { field: 'subject', reverse: true, value: 'zebra' },
+    });
+    expect(decodeCursor(anchored, '9').anchor).toEqual({
+      field: 'subject',
+      reverse: true,
+      value: 'zebra',
+    });
+    expect(() => decodeCursor(encodeCursor({ v: 3, position: 1, afterUid: 0 }))).toThrow(MailError);
+    expect(() =>
+      decodeCursor(
+        Buffer.from(
+          JSON.stringify({
+            v: 3,
+            position: 1,
+            anchor: { field: 'nope', reverse: true, value: 'x' },
+          }),
+          'utf8',
+        ).toString('base64url'),
+      ),
+    ).toThrow(MailError);
   });
 });
 

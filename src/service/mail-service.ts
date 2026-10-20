@@ -13,11 +13,17 @@ import {
   encodeCursor,
   clampLimit,
   pageAfterUid,
-  pageByPosition,
+  pageAnchored,
 } from '../pagination.js';
 import type { ImapPool } from '../imap/pool.js';
 import { assertSearchCapabilities, compileSearch, type SearchCriteria } from '../imap/search.js';
-import { sortMessages, type SortKey, type SortableMessage } from '../imap/sort.js';
+import {
+  anchorOf,
+  isStrictlyAfter,
+  sortMessages,
+  type SortKey,
+  type SortableMessage,
+} from '../imap/sort.js';
 import { resolveSpecialUse, type ResolvedSpecialUse } from '../imap/special-use.js';
 import { normalizeFlags, touchesDeleted } from '../imap/flags.js';
 import type {
@@ -597,12 +603,17 @@ export class MailService {
       const limit = clampLimit(input.limit, account.limits.pageSize, account.limits.maxPageSize);
       const cursor = input.cursor ? decodeCursor(input.cursor, box.uidValidity) : undefined;
       const page =
-        cursor?.v === 3
-          ? pageByPosition(flat, limit, cursor.position ?? 0, box.uidValidity)
-          : pageAfterUid(
+        cursor?.v === 2
+          ? pageAfterUid(flat, limit, cursor.afterUid, box.uidValidity)
+          : pageAnchored(
               flat,
               limit,
-              cursor?.v === 2 ? cursor.afterUid : undefined,
+              {
+                position: cursor?.v === 3 ? (cursor.position ?? 0) : 0,
+                ...(cursor?.v === 3 && cursor.afterUid !== undefined
+                  ? { afterUid: cursor.afterUid }
+                  : {}),
+              },
               box.uidValidity,
             );
       const pageSet = new Set(page.uids);
@@ -1228,12 +1239,15 @@ export class MailService {
         account.limits.maxPageSize,
       );
       const decoded = input.cursor ? decodeCursor(input.cursor, box.uidValidity) : undefined;
-      const afterUid = decoded?.v === 2 ? decoded.afterUid : undefined;
+      const legacyAfterUid = decoded?.v === 2 ? decoded.afterUid : undefined;
+      const anchoredAfterUid = decoded?.v === 3 ? decoded.afterUid : undefined;
       const startIndex = decoded?.v === 3 ? (decoded.position ?? 0) : 0;
-      // A position cursor pages the same sorted search. A legacy afterUid cursor
-      // still slices that sorted list; it is not turned into a UID range.
+      const anchor = decoded?.v === 3 ? decoded.anchor : undefined;
+      // ESORT PARTIAL is only safe for a fresh page. A later page has to see the
+      // whole ordered result so an expunge above the cursor cannot shift the window.
+      const freshPage = legacyAfterUid === undefined && anchoredAfterUid === undefined && !anchor;
       const window =
-        session.hasCapability('SORT') && session.hasCapability('ESORT') && afterUid === undefined
+        session.hasCapability('SORT') && session.hasCapability('ESORT') && freshPage
           ? { start: startIndex + 1, count: limitForPage }
           : undefined;
       const serverSorted = session.hasCapability('SORT')
@@ -1243,26 +1257,50 @@ export class MailService {
       let nextCursor: string | null;
       let offset: number;
       let total: number;
+      let anchorLookup: Map<number, SortableMessage> | undefined;
       if (serverSorted) {
         const allow = new Set(matched);
-        if (serverSorted.partial && afterUid === undefined) {
+        if (serverSorted.partial && freshPage) {
           pageUids = serverSorted.uids.filter((uid) => allow.has(uid));
           total = matched.length;
           offset = startIndex;
-          const next = startIndex + pageUids.length;
-          nextCursor =
-            pageUids.length > 0 && pageUids.length >= limitForPage && next < total
-              ? encodeCursor({ v: 3, position: next, uidValidity: box.uidValidity })
-              : null;
+          nextCursor = null;
         } else {
           const ordered = serverSorted.uids.filter((uid) => allow.has(uid));
-          const paged =
-            afterUid !== undefined
-              ? pageAfterUid(ordered, limitForPage, afterUid, box.uidValidity)
-              : pageByPosition(ordered, limitForPage, startIndex, box.uidValidity);
-          pageUids = paged.uids;
-          nextCursor = paged.nextCursor;
-          offset = paged.offset;
+          if (legacyAfterUid !== undefined) {
+            const paged = pageAfterUid(ordered, limitForPage, legacyAfterUid, box.uidValidity);
+            pageUids = paged.uids;
+            nextCursor = paged.nextCursor;
+            offset = paged.offset;
+          } else {
+            const uidMissing =
+              anchoredAfterUid !== undefined && !ordered.includes(anchoredAfterUid);
+            if (uidMissing && anchor) {
+              const summaries = await box.fetchSummaries(ordered, {
+                snippet: false,
+                snippetChars: 0,
+              });
+              anchorLookup = new Map(summaries.map((item) => [item.uid, toSortable(item)]));
+            }
+            const paged = pageAnchored(
+              ordered,
+              limitForPage,
+              {
+                position: startIndex,
+                ...(anchoredAfterUid !== undefined ? { afterUid: anchoredAfterUid } : {}),
+              },
+              box.uidValidity,
+              anchorLookup && anchor
+                ? (uid) => {
+                    const item = anchorLookup?.get(uid);
+                    return item ? isStrictlyAfter(item, anchor) : false;
+                  }
+                : undefined,
+            );
+            pageUids = paged.uids;
+            nextCursor = paged.nextCursor;
+            offset = paged.offset;
+          }
           total = ordered.length;
         }
         sortSource = 'server';
@@ -1285,13 +1323,32 @@ export class MailService {
           size: item.size,
         }));
         const ordered = sortMessages(sortable, keys).map((item) => item.uid);
-        const paged =
-          afterUid !== undefined
-            ? pageAfterUid(ordered, limitForPage, afterUid, box.uidValidity)
-            : pageByPosition(ordered, limitForPage, startIndex, box.uidValidity);
-        pageUids = paged.uids;
-        nextCursor = paged.nextCursor;
-        offset = paged.offset;
+        anchorLookup = new Map(sortable.map((item) => [item.uid, item]));
+        if (legacyAfterUid !== undefined) {
+          const paged = pageAfterUid(ordered, limitForPage, legacyAfterUid, box.uidValidity);
+          pageUids = paged.uids;
+          nextCursor = paged.nextCursor;
+          offset = paged.offset;
+        } else {
+          const paged = pageAnchored(
+            ordered,
+            limitForPage,
+            {
+              position: startIndex,
+              ...(anchoredAfterUid !== undefined ? { afterUid: anchoredAfterUid } : {}),
+            },
+            box.uidValidity,
+            anchor
+              ? (uid) => {
+                  const item = anchorLookup?.get(uid);
+                  return item ? isStrictlyAfter(item, anchor) : false;
+                }
+              : undefined,
+          );
+          pageUids = paged.uids;
+          nextCursor = paged.nextCursor;
+          offset = paged.offset;
+        }
         total = ordered.length;
         sortSource = 'client';
       }
@@ -1303,6 +1360,22 @@ export class MailService {
       const orderedMessages = pageUids
         .map((uid) => byUid.get(uid))
         .filter((item): item is MessageSummary => Boolean(item));
+      const next = offset + orderedMessages.length;
+      if (
+        orderedMessages.length > 0 &&
+        orderedMessages.length >= limitForPage &&
+        next < total &&
+        (nextCursor !== null || (serverSorted?.partial && freshPage))
+      ) {
+        nextCursor = cursorAfterPage(
+          orderedMessages[orderedMessages.length - 1],
+          next,
+          keys,
+          box.uidValidity,
+        );
+      } else if (serverSorted?.partial && freshPage) {
+        nextCursor = null;
+      }
       return {
         ok: true as const,
         account: account.id,
@@ -1842,6 +1915,38 @@ function requireAttachmentsDir(root: string | undefined): string {
 
 function stripCid(value: string): string {
   return value.trim().replace(/^<|>$/g, '').toLowerCase();
+}
+
+function toSortable(item: MessageSummary): SortableMessage {
+  return {
+    uid: item.uid,
+    arrival: item.internalDate,
+    date: item.date,
+    from: item.from[0]?.address ?? item.from[0]?.name,
+    to: item.to[0]?.address ?? item.to[0]?.name,
+    cc: item.cc[0]?.address,
+    subject: item.subject,
+    size: item.size,
+  };
+}
+
+function cursorAfterPage(
+  last: MessageSummary | undefined,
+  next: number,
+  keys: readonly SortKey[],
+  uidValidity: string,
+): string | null {
+  if (!last) {
+    return null;
+  }
+  const primary = keys[0] ?? { field: 'arrival', reverse: true };
+  return encodeCursor({
+    v: 3,
+    position: next,
+    afterUid: last.uid,
+    uidValidity,
+    anchor: anchorOf(toSortable(last), primary),
+  });
 }
 
 function flagResults(

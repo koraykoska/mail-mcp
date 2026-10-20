@@ -1,11 +1,12 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it, beforeAll } from 'vitest';
 import { ImapFlow } from 'imapflow';
+import { ImapFlowSession } from '../../src/imap/flow-session.js';
 import { createRuntime } from '../../src/runtime.js';
 import { createLogger } from '../../src/log.js';
 import { simpleMessage } from '../fixtures/messages.js';
 import { ensureDovecot, type DovecotEndpoints } from '../support/dovecot.js';
-import { appConfig } from '../support/config.js';
+import { account, appConfig } from '../support/config.js';
 
 let dovecot: DovecotEndpoints;
 
@@ -246,6 +247,155 @@ describe('Dovecot', () => {
     const result = await waiting;
     expect(result.timedOut).toBe(false);
     expect((result.changes as unknown[]).length).toBeGreaterThan(0);
+    await runtime.close();
+  });
+
+  it('stays up when a pooled connection sits past the socket timeout', async () => {
+    const crashes: unknown[] = [];
+    const onException = (error: unknown): void => {
+      crashes.push(error);
+    };
+    const onRejection = (error: unknown): void => {
+      crashes.push(error);
+    };
+    process.on('uncaughtException', onException);
+    process.on('unhandledRejection', onRejection);
+    const runtime = runtimeFor(dovecot.imapPort, {
+      imap: {
+        host: dovecot.host,
+        port: dovecot.imapPort,
+        secure: false,
+        starttls: 'required',
+        timeoutMs: 3_000,
+        tls: { rejectUnauthorized: true, caFile: dovecot.caFile, servername: 'localhost' },
+      },
+    });
+    try {
+      expect((await runtime.service.capabilities()).ok).toBe(true);
+      await runtime.service.listMailboxes(undefined);
+      await new Promise((resolve) => setTimeout(resolve, 8_000));
+      expect(crashes).toEqual([]);
+      expect((await runtime.service.capabilities()).ok).toBe(true);
+      await runtime.service.listMailboxes(undefined);
+    } finally {
+      process.off('uncaughtException', onException);
+      process.off('unhandledRejection', onRejection);
+      await runtime.close();
+    }
+  });
+
+  it('stays up after a wait restores the short socket timeout', async () => {
+    const crashes: unknown[] = [];
+    const onException = (error: unknown): void => {
+      crashes.push(error);
+    };
+    process.on('uncaughtException', onException);
+    const runtime = runtimeFor(dovecot.imapPort, {
+      imap: {
+        host: dovecot.host,
+        port: dovecot.imapPort,
+        secure: false,
+        starttls: 'required',
+        timeoutMs: 3_000,
+        tls: { rejectUnauthorized: true, caFile: dovecot.caFile, servername: 'localhost' },
+      },
+    });
+    try {
+      const stamp = `restore-${Date.now()}`;
+      await runtime.service.createMailbox(undefined, stamp);
+      const waited = await runtime.service.waitForChanges({ mailbox: stamp, timeoutMs: 4_000 });
+      expect(waited.timedOut).toBe(true);
+      await new Promise((resolve) => setTimeout(resolve, 5_000));
+      expect(crashes).toEqual([]);
+      expect((await runtime.service.capabilities()).ok).toBe(true);
+    } finally {
+      process.off('uncaughtException', onException);
+      await runtime.close();
+    }
+  });
+
+  it('serves an ESORT partial window', async () => {
+    const session = new ImapFlowSession(
+      account({
+        user: dovecot.user,
+        email: dovecot.email,
+        auth: { type: 'password', password: dovecot.password },
+        imap: {
+          host: dovecot.host,
+          port: dovecot.imapPort,
+          secure: false,
+          starttls: 'required',
+          timeoutMs: 15_000,
+          tls: { rejectUnauthorized: true, caFile: dovecot.caFile, servername: 'localhost' },
+        },
+      }),
+      async () => undefined,
+      createLogger({ level: 'silent' }),
+    );
+    await session.connect();
+    const stamp = `partial-${Date.now()}`;
+    await session.createMailbox(stamp);
+    for (const subject of ['One', 'Two', 'Three']) {
+      await session.append(stamp, simpleMessage({ subject }));
+    }
+    const sorted = await session.withMailbox(stamp, 'read', (box) =>
+      box.serverSort(
+        { query: { all: true }, requires: [] },
+        [{ field: 'arrival', reverse: true }],
+        {
+          start: 1,
+          count: 1,
+        },
+      ),
+    );
+    expect(sorted?.partial).toBe(true);
+    expect(sorted?.uids).toHaveLength(1);
+    expect(sorted?.total).toBe(3);
+    await session.close();
+  });
+
+  it('does not skip a message when an already returned one is expunged', async () => {
+    const runtime = runtimeFor(dovecot.imapPort);
+    const stamp = `expunge-page-${Date.now()}`;
+    await runtime.service.createMailbox(undefined, stamp);
+    for (const subject of ['Zebra', 'Mango', 'Banana', 'Apple']) {
+      await runtime.service.append({
+        mailbox: stamp,
+        rawBase64: simpleMessage({ subject }).toString('base64'),
+      });
+    }
+    const sort = [{ field: 'subject' as const, reverse: true }];
+    const first = await runtime.service.listMessages({
+      mailbox: stamp,
+      sort,
+      limit: 1,
+      includeSnippet: false,
+    });
+    const row = (first.messages as Array<{ uid: number; subject: string | null }>)[0];
+    expect(row?.subject).toBe('Zebra');
+    await runtime.service.deleteMessages({
+      mailbox: stamp,
+      uids: [Number(row?.uid)],
+      permanent: true,
+    });
+    const subjects: string[] = [];
+    let cursor = first.nextCursor ? String(first.nextCursor) : undefined;
+    for (let page = 0; page < 5 && cursor; page += 1) {
+      const listed = await runtime.service.listMessages({
+        mailbox: stamp,
+        sort,
+        limit: 1,
+        includeSnippet: false,
+        cursor,
+      });
+      const message = (listed.messages as Array<{ subject: string | null }>)[0];
+      if (!message) {
+        break;
+      }
+      subjects.push(String(message.subject));
+      cursor = listed.nextCursor ? String(listed.nextCursor) : undefined;
+    }
+    expect(subjects).toEqual(['Mango', 'Banana', 'Apple']);
     await runtime.close();
   });
 

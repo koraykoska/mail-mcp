@@ -3,6 +3,13 @@ export interface SortKey {
   reverse?: boolean;
 }
 
+/** Primary sort key of the last message returned on a page. */
+export interface SortAnchor {
+  field: SortKey['field'];
+  reverse: boolean;
+  value: string;
+}
+
 export interface SortableMessage {
   uid: number;
   arrival?: string;
@@ -82,6 +89,46 @@ function compareString(left: string | undefined, right: string | undefined): num
     return -1;
   }
   return left.localeCompare(right, undefined, { sensitivity: 'base' });
+}
+
+export function anchorOf(message: SortableMessage, key: SortKey): SortAnchor {
+  return {
+    field: key.field,
+    reverse: Boolean(key.reverse),
+    value: canonicalSortValue(message, key.field),
+  };
+}
+
+export function canonicalSortValue(message: SortableMessage, field: SortKey['field']): string {
+  if (field === 'size') {
+    return message.size === undefined ? '' : String(message.size);
+  }
+  if (field === 'arrival' || field === 'date') {
+    return message[field] ?? '';
+  }
+  return message[field] ?? '';
+}
+
+/** True when `message` sorts strictly after `anchor` in the anchor's direction. */
+export function isStrictlyAfter(message: SortableMessage, anchor: SortAnchor): boolean {
+  const compared = compareField(message, messageFromAnchor(anchor), anchor.field);
+  return (anchor.reverse ? -compared : compared) > 0;
+}
+
+function messageFromAnchor(anchor: SortAnchor): SortableMessage {
+  const message: SortableMessage = { uid: 0 };
+  if (anchor.value === '') {
+    return message;
+  }
+  if (anchor.field === 'size') {
+    const size = Number(anchor.value);
+    if (Number.isFinite(size)) {
+      message.size = size;
+    }
+    return message;
+  }
+  message[anchor.field] = anchor.value;
+  return message;
 }
 
 export function sortKeyToImap(key: SortKey, display = false): string {

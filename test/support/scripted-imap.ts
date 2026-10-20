@@ -24,6 +24,10 @@ export interface ScriptedOptions {
   refuseStore?: boolean;
   /** Answer UID SORT RETURN with an ESEARCH untagged line. */
   esearchSort?: boolean;
+  /** Send the full RFC822 literal even when the client asked for a partial body. */
+  ignorePartial?: boolean;
+  /** RFC822.SIZE to advertise. Defaults to the real message size. */
+  reportedSize?: number;
   /** Answer UNCHANGEDSINCE STORE with a MODIFIED response code. */
   modifiedStore?: boolean;
   refuseCopy?: boolean;
@@ -349,11 +353,12 @@ export class ScriptedImap {
         }
         const source = Buffer.from(message.raw);
         const flags = message.flags.join(' ');
-        const common = `UID ${message.uid} FLAGS (${flags}) RFC822.SIZE ${source.length} INTERNALDATE "01-Jan-2026 00:00:00 +0000"`;
+        const advertised = this.options.reportedSize ?? source.length;
+        const common = `UID ${message.uid} FLAGS (${flags}) RFC822.SIZE ${advertised} INTERNALDATE "01-Jan-2026 00:00:00 +0000"`;
         if (sourceWanted) {
           const partial = /<(\d+)\.(\d+)>/.exec(args);
           let payload = source;
-          if (partial?.[1] && partial[2]) {
+          if (!this.options.ignorePartial && partial?.[1] && partial[2]) {
             const start = Number(partial[1]);
             const count = Number(partial[2]);
             payload = source.subarray(start, start + count);
@@ -405,15 +410,33 @@ export class ScriptedImap {
         bad('Unknown sort argument');
         return;
       }
-      const uids = this.messages.map((message) => message.uid).join(',');
-      if (this.options.esearchSort && args.toUpperCase().includes('RETURN')) {
+      if (args.toUpperCase().includes('(RETURN')) {
+        bad('Unknown sort argument');
+        return;
+      }
+      const allUids = this.messages.map((message) => message.uid);
+      const partial = /RETURN \(PARTIAL (\d+):(\d+)/i.exec(args);
+      let uids = allUids;
+      if (partial?.[1] && partial[2]) {
+        const start = Number(partial[1]);
+        const end = Number(partial[2]);
+        uids = allUids.slice(Math.max(0, start - 1), end);
+      }
+      if (partial?.[1] && partial[2]) {
+        const listed = uids.join(',') || 'NIL';
         ctx.write(
-          `* ESEARCH (TAG "${tag}") UID COUNT ${this.messages.length} ALL ${uids || '1'}\r\n`,
+          `* ESEARCH (TAG "${tag}") UID PARTIAL (${partial[1]}:${partial[2]} ${listed}) COUNT ${allUids.length}\r\n`,
         );
         ok('SORT completed');
         return;
       }
-      ctx.write(`* SORT ${uids.replaceAll(',', ' ')}\r\n`);
+      if (this.options.esearchSort && args.toUpperCase().includes('RETURN')) {
+        const listed = allUids.join(',') || 'NIL';
+        ctx.write(`* ESEARCH (TAG "${tag}") UID COUNT ${allUids.length} ALL ${listed}\r\n`);
+        ok('SORT completed');
+        return;
+      }
+      ctx.write(`* SORT ${uids.join(' ')}\r\n`);
       ok('SORT completed');
       return;
     }

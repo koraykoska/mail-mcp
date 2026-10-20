@@ -67,6 +67,11 @@ export type AccessTokenProvider = (options?: { force?: boolean }) => Promise<str
 export class ImapFlowSession implements ImapSession {
   private client: ImapFlow | undefined;
   private connecting: Promise<void> | undefined;
+  private dead = false;
+  private literalOverflow = false;
+  private onDead: (() => void) | undefined;
+  /** Clients closed on purpose. Their error and close events must not evict the pool slot. */
+  private readonly retiring = new WeakSet<ImapFlow>();
   readonly capabilities = new Map<string, boolean | number>();
 
   constructor(
@@ -109,8 +114,46 @@ export class ImapFlowSession implements ImapSession {
     return this.requireClient().greeting;
   }
 
+  bindDisconnect(handler: () => void): void {
+    this.onDead = handler;
+  }
+
+  hasFailed(): boolean {
+    return this.dead || (this.client !== undefined && !this.client.usable);
+  }
+
+  idleBudgetMs(): number {
+    return this.account.imap.timeoutMs;
+  }
+
+  /** Remember a parser-size failure even when the command later rejects with a follow-on error. */
+  takeLiteralOverflow(): boolean {
+    const overflow = this.literalOverflow;
+    this.literalOverflow = false;
+    return overflow;
+  }
+
+  /** Drop this connection so the pool opens a new one on the next call. */
+  kill(): void {
+    if (this.dead) {
+      return;
+    }
+    this.dead = true;
+    const client = this.client;
+    this.client = undefined;
+    if (client) {
+      this.retiring.add(client);
+      try {
+        client.close();
+      } catch {
+        // The socket is already closing.
+      }
+    }
+    this.onDead?.();
+  }
+
   async connect(): Promise<void> {
-    if (this.client?.usable) {
+    if (this.client?.usable && !this.dead) {
       return;
     }
     if (this.connecting) {
@@ -125,9 +168,11 @@ export class ImapFlowSession implements ImapSession {
   async logout(): Promise<void> {
     const client = this.client;
     this.client = undefined;
+    this.dead = true;
     if (!client) {
       return;
     }
+    this.retiring.add(client);
     try {
       await client.logout();
     } catch {
@@ -138,7 +183,12 @@ export class ImapFlowSession implements ImapSession {
   close(): void {
     const client = this.client;
     this.client = undefined;
-    client?.close();
+    this.dead = true;
+    if (!client) {
+      return;
+    }
+    this.retiring.add(client);
+    client.close();
   }
 
   async namespaces(): Promise<{
@@ -572,7 +622,10 @@ export class ImapFlowSession implements ImapSession {
   private async open(): Promise<void> {
     const previous = this.client;
     this.client = undefined;
-    previous?.close();
+    if (previous) {
+      this.retiring.add(previous);
+      previous.close();
+    }
     const endpoint = this.account.imap;
     const tls: ImapFlowOptions['tls'] = {
       rejectUnauthorized: endpoint.tls.rejectUnauthorized,
@@ -624,7 +677,10 @@ export class ImapFlowSession implements ImapSession {
         throw mapped;
       }
     }
+    this.dead = false;
+    this.literalOverflow = false;
     this.client = client;
+    this.watch(client);
     this.capabilities.clear();
     for (const [key, value] of client.capabilities) {
       this.capabilities.set(key, value);
@@ -649,10 +705,36 @@ export class ImapFlowSession implements ImapSession {
   }
 
   private requireClient(): ImapFlow {
-    if (!this.client?.usable) {
+    if (this.dead || !this.client?.usable) {
       throw new MailError('CONNECTION_FAILED', 'IMAP session is not connected.');
     }
     return this.client;
+  }
+
+  /**
+   * ImapFlow emits 'error' for a quiet socket (ETIMEOUT) and for a literal the parser
+   * refuses. With no listener, Node treats that as an uncaught exception and exits.
+   * 'close' covers a peer that drops the TCP session without an error event.
+   */
+  private watch(client: ImapFlow): void {
+    client.on('error', (error: unknown) => {
+      this.noteFailure(client, error);
+    });
+    client.on('close', () => {
+      this.noteFailure(client);
+    });
+  }
+
+  private noteFailure(client: ImapFlow, error?: unknown): void {
+    if (isOversizedLiteral(error)) {
+      this.literalOverflow = true;
+    }
+    if (this.retiring.has(client) || this.client !== client || this.dead) {
+      return;
+    }
+    this.dead = true;
+    this.client = undefined;
+    this.onDead?.();
   }
 }
 
@@ -758,12 +840,19 @@ class FlowMailbox implements OpenMailbox {
       }
       return Buffer.from(row.source);
     } catch (error) {
-      if (maxBytes !== undefined && isOversizedLiteral(error)) {
-        throw new MailError(
-          'SIZE_LIMIT',
-          `The server sent more than ${maxBytes} bytes for UID ${uid}.`,
-          'The partial body limit was ignored, so the connection was closed instead of buffering the message.',
-        );
+      if (maxBytes !== undefined) {
+        // LiteralTooLarge is emitted on the connection. The fetch promise then rejects
+        // with "Connection not available", so give the error listener one turn first.
+        await new Promise((resolve) => setImmediate(resolve));
+        const overflow = this.session.takeLiteralOverflow();
+        if (isOversizedLiteral(error) || overflow) {
+          this.session.kill();
+          throw new MailError(
+            'SIZE_LIMIT',
+            `The server sent more than ${maxBytes} bytes for UID ${uid}.`,
+            'The partial body limit was ignored, so the connection was closed instead of buffering the message.',
+          );
+        }
       }
       throw error;
     } finally {
@@ -1026,7 +1115,11 @@ class FlowMailbox implements OpenMailbox {
       return null;
     }
     const searchKey = searchAttributes(this.client, compiled);
-    const displays = this.session.hasCapability('SORT=DISPLAY') ? [true, false] : [false];
+    const displayable = keys.some(
+      (key) => key.field === 'from' || key.field === 'to' || key.field === 'subject',
+    );
+    const displays =
+      this.session.hasCapability('SORT=DISPLAY') && displayable ? [true, false] : [false];
     let lastError: unknown;
     for (const display of displays) {
       const criteria: unknown[] = [];
@@ -1043,16 +1136,16 @@ class FlowMailbox implements OpenMailbox {
       const attempts: Array<{ args: unknown[]; partial: boolean }> = [];
       if (this.session.hasCapability('ESORT') && window && !display) {
         const end = window.start + window.count - 1;
+        // RFC 5267: RETURN is a command option, not a sort criterion.
+        // UID SORT RETURN (PARTIAL x:y COUNT) (REVERSE ARRIVAL) UTF-8 ALL
         attempts.push({
           partial: true,
           args: [
+            { type: 'ATOM', value: 'RETURN' },
             [
-              { type: 'ATOM', value: 'RETURN' },
-              [
-                { type: 'ATOM', value: 'PARTIAL' },
-                { type: 'ATOM', value: `${window.start}:${end}` },
-                { type: 'ATOM', value: 'COUNT' },
-              ],
+              { type: 'ATOM', value: 'PARTIAL' },
+              { type: 'ATOM', value: `${window.start}:${end}` },
+              { type: 'ATOM', value: 'COUNT' },
             ],
             ...plain,
           ],
@@ -1514,21 +1607,37 @@ function collectModified(node: unknown, out: string[]): void {
 function esearchNumbers(attributes: ImapAttr[]): { uids: number[]; count?: number } {
   const uids: number[] = [];
   let count: number | undefined;
-  const visit = (nodes: ImapAttr[]): void => {
+  const visit = (nodes: unknown[]): void => {
     for (let index = 0; index < nodes.length; index += 1) {
-      const token = String(nodes[index]?.value ?? '').toUpperCase();
-      const next = nodes[index + 1];
-      if (token === 'COUNT' && next?.value !== undefined) {
-        count = Number(next.value);
+      const current = nodes[index];
+      if (Array.isArray(current)) {
+        visit(current);
+        continue;
       }
-      if ((token === 'ALL' || token === 'PARTIAL') && next) {
+      const node = current as ImapAttr | undefined;
+      const token = String(node?.value ?? '').toUpperCase();
+      const next = nodes[index + 1];
+      const nextAttr = Array.isArray(next) ? undefined : (next as ImapAttr | undefined);
+      if (token === 'COUNT' && nextAttr?.value !== undefined) {
+        count = Number(nextAttr.value);
+      }
+      if (token === 'ALL' && next !== undefined) {
         const text = sequenceText(next);
         if (text) {
           uids.push(...parseSequenceSet(text));
         }
       }
-      if (next?.attributes) {
-        visit(next.attributes);
+      if (token === 'PARTIAL' && next !== undefined) {
+        // PARTIAL (1:1 4) is the window range followed by the UID set. The range is not UIDs.
+        // ImapFlow represents that parenthesized list as an array.
+        const pieces = partialPieces(next);
+        const uidText = pieces.length > 1 ? pieces.slice(1).join(',') : '';
+        if (uidText) {
+          uids.push(...parseSequenceSet(uidText));
+        }
+      }
+      if (nextAttr?.attributes) {
+        visit(nextAttr.attributes);
       }
     }
   };
@@ -1536,11 +1645,45 @@ function esearchNumbers(attributes: ImapAttr[]): { uids: number[]; count?: numbe
   return { uids, ...(count !== undefined ? { count } : {}) };
 }
 
-function sequenceText(node: ImapAttr): string {
-  if (node.value !== undefined && !node.attributes?.length) {
-    return String(node.value);
+function partialPieces(node: unknown): string[] {
+  const list = Array.isArray(node)
+    ? (node as ImapAttr[])
+    : node && typeof node === 'object' && Array.isArray((node as ImapAttr).attributes)
+      ? ((node as ImapAttr).attributes ?? [])
+      : null;
+  if (list && list.length > 0) {
+    return list
+      .map((item) => (item.value !== undefined ? String(item.value) : sequenceText(item)))
+      .filter((item) => item.length > 0);
   }
-  return (node.attributes ?? [])
+  const text =
+    node && typeof node === 'object' && (node as ImapAttr).value !== undefined
+      ? String((node as ImapAttr).value).trim()
+      : '';
+  const match = /^(\d+:\d+)(?:\s+(.+))?$/.exec(text);
+  if (!match) {
+    return text ? [text] : [];
+  }
+  const range = match[1] ?? '';
+  const rest = match[2]?.trim() ?? '';
+  return rest ? [range, rest] : [range];
+}
+
+function sequenceText(node: unknown): string {
+  if (Array.isArray(node)) {
+    return node
+      .map((item) => sequenceText(item))
+      .filter(Boolean)
+      .join(',');
+  }
+  const attr = node as ImapAttr | undefined;
+  if (!attr) {
+    return '';
+  }
+  if (attr.value !== undefined && !attr.attributes?.length) {
+    return String(attr.value);
+  }
+  return (attr.attributes ?? [])
     .map((item) => (item.value !== undefined ? String(item.value) : ''))
     .filter(Boolean)
     .join(',');
@@ -1597,11 +1740,19 @@ function replaceSocketTimeout(client: ImapFlow, timeoutMs: number): number {
   return previous;
 }
 
-function isOversizedLiteral(error: unknown): boolean {
+function isOversizedLiteral(error: unknown, seen?: Set<unknown>): boolean {
   if (typeof error !== 'object' || error === null) {
     return false;
   }
-  const like = error as { code?: unknown; message?: unknown; name?: unknown };
+  const visited = seen ?? new Set<unknown>();
+  if (visited.has(error)) {
+    return false;
+  }
+  visited.add(error);
+  const like = error as { code?: unknown; message?: unknown; name?: unknown; cause?: unknown };
   const text = `${String(like.code ?? '')} ${String(like.name ?? '')} ${String(like.message ?? '')}`;
-  return /LiteralTooLarge|literal size/i.test(text);
+  if (/LiteralTooLarge|literal size/i.test(text)) {
+    return true;
+  }
+  return isOversizedLiteral(like.cause, visited);
 }

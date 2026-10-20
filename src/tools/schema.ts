@@ -276,7 +276,7 @@ const cursor = z
   .string()
   .optional()
   .describe(
-    "Opaque cursor from the previous page's nextCursor. It stores the position in that sorted result and the mailbox uidValidity. A cursor whose uidValidity no longer matches fails with UIDVALIDITY_CHANGED. Omit to start at the first page.",
+    "Opaque cursor from the previous page's nextCursor. It stores the last returned UID, that message's position, the primary sort key, and the mailbox uidValidity. The next page continues after that UID in a freshly sorted result. If the UID was expunged, the page continues at the first message that sorts strictly after the stored key, so deleting an earlier message does not skip the next one. Messages that compare equal to that key may be repeated or skipped. When the cursor has no sort key, the stored position is used, and adding or removing earlier messages can skip or repeat one. A cursor whose uidValidity no longer matches fails with UIDVALIDITY_CHANGED. Pass the same sort as the call that issued the cursor. Omit to start at the first page.",
   );
 
 const ok = z

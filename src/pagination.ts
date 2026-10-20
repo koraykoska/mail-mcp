@@ -1,12 +1,17 @@
 import { MailError } from './errors.js';
+import type { SortAnchor } from './imap/sort.js';
+
+const ANCHOR_FIELDS = ['arrival', 'date', 'from', 'to', 'cc', 'subject', 'size'] as const;
 
 export interface PageCursor {
   v: 1 | 2 | 3;
   offset?: number;
   /** Last UID returned on the previous page. The next page starts after this UID in the same order. */
   afterUid?: number;
-  /** Index in the sorted result where the next page starts. Independent of UID order. */
+  /** Index in the sorted result where the next page starts. Used when afterUid is gone and no sort key is stored. */
   position?: number;
+  /** Primary sort key of the last returned message. Used when that UID has been expunged. */
+  anchor?: SortAnchor;
   uidValidity?: string;
 }
 
@@ -41,6 +46,7 @@ export function decodeCursor(value: string, expectedUidValidity?: string): PageC
     offset?: unknown;
     afterUid?: unknown;
     position?: unknown;
+    anchor?: unknown;
     uidValidity?: unknown;
   };
   const version = record.v;
@@ -69,11 +75,21 @@ export function decodeCursor(value: string, expectedUidValidity?: string): PageC
   ) {
     throw new MailError('INVALID_ARGUMENT', 'The page cursor is not valid.');
   }
+  if (
+    record.afterUid !== undefined &&
+    (typeof record.afterUid !== 'number' ||
+      !Number.isInteger(record.afterUid) ||
+      record.afterUid < 1)
+  ) {
+    throw new MailError('INVALID_ARGUMENT', 'The page cursor is not valid.');
+  }
+  const anchor = record.anchor === undefined ? undefined : readAnchor(record.anchor);
   const cursor: PageCursor = {
     v: version,
     ...(typeof record.offset === 'number' ? { offset: record.offset } : {}),
     ...(typeof record.afterUid === 'number' ? { afterUid: record.afterUid } : {}),
     ...(typeof record.position === 'number' ? { position: record.position } : {}),
+    ...(anchor ? { anchor } : {}),
     ...(typeof record.uidValidity === 'string' ? { uidValidity: record.uidValidity } : {}),
   };
   if (expectedUidValidity && cursor.uidValidity && cursor.uidValidity !== expectedUidValidity) {
@@ -116,11 +132,67 @@ export function pageByPosition(
   }
   const uids = ordered.slice(position, position + limit);
   const next = position + uids.length;
+  const last = uids[uids.length - 1];
   const nextCursor =
-    next < ordered.length
-      ? encodeCursor({ v: 3, position: next, ...(uidValidity ? { uidValidity } : {}) })
+    last !== undefined && next < ordered.length
+      ? encodeCursor({
+          v: 3,
+          position: next,
+          afterUid: last,
+          ...(uidValidity ? { uidValidity } : {}),
+        })
       : null;
   return { uids, nextCursor, offset: position };
+}
+
+/**
+ * Continue a sorted walk. Prefer the last returned UID: its index in the fresh list
+ * is stable when an earlier message disappears. If that UID is gone, `isAfterAnchor`
+ * finds the first message that sorts after the stored key. Otherwise the stored
+ * position is used, which can skip or repeat when the list changed above the cursor.
+ */
+export function resumeIndex(
+  ordered: readonly number[],
+  resume: { position: number; afterUid?: number },
+  isAfterAnchor?: (uid: number) => boolean,
+): number {
+  if (!Number.isInteger(resume.position) || resume.position < 0) {
+    throw new MailError('INVALID_ARGUMENT', 'The page cursor is not valid.');
+  }
+  if (resume.afterUid !== undefined) {
+    const index = ordered.indexOf(resume.afterUid);
+    if (index >= 0) {
+      return index + 1;
+    }
+  }
+  if (isAfterAnchor) {
+    const index = ordered.findIndex((uid) => isAfterAnchor(uid));
+    return index >= 0 ? index : ordered.length;
+  }
+  return resume.position;
+}
+
+export function pageAnchored(
+  ordered: readonly number[],
+  limit: number,
+  resume: { position: number; afterUid?: number },
+  uidValidity?: string,
+  isAfterAnchor?: (uid: number) => boolean,
+): { uids: number[]; nextCursor: string | null; offset: number } {
+  const offset = resumeIndex(ordered, resume, isAfterAnchor);
+  const uids = ordered.slice(offset, offset + limit);
+  const next = offset + uids.length;
+  const last = uids[uids.length - 1];
+  const nextCursor =
+    last !== undefined && next < ordered.length
+      ? encodeCursor({
+          v: 3,
+          position: next,
+          afterUid: last,
+          ...(uidValidity ? { uidValidity } : {}),
+        })
+      : null;
+  return { uids, nextCursor, offset };
 }
 
 /** Slice an ordered UID list after `afterUid`. The list is in sort order, not numeric UID order. */
@@ -149,6 +221,26 @@ export function pageAfterUid(
       ? encodeCursor({ v: 2, afterUid: last, ...(uidValidity ? { uidValidity } : {}) })
       : null;
   return { uids, nextCursor, offset: start };
+}
+
+function readAnchor(value: unknown): SortAnchor {
+  if (typeof value !== 'object' || value === null) {
+    throw new MailError('INVALID_ARGUMENT', 'The page cursor is not valid.');
+  }
+  const record = value as { field?: unknown; reverse?: unknown; value?: unknown };
+  if (
+    typeof record.field !== 'string' ||
+    !ANCHOR_FIELDS.includes(record.field as (typeof ANCHOR_FIELDS)[number]) ||
+    typeof record.reverse !== 'boolean' ||
+    typeof record.value !== 'string'
+  ) {
+    throw new MailError('INVALID_ARGUMENT', 'The page cursor is not valid.');
+  }
+  return {
+    field: record.field as SortAnchor['field'],
+    reverse: record.reverse,
+    value: record.value,
+  };
 }
 
 export function paginate<T>(items: readonly T[], offset: number, limit: number): Page<T> {

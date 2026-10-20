@@ -215,6 +215,15 @@ export interface ImapSession {
   connect(): Promise<void>;
   logout(): Promise<void>;
   close(): void;
+  /**
+   * The pool calls this once, after the session is tracked.
+   * Invoke the handler when the socket fails or closes on its own so the slot can be dropped.
+   */
+  bindDisconnect?(handler: () => void): void;
+  /** True when this connection failed and must not be returned to the idle pool. */
+  hasFailed?(): boolean;
+  /** Inactivity budget of the underlying socket. The pool drops an idle session before this elapses. */
+  idleBudgetMs?(): number;
 }
 
 export function uidList(uids: number[]): string {

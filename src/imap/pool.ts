@@ -28,6 +28,8 @@ export class ImapConnectionPool implements ImapPool {
   private readonly all = new Map<string, Set<ImapSession>>();
   private readonly opening = new Map<string, number>();
   private readonly waiters = new Map<string, Waiter[]>();
+  private readonly idleTimers = new Map<ImapSession, NodeJS.Timeout>();
+  private readonly dropping = new WeakSet<ImapSession>();
   private closed = false;
 
   constructor(
@@ -76,6 +78,10 @@ export class ImapConnectionPool implements ImapPool {
     this.all.clear();
     this.idle.clear();
     this.opening.clear();
+    for (const timer of this.idleTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.idleTimers.clear();
     await Promise.all(sessions.map((session) => session.logout().catch(() => session.close())));
   }
 
@@ -133,6 +139,11 @@ export class ImapConnectionPool implements ImapPool {
       if (!session) {
         continue;
       }
+      this.clearIdleTimer(session);
+      if (session.hasFailed?.()) {
+        await this.drop(accountId, session);
+        continue;
+      }
       try {
         await session.connect();
         return session;
@@ -156,6 +167,9 @@ export class ImapConnectionPool implements ImapPool {
         const set = this.all.get(accountId) ?? new Set<ImapSession>();
         set.add(session);
         this.all.set(accountId, set);
+        session.bindDisconnect?.(() => {
+          void this.drop(accountId, session);
+        });
         return session;
       } finally {
         const left = (this.opening.get(accountId) ?? 1) - 1;
@@ -210,6 +224,10 @@ export class ImapConnectionPool implements ImapPool {
     if (this.closed || !this.all.get(accountId)?.has(session)) {
       return;
     }
+    if (session.hasFailed?.()) {
+      void this.drop(accountId, session);
+      return;
+    }
     const queue = this.waiters.get(accountId);
     const waiter = queue?.shift();
     if (waiter) {
@@ -224,9 +242,11 @@ export class ImapConnectionPool implements ImapPool {
       list.push(session);
     }
     this.idle.set(accountId, list);
+    this.armIdleEviction(accountId, session);
   }
 
   private async drop(accountId: string, session: ImapSession): Promise<void> {
+    this.clearIdleTimer(session);
     this.all.get(accountId)?.delete(session);
     const idle = this.idle.get(accountId);
     if (idle) {
@@ -235,6 +255,10 @@ export class ImapConnectionPool implements ImapPool {
         idle.filter((item) => item !== session),
       );
     }
+    if (this.dropping.has(session)) {
+      return;
+    }
+    this.dropping.add(session);
     try {
       await session.logout();
     } catch {
@@ -278,6 +302,41 @@ export class ImapConnectionPool implements ImapPool {
     }
     throw mapTransportError(last);
   }
+
+  private armIdleEviction(accountId: string, session: ImapSession): void {
+    this.clearIdleTimer(session);
+    const delayMs = idleEvictDelay(session.idleBudgetMs?.() ?? 0);
+    if (delayMs <= 0) {
+      return;
+    }
+    // Log out before ImapFlow's socket timer fires. A quiet pooled socket emits
+    // 'error' (ETIMEOUT) once that timer elapses, including after a wait restores
+    // the shorter account timeout. The session error listener is the backstop.
+    const timer = setTimeout(() => {
+      this.idleTimers.delete(session);
+      void this.drop(accountId, session);
+    }, delayMs);
+    timer.unref?.();
+    this.idleTimers.set(session, timer);
+  }
+
+  private clearIdleTimer(session: ImapSession): void {
+    const timer = this.idleTimers.get(session);
+    if (!timer) {
+      return;
+    }
+    clearTimeout(timer);
+    this.idleTimers.delete(session);
+  }
+}
+
+/** How long an idle session may sit before the pool closes it. Always inside the socket budget. */
+export function idleEvictDelay(budgetMs: number): number {
+  if (budgetMs <= 0) {
+    return 0;
+  }
+  const slack = Math.min(1_000, Math.max(50, Math.floor(budgetMs / 2)));
+  return Math.max(1, budgetMs - slack);
 }
 
 function isTerminalSessionError(error: unknown): boolean {

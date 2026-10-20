@@ -6,6 +6,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { describe, expect, it } from 'vitest';
 import { TOOLS } from '../../src/tools/catalog.js';
+import { ScriptedImap } from '../support/scripted-imap.js';
 
 const bin = path.resolve('dist/cli.js');
 
@@ -61,6 +62,45 @@ describe('stdio MCP server', () => {
     expect(missing.isError).toBe(true);
     expect(JSON.stringify(missing.content)).toContain('INVALID_ARGUMENT');
     await client.close();
+  });
+
+  it('stays alive after an idle IMAP socket timeout', async () => {
+    const server = new ScriptedImap({ capabilities: ['IMAP4rev1', 'UIDPLUS', 'IDLE'] });
+    await server.ready();
+    const dir = mkdtempSync(path.join(tmpdir(), 'mail-mcp-e2e-idle-'));
+    const config = path.join(dir, 'mail.json');
+    writeFileSync(
+      config,
+      JSON.stringify({
+        accounts: {
+          local: {
+            email: 'user@example.com',
+            user: 'user',
+            password: 'secret',
+            imap: {
+              host: '127.0.0.1',
+              port: server.port,
+              secure: false,
+              starttls: 'disabled',
+              timeoutMs: 1000,
+            },
+          },
+        },
+      }),
+    );
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [bin, '--config', config, '--log-level', 'silent'],
+    });
+    const client = new Client({ name: 'mail-mcp-e2e', version: '0.0.0' });
+    await client.connect(transport);
+    const first = await client.callTool({ name: 'mail_list_mailboxes', arguments: {} });
+    expect(first.isError).toBeFalsy();
+    await new Promise((resolve) => setTimeout(resolve, 3_000));
+    const second = await client.callTool({ name: 'mail_list_mailboxes', arguments: {} });
+    expect(second.isError).toBeFalsy();
+    await client.close();
+    await server.close();
   });
 
   it('answers --help and --version on stdout', async () => {
