@@ -179,6 +179,76 @@ describe('Dovecot', () => {
     await runtime.close();
   });
 
+  it('pages newest-first when an older internal date is not the lowest UID', async () => {
+    const runtime = runtimeFor(dovecot.imapPort);
+    const stamp = `mixed-${Date.now()}`;
+    await runtime.service.createMailbox(undefined, stamp);
+    await runtime.service.append({
+      mailbox: stamp,
+      date: '2026-08-01T12:00:00.000Z',
+      rawBase64: simpleMessage({ subject: 'Newer' }).toString('base64'),
+    });
+    await runtime.service.append({
+      mailbox: stamp,
+      date: '2010-01-01T12:00:00.000Z',
+      rawBase64: simpleMessage({ subject: 'Older' }).toString('base64'),
+    });
+    await runtime.service.append({
+      mailbox: stamp,
+      date: '2026-10-20T12:00:00.000Z',
+      rawBase64: simpleMessage({ subject: 'Newest' }).toString('base64'),
+    });
+    const subjects: string[] = [];
+    let cursor: string | undefined;
+    for (let page = 0; page < 5; page += 1) {
+      const listed = await runtime.service.listMessages({
+        mailbox: stamp,
+        limit: 1,
+        includeSnippet: false,
+        ...(cursor ? { cursor } : {}),
+      });
+      const rows = listed.messages as Array<{ subject: string | null }>;
+      if (rows.length === 0) {
+        break;
+      }
+      subjects.push(String(rows[0]?.subject));
+      cursor = listed.nextCursor ? String(listed.nextCursor) : undefined;
+      if (!cursor) {
+        break;
+      }
+    }
+    expect(subjects).toEqual(['Newest', 'Newer', 'Older']);
+    expect(new Set(subjects).size).toBe(subjects.length);
+    await runtime.close();
+  });
+
+  it('sees mail that arrives after the account socket timeout', async () => {
+    const runtime = runtimeFor(dovecot.imapPort, {
+      imap: {
+        host: dovecot.host,
+        port: dovecot.imapPort,
+        secure: false,
+        starttls: 'required',
+        timeoutMs: 3_000,
+        tls: { rejectUnauthorized: true, caFile: dovecot.caFile, servername: 'localhost' },
+      },
+    });
+    const stamp = `longwait-${Date.now()}`;
+    await runtime.service.createMailbox(undefined, stamp);
+    const waiting = runtime.service.waitForChanges({ mailbox: stamp, timeoutMs: 6_000 });
+    await new Promise((resolve) => setTimeout(resolve, 4_000));
+    await runtime.service.append({
+      mailbox: stamp,
+      rawBase64: simpleMessage({ subject: 'late', text: 'after the account timeout' }).toString(
+        'base64',
+      ),
+    });
+    const result = await waiting;
+    expect(result.timedOut).toBe(false);
+    expect((result.changes as unknown[]).length).toBeGreaterThan(0);
+    await runtime.close();
+  });
+
   it('negotiates STARTTLS on port 143', async () => {
     const client = new ImapFlow({
       host: dovecot.host,

@@ -1,10 +1,12 @@
 import { MailError } from './errors.js';
 
 export interface PageCursor {
-  v: 1 | 2;
+  v: 1 | 2 | 3;
   offset?: number;
   /** Last UID returned on the previous page. The next page starts after this UID in the same order. */
   afterUid?: number;
+  /** Index in the sorted result where the next page starts. Independent of UID order. */
+  position?: number;
   uidValidity?: string;
 }
 
@@ -38,10 +40,11 @@ export function decodeCursor(value: string, expectedUidValidity?: string): PageC
     v?: unknown;
     offset?: unknown;
     afterUid?: unknown;
+    position?: unknown;
     uidValidity?: unknown;
   };
   const version = record.v;
-  if (version !== 1 && version !== 2) {
+  if (version !== 1 && version !== 2 && version !== 3) {
     throw new MailError('INVALID_ARGUMENT', 'The page cursor is not valid.');
   }
   if (
@@ -58,10 +61,19 @@ export function decodeCursor(value: string, expectedUidValidity?: string): PageC
   ) {
     throw new MailError('INVALID_ARGUMENT', 'The page cursor is not valid.');
   }
+  if (
+    version === 3 &&
+    (typeof record.position !== 'number' ||
+      !Number.isInteger(record.position) ||
+      record.position < 0)
+  ) {
+    throw new MailError('INVALID_ARGUMENT', 'The page cursor is not valid.');
+  }
   const cursor: PageCursor = {
     v: version,
     ...(typeof record.offset === 'number' ? { offset: record.offset } : {}),
     ...(typeof record.afterUid === 'number' ? { afterUid: record.afterUid } : {}),
+    ...(typeof record.position === 'number' ? { position: record.position } : {}),
     ...(typeof record.uidValidity === 'string' ? { uidValidity: record.uidValidity } : {}),
   };
   if (expectedUidValidity && cursor.uidValidity && cursor.uidValidity !== expectedUidValidity) {
@@ -89,7 +101,29 @@ export function clampLimit(requested: number | undefined, fallback: number, max:
   return value;
 }
 
-/** Slice an ordered UID list after `afterUid`, so mail that arrives at the start does not shift the page. */
+/**
+ * Slice `ordered` at `position`. `ordered` is already in sort order, so the next page
+ * is the next slice of that result even when UIDs and internal dates disagree.
+ */
+export function pageByPosition(
+  ordered: readonly number[],
+  limit: number,
+  position: number,
+  uidValidity?: string,
+): { uids: number[]; nextCursor: string | null; offset: number } {
+  if (!Number.isInteger(position) || position < 0) {
+    throw new MailError('INVALID_ARGUMENT', 'The page cursor is not valid.');
+  }
+  const uids = ordered.slice(position, position + limit);
+  const next = position + uids.length;
+  const nextCursor =
+    next < ordered.length
+      ? encodeCursor({ v: 3, position: next, ...(uidValidity ? { uidValidity } : {}) })
+      : null;
+  return { uids, nextCursor, offset: position };
+}
+
+/** Slice an ordered UID list after `afterUid`. The list is in sort order, not numeric UID order. */
 export function pageAfterUid(
   ordered: readonly number[],
   limit: number,

@@ -2,7 +2,14 @@ import { describe, expect, it } from 'vitest';
 import { MailError, mapTransportError, isRetryableConnectionError } from '../../src/errors.js';
 import { redactText, redactValue } from '../../src/redact.js';
 import { createLogger } from '../../src/log.js';
-import { decodeCursor, encodeCursor, paginate, clampLimit } from '../../src/pagination.js';
+import {
+  decodeCursor,
+  encodeCursor,
+  paginate,
+  clampLimit,
+  pageByPosition,
+  pageAfterUid,
+} from '../../src/pagination.js';
 import { decodeModifiedUtf7, encodeModifiedUtf7 } from '../../src/utf7.js';
 import { decodeBody, encodeBody } from '../../src/charset.js';
 import { SlidingWindowLimiter } from '../../src/rate-limit.js';
@@ -90,6 +97,34 @@ describe('pagination', () => {
     expect(clampLimit(undefined, 25, 100)).toBe(25);
     expect(() => clampLimit(0, 25, 100)).toThrow(MailError);
     expect(() => clampLimit(101, 25, 100)).toThrow(MailError);
+    const first = pageByPosition([3, 1, 2], 1, 0, '9');
+    expect(first.uids).toEqual([3]);
+    expect(decodeCursor(first.nextCursor ?? '', '9')).toMatchObject({
+      v: 3,
+      position: 1,
+      uidValidity: '9',
+    });
+    expect(pageByPosition([3, 1, 2], 1, 1, '9').uids).toEqual([1]);
+    expect(pageByPosition([3, 1, 2], 1, 2, '9')).toMatchObject({ uids: [2], nextCursor: null });
+    expect(pageByPosition([3, 1, 2], 1, 0).nextCursor).toEqual(expect.any(String));
+    expect(() => pageByPosition([1], 1, -1)).toThrow(MailError);
+    expect(() => pageByPosition([1], 1, 1.5)).toThrow(MailError);
+    expect(() => decodeCursor(encodeCursor({ v: 3, position: -1 }))).toThrow(MailError);
+    expect(() => decodeCursor(encodeCursor({ v: 3, position: 1.5 }))).toThrow(MailError);
+    expect(() =>
+      decodeCursor(
+        Buffer.from(JSON.stringify({ v: 3, position: '1' }), 'utf8').toString('base64url'),
+      ),
+    ).toThrow(MailError);
+    expect(() =>
+      decodeCursor(Buffer.from(JSON.stringify({ v: 4 }), 'utf8').toString('base64url')),
+    ).toThrow(MailError);
+    expect(() => decodeCursor(Buffer.from('null').toString('base64url'))).toThrow(MailError);
+    expect(() => decodeCursor(Buffer.from('1').toString('base64url'))).toThrow(MailError);
+    expect(() => decodeCursor(encodeCursor({ v: 1, offset: -1 }))).toThrow(MailError);
+    expect(() => decodeCursor(encodeCursor({ v: 2, afterUid: 0 }))).toThrow(MailError);
+    expect(pageAfterUid([4, 3, 2, 1], 2).nextCursor).toEqual(expect.any(String));
+    expect(paginate([1], 0, 2).nextCursor).toBeUndefined();
   });
 });
 

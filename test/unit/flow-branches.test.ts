@@ -327,6 +327,21 @@ describe('IMAP session branches', () => {
     await refused.close();
   });
 
+  it('reports a label update for an unknown UID as not found', async () => {
+    const server = new ScriptedImap({
+      capabilities: ['IMAP4rev1', 'UIDPLUS', 'X-GM-EXT-1'],
+    });
+    await server.ready();
+    server.addMessage(simpleMessage({ subject: 'L' }).toString('utf8'), []);
+    const session = await connect(server);
+    await expect(
+      session.withMailbox('INBOX', 'write', (box) => box.setLabels([999999], ['Work'], 'add')),
+    ).rejects.toMatchObject({ code: 'NOT_FOUND' });
+    await session.withMailbox('INBOX', 'write', (box) => box.setLabels([1], ['Work'], 'add'));
+    await session.close();
+    await server.close();
+  });
+
   it('parses thread nodes that are a bare uid or a nested list', () => {
     expect(parseThreadNode({ value: '4' }).uid).toBe(4);
     const nested = parseThreadNode({

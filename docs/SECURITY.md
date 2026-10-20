@@ -28,4 +28,6 @@ The optional HTTP transport binds to `127.0.0.1` by default. A non-loopback `--h
 
 HTML returned by the tools, and HTML quoted into a reply or forward, is passed through an allow-list sanitizer. Only a fixed set of tags and the `http`, `https`, `mailto`, and `cid` URL schemes are kept. Event handlers, style, and embedded content are dropped. The text rendering does not delete those scheme names from ordinary prose.
 
+A raw fetch asks for at most `maxMessageBytes + 1` octets. If the server ignores that partial and announces a larger literal, the parser refuses it and closes the connection instead of buffering the message. The call fails with `SIZE_LIMIT`.
+
 Attachment `path` values and `savePath` are local filesystem paths. A client that can call tools can read files the process can read and write files the process can write, subject to `attachmentsDir`.

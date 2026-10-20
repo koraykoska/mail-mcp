@@ -92,6 +92,13 @@ describe('HTML allow-list', () => {
     }
     expect(sanitizeHtml('<p>See data: files</p>')).toContain('data:');
     expect(htmlToSafeText('<p>See data: files</p>')).toContain('data:');
+    const slashed = sanitizeHtml('<img/src=x/onerror=alert(1)>');
+    expect(slashed.toLowerCase()).not.toMatch(/\sonerror\s*=/);
+    expect(slashed.toLowerCase()).not.toMatch(/javascript\s*:/);
+    expect(slashed).toBe('<img src="x/onerror=alert(1)" />');
+    expect(sanitizeHtml('<img src="x" onerror="alert(1)">').toLowerCase()).not.toMatch(
+      /\sonerror\s*=/,
+    );
     expect(sanitizeHtml('<a href="https://example.com">ok</a>')).toContain('https://example.com');
     expect(sanitizeHtml('<a href="mailto:a@b.c">m</a>')).toContain('mailto:a@b.c');
     expect(sanitizeHtml('<a href="cid:part1">c</a>')).toContain('cid:part1');
@@ -222,6 +229,45 @@ describe('per-UID labels, size cap, flags, and cursors', () => {
     expect(second).toHaveLength(2);
     expect(first.filter((uid) => second.includes(uid))).toEqual([]);
     expect(page2.total).toBe(5);
+  });
+
+  it('pages a client-side arrival sort when internal dates and UIDs disagree', async () => {
+    const session = new FakeSession(['IMAP4rev1', 'UIDPLUS']);
+    await session.append('INBOX', simpleMessage({ subject: 'Newer' }), []);
+    await session.append('INBOX', simpleMessage({ subject: 'Older' }), []);
+    await session.append('INBOX', simpleMessage({ subject: 'Newest' }), []);
+    const stored = session.boxes.get('INBOX')?.messages ?? [];
+    const newer = stored[0];
+    const older = stored[1];
+    const newest = stored[2];
+    if (!newer || !older || !newest) {
+      throw new Error('missing messages');
+    }
+    newer.internalDate = '2026-08-01T00:00:00.000Z';
+    older.internalDate = '2010-01-01T00:00:00.000Z';
+    newest.internalDate = '2026-10-20T00:00:00.000Z';
+    const { service } = harness(session);
+    const subjects: string[] = [];
+    let cursor: string | undefined;
+    for (let page = 0; page < 5; page += 1) {
+      const listed = await service.listMessages({
+        mailbox: 'INBOX',
+        limit: 1,
+        includeSnippet: false,
+        ...(cursor ? { cursor } : {}),
+      });
+      const rows = listed.messages as Array<{ subject: string | null }>;
+      if (rows.length === 0) {
+        break;
+      }
+      subjects.push(String(rows[0]?.subject));
+      cursor = listed.nextCursor ? String(listed.nextCursor) : undefined;
+      if (!cursor) {
+        break;
+      }
+    }
+    expect(subjects).toEqual(['Newest', 'Newer', 'Older']);
+    expect(new Set(subjects).size).toBe(3);
   });
 
   it('indexes partIndex on the attachment list, not the text body', async () => {

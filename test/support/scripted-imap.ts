@@ -299,7 +299,7 @@ export class ScriptedImap {
         no('SEARCH refused');
         return;
       }
-      const uids = this.messages.map((message) => message.uid);
+      const uids = searchUids(args, this.messages);
       ctx.write(`* SEARCH ${uids.join(' ')}\r\n`);
       ok('SEARCH completed');
       return;
@@ -542,6 +542,29 @@ function headerOf(raw: string, name: string): string | undefined {
 
 function imapQuote(value: string): string {
   return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+
+function searchUids(args: string, messages: ScriptedMessage[]): number[] {
+  const match = /(?:^|\s)UID\s+([0-9:,*]+)/i.exec(args);
+  if (!match?.[1] || match[1] === '*') {
+    return messages.map((message) => message.uid);
+  }
+  const wanted = new Set<number>();
+  for (const part of match[1].split(',')) {
+    const range = /^(\d+):(\d+)$/.exec(part);
+    if (range?.[1] && range[2]) {
+      const low = Math.min(Number(range[1]), Number(range[2]));
+      const high = Math.max(Number(range[1]), Number(range[2]));
+      for (let uid = low; uid <= high; uid += 1) {
+        wanted.add(uid);
+      }
+      continue;
+    }
+    if (/^\d+$/.test(part)) {
+      wanted.add(Number(part));
+    }
+  }
+  return messages.map((message) => message.uid).filter((uid) => wanted.has(uid));
 }
 
 function flagsIn(args: string): string[] {

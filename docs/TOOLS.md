@@ -364,7 +364,7 @@ Annotations: readOnlyHint=true, destructiveHint=false, idempotentHint=true, open
   - `field`: arrival is the internal received date. date is the Date header.
   - `reverse` (optional): true sorts descending. Default false (ascending). Newest-first is arrival + reverse.
 - `limit` (optional): Page size. Default is limits.pageSize (25). The schema allows up to 10000; the server rejects values above the configured limits.maxPageSize (default 100).
-- `cursor` (optional): Opaque cursor from the previous page's nextCursor. A cursor resumes after the UID it names. If that UID is no longer in the result, the call fails with INVALID_ARGUMENT; repeat the request without a cursor. Cursors are tied to uidValidity. Omit to start at the first page.
+- `cursor` (optional): Opaque cursor from the previous page's nextCursor. It stores the position in that sorted result and the mailbox uidValidity. A cursor whose uidValidity no longer matches fails with UIDVALIDITY_CHANGED. Omit to start at the first page.
 - `uidValidity` (optional): Expected UIDVALIDITY decimal string from mail_get_mailbox_status or a previous list. When set, the call fails with UIDVALIDITY_CHANGED if the mailbox was recreated.
 - `includeSnippet` (optional): Include a text snippet. Default true. Set false for a faster list.
 - `snippetChars` (optional): Maximum snippet length. Default 160.
@@ -431,7 +431,7 @@ Annotations: readOnlyHint=true, destructiveHint=false, idempotentHint=true, open
   - `field`: arrival is the internal received date. date is the Date header.
   - `reverse` (optional): true sorts descending. Default false (ascending). Newest-first is arrival + reverse.
 - `limit` (optional): Page size. Default is limits.pageSize (25). The schema allows up to 10000; the server rejects values above the configured limits.maxPageSize (default 100).
-- `cursor` (optional): Opaque cursor from the previous page's nextCursor. A cursor resumes after the UID it names. If that UID is no longer in the result, the call fails with INVALID_ARGUMENT; repeat the request without a cursor. Cursors are tied to uidValidity. Omit to start at the first page.
+- `cursor` (optional): Opaque cursor from the previous page's nextCursor. It stores the position in that sorted result and the mailbox uidValidity. A cursor whose uidValidity no longer matches fails with UIDVALIDITY_CHANGED. Omit to start at the first page.
 - `uidValidity` (optional): Expected UIDVALIDITY decimal string from mail_get_mailbox_status or a previous list. When set, the call fails with UIDVALIDITY_CHANGED if the mailbox was recreated.
 - `includeSnippet` (optional): Include a text snippet. Default true. Set false for a faster search.
 - `snippetChars` (optional): Maximum snippet length in characters. Default 160.
@@ -610,7 +610,7 @@ Annotations: readOnlyHint=true, destructiveHint=false, idempotentHint=true, open
   - `and` (optional): Match if every nested object matches. Top-level fields are already ANDed; use this for grouped clauses.
 - `algorithm` (optional): Default REFERENCES.
 - `limit` (optional): Page size. Default is limits.pageSize (25). The schema allows up to 10000; the server rejects values above the configured limits.maxPageSize (default 100).
-- `cursor` (optional): Opaque cursor from the previous page's nextCursor. A cursor resumes after the UID it names. If that UID is no longer in the result, the call fails with INVALID_ARGUMENT; repeat the request without a cursor. Cursors are tied to uidValidity. Omit to start at the first page.
+- `cursor` (optional): Opaque cursor from the previous page's nextCursor. It stores the position in that sorted result and the mailbox uidValidity. A cursor whose uidValidity no longer matches fails with UIDVALIDITY_CHANGED. Omit to start at the first page.
 - `uidValidity` (optional): Expected UIDVALIDITY decimal string from mail_get_mailbox_status or a previous list. When set, the call fails with UIDVALIDITY_CHANGED if the mailbox was recreated.
 
 ### Examples

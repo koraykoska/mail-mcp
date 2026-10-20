@@ -8,15 +8,15 @@ import { requireAccount } from '../config/load.js';
 import type { Logger } from '../log.js';
 import { SlidingWindowLimiter } from '../rate-limit.js';
 import { assertMutation, assertRecipients } from '../safety.js';
-import { decodeCursor, encodeCursor, clampLimit, pageAfterUid } from '../pagination.js';
-import type { ImapPool } from '../imap/pool.js';
 import {
-  andSearchUid,
-  assertSearchCapabilities,
-  compileSearch,
-  type CompiledSearch,
-  type SearchCriteria,
-} from '../imap/search.js';
+  decodeCursor,
+  encodeCursor,
+  clampLimit,
+  pageAfterUid,
+  pageByPosition,
+} from '../pagination.js';
+import type { ImapPool } from '../imap/pool.js';
+import { assertSearchCapabilities, compileSearch, type SearchCriteria } from '../imap/search.js';
 import { sortMessages, type SortKey, type SortableMessage } from '../imap/sort.js';
 import { resolveSpecialUse, type ResolvedSpecialUse } from '../imap/special-use.js';
 import { normalizeFlags, touchesDeleted } from '../imap/flags.js';
@@ -596,12 +596,15 @@ export class MailService {
       const flat = flattenThread(threads);
       const limit = clampLimit(input.limit, account.limits.pageSize, account.limits.maxPageSize);
       const cursor = input.cursor ? decodeCursor(input.cursor, box.uidValidity) : undefined;
-      const page = pageAfterUid(
-        flat,
-        limit,
-        cursor?.v === 2 ? cursor.afterUid : undefined,
-        box.uidValidity,
-      );
+      const page =
+        cursor?.v === 3
+          ? pageByPosition(flat, limit, cursor.position ?? 0, box.uidValidity)
+          : pageAfterUid(
+              flat,
+              limit,
+              cursor?.v === 2 ? cursor.afterUid : undefined,
+              box.uidValidity,
+            );
       const pageSet = new Set(page.uids);
       return {
         ok: true as const,
@@ -1189,9 +1192,9 @@ export class MailService {
       throw new MailError('INVALID_ARGUMENT', 'timeoutMs must be between 1000 and 120000.');
     }
     const mailbox = input.mailbox ?? 'INBOX';
-    // The wait's own deadline is the command budget. The pool closes the
-    // socket if the session is still inside the wait after a short grace,
-    // which is what happens when IDLE ignores its timer.
+    // The wait's own deadline is the command budget. The session also raises
+    // the IMAP socket timeout for this call. The pool closes the socket if
+    // the wait is still running after a short grace.
     return this.withImap(
       account,
       async (session) => {
@@ -1226,42 +1229,15 @@ export class MailService {
       );
       const decoded = input.cursor ? decodeCursor(input.cursor, box.uidValidity) : undefined;
       const afterUid = decoded?.v === 2 ? decoded.afterUid : undefined;
-      const direction = arrivalDirection(keys);
-      let sortCompiled: CompiledSearch = compiled;
-      let window: { start: number; count: number } | undefined;
-      let bounded = false;
-      if (session.hasCapability('SORT') && session.hasCapability('ESORT')) {
-        if (afterUid !== undefined && direction) {
-          const range =
-            direction === 'desc'
-              ? afterUid > 1
-                ? `1:${afterUid - 1}`
-                : undefined
-              : `${afterUid + 1}:*`;
-          if (!range) {
-            return {
-              ok: true as const,
-              account: account.id,
-              mailbox,
-              uidValidity: box.uidValidity,
-              total: matched.length,
-              offset: matched.length,
-              sort: keys,
-              sortSource: 'server' as const,
-              search: fromSearch,
-              messages: [],
-              nextCursor: null,
-            };
-          }
-          sortCompiled = andSearchUid(compiled, range);
-          bounded = true;
-          window = { start: 1, count: limitForPage };
-        } else if (afterUid === undefined) {
-          window = { start: 1, count: limitForPage };
-        }
-      }
+      const startIndex = decoded?.v === 3 ? (decoded.position ?? 0) : 0;
+      // A position cursor pages the same sorted search. A legacy afterUid cursor
+      // still slices that sorted list; it is not turned into a UID range.
+      const window =
+        session.hasCapability('SORT') && session.hasCapability('ESORT') && afterUid === undefined
+          ? { start: startIndex + 1, count: limitForPage }
+          : undefined;
       const serverSorted = session.hasCapability('SORT')
-        ? await box.serverSort(sortCompiled, keys, window)
+        ? await box.serverSort(compiled, keys, window)
         : null;
       let pageUids: number[];
       let nextCursor: string | null;
@@ -1269,29 +1245,25 @@ export class MailService {
       let total: number;
       if (serverSorted) {
         const allow = new Set(matched);
-        if (serverSorted.partial) {
+        if (serverSorted.partial && afterUid === undefined) {
           pageUids = serverSorted.uids.filter((uid) => allow.has(uid));
           total = matched.length;
-          offset = 0;
-          const last = pageUids[pageUids.length - 1];
+          offset = startIndex;
+          const next = startIndex + pageUids.length;
           nextCursor =
-            last !== undefined &&
-            pageUids.length >= limitForPage &&
-            serverSorted.total > pageUids.length
-              ? encodeCursor({ v: 2, afterUid: last, uidValidity: box.uidValidity })
+            pageUids.length > 0 && pageUids.length >= limitForPage && next < total
+              ? encodeCursor({ v: 3, position: next, uidValidity: box.uidValidity })
               : null;
         } else {
           const ordered = serverSorted.uids.filter((uid) => allow.has(uid));
-          const paged = pageAfterUid(
-            ordered,
-            limitForPage,
-            bounded ? undefined : afterUid,
-            box.uidValidity,
-          );
+          const paged =
+            afterUid !== undefined
+              ? pageAfterUid(ordered, limitForPage, afterUid, box.uidValidity)
+              : pageByPosition(ordered, limitForPage, startIndex, box.uidValidity);
           pageUids = paged.uids;
           nextCursor = paged.nextCursor;
           offset = paged.offset;
-          total = bounded ? matched.length : ordered.length;
+          total = ordered.length;
         }
         sortSource = 'server';
       } else if (matched.length > account.limits.maxSortCandidates) {
@@ -1313,7 +1285,10 @@ export class MailService {
           size: item.size,
         }));
         const ordered = sortMessages(sortable, keys).map((item) => item.uid);
-        const paged = pageAfterUid(ordered, limitForPage, afterUid, box.uidValidity);
+        const paged =
+          afterUid !== undefined
+            ? pageAfterUid(ordered, limitForPage, afterUid, box.uidValidity)
+            : pageByPosition(ordered, limitForPage, startIndex, box.uidValidity);
         pageUids = paged.uids;
         nextCursor = paged.nextCursor;
         offset = paged.offset;
@@ -1989,20 +1964,6 @@ function textFromPart(content: Buffer, contentType: string | undefined): string 
   }
   const text = content.toString('utf8');
   return type.startsWith('text/html') ? sanitizeHtml(text) : text;
-}
-
-function arrivalDirection(keys: readonly SortKey[]): 'asc' | 'desc' | null {
-  if (keys.length === 0 || keys.some((key) => key.field !== 'arrival')) {
-    return null;
-  }
-  const reversed = keys.map((key) => Boolean(key.reverse));
-  if (reversed.every((value) => value)) {
-    return 'desc';
-  }
-  if (reversed.every((value) => !value)) {
-    return 'asc';
-  }
-  return null;
 }
 
 export interface UidInput {

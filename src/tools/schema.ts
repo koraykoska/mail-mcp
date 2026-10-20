@@ -276,7 +276,7 @@ const cursor = z
   .string()
   .optional()
   .describe(
-    "Opaque cursor from the previous page's nextCursor. A cursor resumes after the UID it names. If that UID is no longer in the result, the call fails with INVALID_ARGUMENT; repeat the request without a cursor. Cursors are tied to uidValidity. Omit to start at the first page.",
+    "Opaque cursor from the previous page's nextCursor. It stores the position in that sorted result and the mailbox uidValidity. A cursor whose uidValidity no longer matches fails with UIDVALIDITY_CHANGED. Omit to start at the first page.",
   );
 
 const ok = z

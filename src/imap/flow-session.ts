@@ -350,6 +350,10 @@ export class ImapFlowSession implements ImapSession {
 
   async waitForChanges(path: string, timeoutMs: number): Promise<WaitResult> {
     const client = this.requireClient();
+    // ImapFlow arms socketTimeout from the account command budget. A wait is
+    // allowed to run longer than that, so raise the watchdog for this call and
+    // put the account timeout back afterwards.
+    const previousSocketTimeout = replaceSocketTimeout(client, timeoutMs + 1_000);
     const changes: MailboxChange[] = [];
     const onExists = (event: { path: string; count: number; prevCount: number }): void => {
       changes.push({
@@ -457,6 +461,9 @@ export class ImapFlowSession implements ImapSession {
     } catch (error) {
       throw mapTransportError(error);
     } finally {
+      if (client.usable) {
+        replaceSocketTimeout(client, previousSocketTimeout);
+      }
       lock?.release();
       client.off('exists', onExists);
       client.off('expunge', onExpunge);
@@ -731,15 +738,39 @@ class FlowMailbox implements OpenMailbox {
   }
 
   async fetchSource(uid: number, maxBytes?: number): Promise<Buffer | null> {
-    const row = await this.client.fetchOne(
-      String(uid),
-      { uid: true, source: maxBytes ? { maxLength: maxBytes } : true },
-      { uid: true },
-    );
-    if (!row || !row.source) {
-      return null;
+    const client = this.client as ImapFlow & { streamer?: { maxLiteralSize: number } };
+    const streamer = client.streamer;
+    const previousLimit = streamer?.maxLiteralSize;
+    // A server that ignores BODY.PEEK[]<0.n> would otherwise deliver the whole
+    // message as one literal. Cap the parser so that literal is refused before
+    // it is buffered, and the connection is closed.
+    if (streamer && maxBytes !== undefined && maxBytes > 0) {
+      streamer.maxLiteralSize = Math.min(previousLimit ?? maxBytes, maxBytes);
     }
-    return Buffer.from(row.source);
+    try {
+      const row = await this.client.fetchOne(
+        String(uid),
+        { uid: true, source: maxBytes ? { maxLength: maxBytes } : true },
+        { uid: true },
+      );
+      if (!row || !row.source) {
+        return null;
+      }
+      return Buffer.from(row.source);
+    } catch (error) {
+      if (maxBytes !== undefined && isOversizedLiteral(error)) {
+        throw new MailError(
+          'SIZE_LIMIT',
+          `The server sent more than ${maxBytes} bytes for UID ${uid}.`,
+          'The partial body limit was ignored, so the connection was closed instead of buffering the message.',
+        );
+      }
+      throw error;
+    } finally {
+      if (streamer && previousLimit !== undefined) {
+        streamer.maxLiteralSize = previousLimit;
+      }
+    }
   }
 
   async fetchHeaders(uid: number): Promise<Buffer | null> {
@@ -932,6 +963,17 @@ class FlowMailbox implements OpenMailbox {
         'CAPABILITY_UNSUPPORTED',
         'Gmail labels require the X-GM-EXT-1 extension.',
       );
+    }
+    if (uids.length === 0) {
+      return;
+    }
+    // A UID STORE for an unknown UID is often a successful no-op. Search first,
+    // the same way flag updates do, so a missing UID is NOT_FOUND.
+    const present = await this.search({ query: { uid: uids.join(',') }, requires: [] });
+    const presentSet = new Set(present);
+    const missing = uids.filter((uid) => !presentSet.has(uid));
+    if (missing.length > 0) {
+      throw new MailError('NOT_FOUND', `UID ${missing[0]} was not in the mailbox.`);
     }
     const range = uidList(uids);
     const options = { uid: true, useLabels: true };
@@ -1537,4 +1579,29 @@ export function parseThreadNode(attribute: ImapAttr): ThreadNode {
     children.push(parseThreadNode(item));
   });
   return { uid, children };
+}
+
+function replaceSocketTimeout(client: ImapFlow, timeoutMs: number): number {
+  const raw = client as ImapFlow & {
+    socketTimeout: number;
+    socket?: { setTimeout?: (ms: number) => void } | false;
+    writeSocket?: { setTimeout?: (ms: number) => void } | false;
+  };
+  const previous = raw.socketTimeout;
+  raw.socketTimeout = timeoutMs;
+  for (const socket of [raw.socket, raw.writeSocket]) {
+    if (socket && typeof socket === 'object' && typeof socket.setTimeout === 'function') {
+      socket.setTimeout(timeoutMs);
+    }
+  }
+  return previous;
+}
+
+function isOversizedLiteral(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null) {
+    return false;
+  }
+  const like = error as { code?: unknown; message?: unknown; name?: unknown };
+  const text = `${String(like.code ?? '')} ${String(like.name ?? '')} ${String(like.message ?? '')}`;
+  return /LiteralTooLarge|literal size/i.test(text);
 }
