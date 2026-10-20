@@ -42,7 +42,7 @@ export function textToHtml(text: string): string {
 }
 
 export function htmlToSafeText(html: string): string {
-  return htmlToRoughText(sanitizeHtml(html)).replace(/javascript:/gi, '');
+  return stripDangerousSchemes(htmlToRoughText(sanitizeHtml(html)));
 }
 
 function stripElement(html: string, tag: string): string {
@@ -128,6 +128,36 @@ function isDangerousUrl(name: string, value: string): boolean {
       stripped += char;
     }
   }
-  stripped = stripped.toLowerCase();
-  return stripped.startsWith('javascript:') || stripped.startsWith('vbscript:');
+  return hasDangerousScheme(stripped);
+}
+
+const DANGEROUS_SCHEMES = ['javascript:', 'data:', 'vbscript:'];
+
+function hasDangerousScheme(value: string): boolean {
+  const scheme = value.toLowerCase();
+  return DANGEROUS_SCHEMES.some((prefix) => scheme.startsWith(prefix));
+}
+
+function stripDangerousSchemes(value: string): string {
+  let out = '';
+  let index = 0;
+  const lower = value.toLowerCase();
+  while (index < value.length) {
+    let next = -1;
+    let matched = '';
+    for (const scheme of DANGEROUS_SCHEMES) {
+      const found = lower.indexOf(scheme, index);
+      if (found >= 0 && (next < 0 || found < next)) {
+        next = found;
+        matched = scheme;
+      }
+    }
+    if (next < 0) {
+      out += value.slice(index);
+      break;
+    }
+    out += value.slice(index, next);
+    index = next + matched.length;
+  }
+  return out;
 }

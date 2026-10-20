@@ -40,6 +40,9 @@ describe('transfer and html helpers', () => {
     expect(html).toContain('Ada');
     expect(html.toLowerCase()).not.toContain('javascript:');
     expect(htmlToSafeText('<a href="javascript:alert(1)">x</a>')).not.toMatch(/javascript:/i);
+    expect(htmlToSafeText('see data:text/html,hi and vbscript:msg')).not.toMatch(
+      /data:|vbscript:/i,
+    );
     expect(textToHtml('a<b>\n')).toContain('&lt;');
   });
 });

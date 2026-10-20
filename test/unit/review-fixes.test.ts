@@ -216,6 +216,9 @@ describe('review fixes', () => {
     );
     expect(clean).not.toContain('<script');
     expect(clean.toLowerCase()).not.toContain('javascript:');
+    expect(
+      sanitizeHtml('<a href="data:text/html,hi">d</a><a href="vbscript:msg">v</a>').toLowerCase(),
+    ).not.toMatch(/data:|vbscript:/);
     expect(clean).toContain('Hi');
   });
 
