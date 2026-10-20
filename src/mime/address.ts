@@ -6,8 +6,6 @@ export interface MailAddress {
   address: string;
 }
 
-const ADDRESS_RE = /^(?:"((?:\\.|[^"])*)"|([^<>"]*?))\s*<([^<>]+)>$/;
-
 /**
  * Parse a single mailbox address. Accepts `Name <local@domain>` and bare addresses.
  * The domain is stored in Unicode; {@link addressToAscii} converts it for SMTP/IMAP.
@@ -17,17 +15,22 @@ export function parseAddress(input: string): MailAddress {
   if (!trimmed) {
     throw new MailError('INVALID_ARGUMENT', 'An email address was empty.');
   }
-  const wrapped = ADDRESS_RE.exec(trimmed);
-  if (wrapped) {
-    const name = (wrapped[1] ?? wrapped[2] ?? '').trim().replace(/^"|"$/g, '');
-    const address = normalizeAddress(wrapped[3] ?? '');
-    const parsed: MailAddress = { address };
-    if (name) {
-      parsed.name = name;
+  if (trimmed.endsWith('>')) {
+    const open = trimmed.lastIndexOf('<');
+    if (open >= 0) {
+      const address = normalizeAddress(trimmed.slice(open + 1, -1));
+      let name = trimmed.slice(0, open).trim();
+      if (name.startsWith('"') && name.endsWith('"') && name.length >= 2) {
+        name = unescapeQuoted(name.slice(1, -1));
+      }
+      const parsed: MailAddress = { address };
+      if (name) {
+        parsed.name = name;
+      }
+      return parsed;
     }
-    return parsed;
   }
-  if (trimmed.includes(' ')) {
+  if (trimmed.includes(' ') || trimmed.includes('<')) {
     throw new MailError(
       'INVALID_ARGUMENT',
       `Could not parse the address "${trimmed}".`,
@@ -49,9 +52,7 @@ export function formatAddress(address: MailAddress): string {
   if (!address.name) {
     return address.address;
   }
-  const quoted = /[",<>]/.test(address.name)
-    ? `"${address.name.replace(/"/g, '\\"')}"`
-    : address.name;
+  const quoted = needsQuotes(address.name) ? `"${escapeQuoted(address.name)}"` : address.name;
   return `${quoted} <${address.address}>`;
 }
 
@@ -85,6 +86,36 @@ export function domainOf(address: string): string {
   const ascii = addressToAscii(address);
   const at = ascii.lastIndexOf('@');
   return at >= 0 ? ascii.slice(at + 1).toLowerCase() : '';
+}
+
+function needsQuotes(name: string): boolean {
+  return name.includes('"') || name.includes(',') || name.includes('<') || name.includes('>');
+}
+
+function escapeQuoted(name: string): string {
+  let out = '';
+  for (const char of name) {
+    if (char === '\\' || char === '"') {
+      out += `\\${char}`;
+    } else {
+      out += char;
+    }
+  }
+  return out;
+}
+
+function unescapeQuoted(value: string): string {
+  let out = '';
+  for (let index = 0; index < value.length; index += 1) {
+    const char = value[index] ?? '';
+    if (char === '\\' && index + 1 < value.length) {
+      index += 1;
+      out += value[index] ?? '';
+    } else {
+      out += char;
+    }
+  }
+  return out;
 }
 
 function normalizeAddress(input: string): string {

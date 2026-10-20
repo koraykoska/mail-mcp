@@ -18,10 +18,31 @@ export function makeSnippet(text: string, maxChars: number): string {
 }
 
 /** Very small HTML-to-text used when the html-to-text package is unnecessary (previews). */
+function stripTag(html: string, tag: string): string {
+  const lower = html.toLowerCase();
+  const open = `<${tag}`;
+  const close = `</${tag}`;
+  let out = '';
+  let index = 0;
+  while (index < html.length) {
+    const start = lower.indexOf(open, index);
+    if (start < 0) {
+      out += html.slice(index);
+      break;
+    }
+    out += html.slice(index, start);
+    const end = lower.indexOf(close, start + open.length);
+    if (end < 0) {
+      break;
+    }
+    const after = lower.indexOf('>', end + close.length);
+    index = after < 0 ? html.length : after + 1;
+  }
+  return out;
+}
+
 export function htmlToRoughText(html: string): string {
-  return html
-    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
-    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+  return stripTag(stripTag(html, 'style'), 'script')
     .replace(/<br\s*\/?>/gi, '\n')
     .replace(/<\/p>/gi, '\n')
     .replace(TAGS, ' ')
