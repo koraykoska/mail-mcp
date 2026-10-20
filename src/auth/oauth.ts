@@ -111,7 +111,7 @@ export async function refreshAccessToken(
       'Check tokenUrl, client id, and that this host can reach the identity provider.',
     );
   }
-  let payload: TokenResponse = {};
+  let payload: TokenResponse;
   try {
     payload = (await response.json()) as TokenResponse;
   } catch {
