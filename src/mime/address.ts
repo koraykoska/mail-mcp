@@ -11,7 +11,7 @@ export interface MailAddress {
  * The domain is stored in Unicode; {@link addressToAscii} converts it for SMTP/IMAP.
  */
 export function parseAddress(input: string): MailAddress {
-  const trimmed = input.trim();
+  const trimmed = stripAddressComments(input).trim();
   if (!trimmed) {
     throw new MailError('INVALID_ARGUMENT', 'An email address was empty.');
   }
@@ -44,8 +44,44 @@ export function parseAddressList(value: string | string[] | undefined): MailAddr
   if (!value) {
     return [];
   }
-  const parts = Array.isArray(value) ? value : splitAddresses(value);
+  // Comments can contain commas. Strip them before the list is split.
+  const parts = Array.isArray(value)
+    ? value.flatMap((item) => splitAddresses(stripAddressComments(item)))
+    : splitAddresses(stripAddressComments(value));
   return parts.map((part) => parseAddress(part)).filter((item) => item.address.length > 0);
+}
+
+/** Remove RFC 5322 comments. Parentheses inside a quoted display name stay. */
+export function stripAddressComments(value: string): string {
+  let out = '';
+  let quote = false;
+  let depth = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const char = value[index] ?? '';
+    if (depth > 0) {
+      if (char === '\\') {
+        index += 1;
+        continue;
+      }
+      if (char === '(') {
+        depth += 1;
+      } else if (char === ')') {
+        depth -= 1;
+      }
+      continue;
+    }
+    if (char === '"') {
+      quote = !quote;
+      out += char;
+      continue;
+    }
+    if (char === '(' && !quote) {
+      depth = 1;
+      continue;
+    }
+    out += char;
+  }
+  return out.replace(/[ \t]{2,}/g, ' ').trim();
 }
 
 export function formatAddress(address: MailAddress): string {

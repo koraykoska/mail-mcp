@@ -9,6 +9,23 @@ export interface ImapPool {
     fn: (session: ImapSession) => Promise<T>,
     timeoutMs?: number,
   ): Promise<T>;
+  /**
+   * Run `fn` on another session when one is free. Returns undefined instead of
+   * waiting when the pool has no spare slot.
+   */
+  tryUse?<T>(
+    accountId: string,
+    fn: (session: ImapSession) => Promise<T>,
+    timeoutMs?: number,
+  ): Promise<T | undefined>;
+  /**
+   * Open a session that is not kept in the pool. The caller does not reserve a slot.
+   * Returns undefined when the pool is closed or the server rejects the connection.
+   */
+  useTransient?<T>(
+    accountId: string,
+    fn: (session: ImapSession) => Promise<T>,
+  ): Promise<T | undefined>;
   close(): Promise<void>;
 }
 
@@ -44,6 +61,55 @@ export class ImapConnectionPool implements ImapPool {
     timeoutMs?: number,
   ): Promise<T> {
     const session = await this.acquire(accountId, timeoutMs);
+    return this.finishUse(accountId, session, fn, timeoutMs);
+  }
+
+  async tryUse<T>(
+    accountId: string,
+    fn: (session: ImapSession) => Promise<T>,
+    timeoutMs?: number,
+  ): Promise<T | undefined> {
+    if (this.closed) {
+      return undefined;
+    }
+    const session = await this.acquire(accountId, timeoutMs, false);
+    if (!session) {
+      return undefined;
+    }
+    return this.finishUse(accountId, session, fn, timeoutMs);
+  }
+
+  async useTransient<T>(
+    accountId: string,
+    fn: (session: ImapSession) => Promise<T>,
+  ): Promise<T | undefined> {
+    if (this.closed) {
+      return undefined;
+    }
+    let session: ImapSession | undefined;
+    try {
+      session = await this.factory(accountId);
+      await this.connectWithBackoff(session);
+    } catch {
+      session?.close();
+      return undefined;
+    }
+    const connected = session as ImapSession;
+    try {
+      return await fn(connected);
+    } finally {
+      await connected.logout().catch(() => {
+        connected.close();
+      });
+    }
+  }
+
+  private async finishUse<T>(
+    accountId: string,
+    session: ImapSession,
+    fn: (session: ImapSession) => Promise<T>,
+    timeoutMs?: number,
+  ): Promise<T> {
     let dropped = false;
     try {
       return await this.runBounded(session, fn, timeoutMs);
@@ -129,7 +195,17 @@ export class ImapConnectionPool implements ImapPool {
     }
   }
 
-  private async acquire(accountId: string, timeoutMs?: number): Promise<ImapSession> {
+  private acquire(
+    accountId: string,
+    timeoutMs: number | undefined,
+    wait: false,
+  ): Promise<ImapSession | undefined>;
+  private acquire(accountId: string, timeoutMs?: number, wait?: true): Promise<ImapSession>;
+  private async acquire(
+    accountId: string,
+    timeoutMs?: number,
+    wait = true,
+  ): Promise<ImapSession | undefined> {
     if (this.closed) {
       throw new MailError('CONNECTION_FAILED', 'The mail client is shutting down.');
     }
@@ -179,6 +255,9 @@ export class ImapConnectionPool implements ImapPool {
           this.opening.set(accountId, left);
         }
       }
+    }
+    if (!wait) {
+      return undefined;
     }
     return this.waitForSlot(accountId, timeoutMs);
   }
@@ -270,7 +349,9 @@ export class ImapConnectionPool implements ImapPool {
         clearTimeout(waiter.timer);
       }
       this.acquire(accountId)
-        .then((fresh) => waiter.resolve(fresh))
+        .then((fresh) => {
+          waiter.resolve(fresh);
+        })
         .catch((error: unknown) =>
           waiter.reject(error instanceof MailError ? error : mapTransportError(error)),
         );

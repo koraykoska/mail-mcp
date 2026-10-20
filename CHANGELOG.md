@@ -24,7 +24,11 @@
 - Routing aliases `X-Reply-To`, `X-Confirm-Reading-To`, `X-Sender`, `X-Envelope-From`, `X-Envelope-Sender`, `X-Envelope-To`, `X-Original-From`, `X-Original-Sender`, `X-Original-To`, `X-Original-Recipient`, `X-Apparently-From`, `X-Apparently-To`, and `X-Rcpt-To` are rejected. Other `X-*` headers stay allowed.
 - A Message-ID seed with no `folders` uses the same scope as a mailbox and uid seed: the seed mailbox, INBOX, Sent, Archive, and All. Junk and Trash stay out. `excludedMatches` is the same list for both seeds, in path order. A message that exists only in Junk or Trash is left out of the items until `folders` names that mailbox.
 - `mail_send_draft` sanitizes display names on `To`, `Cc`, and `Bcc` the same way as `From`, and send, reply, and forward do the same for `To` and `Cc`. Names are NFKC-normalized, and a name that is still an encoded-word is dropped. Allow-listed headers are copied from the raw header block.
-- An `X-` header is rejected when the name after `X-` is a routing or receipt header, or when it contains reply, receipt, notification, errors, sender, envelope, rcpt, bounce, resent, or followup. Other `X-*` headers stay allowed.
+- `excludedMatches` is computed after the thread is closed, from every Message-ID in the thread, and is the same path-ordered list for a Message-ID seed and a mailbox and uid seed. A folder in the scope is never listed.
+- A Message-ID that exists only in Junk or Trash is still walked in the default scope. An in-scope reply is returned. The Junk or Trash copy stays in `excludedMatches`. If nothing in scope matches, the items are empty and `excludedMatches` still names that folder.
+- An `X-` header is judged by tokens split on `-`, `_`, and camelCase. A trailing address-bearing name is rejected, as is any token `resent`, `envelope`, `rcpt`, or `bounce`. A separator-free name is also rejected when it ends with a compact address suffix such as `from` or `mdnto`. `X-Sender-IP`, `X-Notification`, and `X-GitHub-Notification` stay allowed.
+- A parenthesized comment on an address is stripped before parsing on send, reply, forward, and draft. `bob@example.com (Eve <eve@evil.test>)` keeps the addr-spec.
+- Duplicate allow-listed draft headers are submitted as separate fields and keep the field name from the draft.
 
 ## 0.1.0
 

@@ -1,6 +1,13 @@
 import iconv from 'iconv-lite';
 import { MailError } from '../errors.js';
-import { formatAddressList, parseAddressList, type MailAddress } from './address.js';
+import {
+  formatAddressList,
+  parseAddressList,
+  stripAddressComments,
+  type MailAddress,
+} from './address.js';
+
+export { stripAddressComments };
 
 /**
  * Header names Nodemailer keeps. The composer deletes this class, then lowercases,
@@ -75,19 +82,61 @@ const ROUTING_HEADER_NAMES = new Set([
   'rcpt-to',
 ]);
 
-/** Substrings that mark an X- name as a routing or receipt alias. Hyphens are ignored. */
-const X_DENY_KEYWORDS = [
-  'reply',
-  'receipt',
-  'notification',
-  'errors',
+/**
+ * Trailing tokens that make an X- name an address header. Compared after the
+ * name is split on "-", "_", and camelCase boundaries.
+ */
+const ADDRESS_BEARING_NAMES = new Set([
+  'to',
+  'from',
   'sender',
-  'envelope',
-  'rcpt',
-  'bounce',
-  'resent',
-  'followup',
-] as const;
+  'cc',
+  'bcc',
+  'reply-to',
+  'errors-to',
+  'return-path',
+  'delivered-to',
+  'apparently-to',
+  'apparently-from',
+  'original-from',
+  'original-to',
+  'receipt-to',
+  'read-receipt-to',
+  'return-receipt-to',
+  'notification-to',
+  'disposition-notification-to',
+  'confirm-reading-to',
+  'reading-to',
+  'mdn-to',
+  'mail-followup-to',
+  'followup-to',
+  'mail-reply-to',
+]);
+
+/** Any one of these tokens denies the X- name, wherever it sits. */
+const X_DENY_TOKENS = new Set(['resent', 'envelope', 'rcpt', 'bounce']);
+
+/**
+ * Compact suffixes for a single blob: no "-" or "_", and no camelCase boundary.
+ * "to" alone is not in this list.
+ */
+const COMPACT_ADDRESS_SUFFIXES = [
+  'apparentlyto',
+  'notificationto',
+  'followupto',
+  'deliveredto',
+  'originalto',
+  'readingto',
+  'returnpath',
+  'receiptto',
+  'errorsto',
+  'replyto',
+  'sender',
+  'mdnto',
+  'from',
+];
+
+const CAMEL_BOUNDARY = /(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])/;
 
 const STRUCTURED_FIELD: Record<string, string> = {
   from: 'from',
@@ -148,15 +197,19 @@ export function isHeaderToken(canonical: string): boolean {
   return HEADER_TOKEN.test(canonical);
 }
 
-function headerHint(canonical: string): string {
-  if (canonical.startsWith('x-') && routingHeaderDenied(canonical)) {
+function headerHint(name: string): string {
+  const canonical = canonicalHeaderName(name);
+  if (canonical.startsWith('x-') && routingHeaderDenied(name)) {
     return (
-      'An X- header is rejected when the name after X- is a routing or receipt header ' +
-      '(From, Sender, Reply-To, To, Cc, Bcc, Resent-*, Return-Path, Errors-To, ' +
-      'Disposition-Notification-To, Return-Receipt-To, Read-Receipt-To, Mail-Reply-To, ' +
-      'Mail-Followup-To, Apparently-*, Original-*, Envelope-*), or when it contains ' +
-      'reply, receipt, notification, errors, sender, envelope, rcpt, bounce, resent, or followup. ' +
-      'Other X-* headers are allowed.'
+      'An X- header is rejected when the tokens after X- (split on "-", "_", and camelCase) ' +
+      'end with an address-bearing header (to, from, sender, cc, bcc, reply-to, errors-to, ' +
+      'return-path, delivered-to, apparently-to, apparently-from, original-from, original-to, ' +
+      'receipt-to, read-receipt-to, return-receipt-to, notification-to, ' +
+      'disposition-notification-to, confirm-reading-to, reading-to, mdn-to, mail-followup-to, ' +
+      'followup-to, mail-reply-to), or when any token is resent, envelope, rcpt, or bounce. ' +
+      'A name with no separator and no camelCase is also rejected when it ends with from, sender, ' +
+      'replyto, errorsto, returnpath, deliveredto, receiptto, notificationto, readingto, mdnto, ' +
+      'apparentlyto, followupto, or originalto. Other X-* headers are allowed.'
     );
   }
   const field = STRUCTURED_FIELD[canonical];
@@ -171,29 +224,71 @@ export function isFieldName(name: string): boolean {
 }
 
 /**
- * True when `canonical` is a routing or receipt header, or an X- alias of one.
- * The remainder after a leading `x-` is compared to the rejected header names.
- * A remainder that contains reply, receipt, notification, errors, sender,
- * envelope, rcpt, bounce, resent, or followup is denied as well. Other X-* names
- * are not denied here.
+ * True when `name` is a routing or receipt header, or an X- alias of one.
+ * Tokens are taken from the original spelling so a camelCase boundary survives.
+ * A trailing token sequence that equals an address-bearing header name is denied.
+ * Any token equal to resent, envelope, rcpt, or bounce is denied. A name with no
+ * separator and no camelCase is denied when its compact form ends with an address
+ * suffix such as from or mdnto. X-Sender-IP and X-Notification are not denied.
  */
-export function routingHeaderDenied(canonical: string): boolean {
-  const name = canonical.toLowerCase();
-  if (routingNameDenied(name)) {
+export function routingHeaderDenied(name: string): boolean {
+  const canonical = canonicalHeaderName(name);
+  if (routingNameDenied(canonical)) {
     return true;
   }
-  if (!name.startsWith('x-')) {
+  if (!canonical.startsWith('x-')) {
     return false;
   }
-  let remainder = name.slice(2);
+  let remainder = canonical.slice(2);
   while (remainder.startsWith('x-')) {
     remainder = remainder.slice(2);
   }
   if (!remainder || routingNameDenied(remainder)) {
     return true;
   }
-  const flat = remainder.replace(/[-_]/g, '');
-  return X_DENY_KEYWORDS.some((word) => flat.includes(word));
+  return xHeaderTokensDenied(name);
+}
+
+function xHeaderTokensDenied(original: string): boolean {
+  const cleaned = original.replace(HEADER_NAME_JUNK, '');
+  let rest = cleaned;
+  while (/^x[-_]/i.test(rest)) {
+    rest = rest.slice(2);
+  }
+  if (!rest) {
+    return true;
+  }
+  const separated = /[-_]/.test(rest);
+  const tokens: string[] = [];
+  let camel = false;
+  for (const piece of rest.split(/[-_]+/)) {
+    if (!piece) {
+      continue;
+    }
+    const parts = piece.split(CAMEL_BOUNDARY).filter((part) => part.length > 0);
+    if (parts.length > 1) {
+      camel = true;
+    }
+    for (const part of parts) {
+      tokens.push(part.toLowerCase());
+    }
+  }
+  if (tokens.length === 0) {
+    return true;
+  }
+  if (tokens.some((token) => X_DENY_TOKENS.has(token))) {
+    return true;
+  }
+  for (let start = 0; start < tokens.length; start += 1) {
+    if (ADDRESS_BEARING_NAMES.has(tokens.slice(start).join('-'))) {
+      return true;
+    }
+  }
+  if (!separated && !camel) {
+    const compact = tokens.join('');
+    return COMPACT_ADDRESS_SUFFIXES.some((suffix) => compact.endsWith(suffix));
+  }
+  return false;
 }
 
 function routingNameDenied(name: string): boolean {
@@ -202,8 +297,9 @@ function routingNameDenied(name: string): boolean {
   );
 }
 
-function headerAllowed(canonical: string): boolean {
-  if (routingHeaderDenied(canonical)) {
+function headerAllowed(name: string): boolean {
+  const canonical = canonicalHeaderName(name);
+  if (routingHeaderDenied(name)) {
     return false;
   }
   return canonical.startsWith('x-') || HEADER_ALLOWLIST.has(canonical);
@@ -213,7 +309,7 @@ function rejectHeader(name: string, canonical: string): never {
   throw new MailError(
     'PERMISSION_DENIED',
     `The ${name.trim() || canonical} header cannot be set from headers.`,
-    headerHint(canonical),
+    headerHint(name),
   );
 }
 
@@ -232,7 +328,7 @@ export function guardOutboundHeaders(headers: Record<string, string>): Record<st
         'A header name is a token. Spaces, controls, and a colon are rejected rather than stripped.',
       );
     }
-    if (!headerAllowed(canonical)) {
+    if (!headerAllowed(name)) {
       rejectHeader(name, canonical);
     }
     out[canonical] = value;
@@ -248,7 +344,7 @@ export function allowlistedHeaderEntries(headers: Record<string, string>): Recor
     if (!canonical || headerNameChanged(name) || !isHeaderToken(canonical)) {
       continue;
     }
-    if (headerAllowed(canonical)) {
+    if (headerAllowed(name)) {
       out[canonical] = value;
     }
   }
@@ -270,10 +366,10 @@ export interface DraftAddressHeaders {
   /** Address headers other than From, Sender, Reply-To, To, Cc, Bcc, and Resent-Bcc, already sanitized. */
   kept: Record<string, string>;
   /**
-   * Allow-listed headers taken from the raw header block. Keys are the original
-   * field names and values are the raw field values, not mailparser keys.
+   * Allow-listed headers from the raw header block, one entry per field.
+   * The field name is the original spelling. Duplicate names are not joined.
    */
-  rawHeaders: Record<string, string>;
+  rawHeaders: Array<{ name: string; value: string }>;
 }
 
 const SINGLETON_HEADERS = ['from', 'sender', 'reply-to'] as const;
@@ -321,39 +417,6 @@ export function readRawHeaderFields(source: Buffer | string): RawHeaderField[] {
   return fields;
 }
 
-/** Remove RFC 5322 comments. Parentheses inside a quoted display name stay. */
-export function stripAddressComments(value: string): string {
-  let out = '';
-  let quote = false;
-  let depth = 0;
-  for (let index = 0; index < value.length; index += 1) {
-    const char = value[index] ?? '';
-    if (depth > 0) {
-      if (char === '\\') {
-        index += 1;
-        continue;
-      }
-      if (char === '(') {
-        depth += 1;
-      } else if (char === ')') {
-        depth -= 1;
-      }
-      continue;
-    }
-    if (char === '"') {
-      quote = !quote;
-      out += char;
-      continue;
-    }
-    if (char === '(' && !quote) {
-      depth = 1;
-      continue;
-    }
-    out += char;
-  }
-  return out.replace(/[ \t]{2,}/g, ' ').trim();
-}
-
 function parseStoredAddresses(name: string, value: string): MailAddress[] {
   let addresses: MailAddress[];
   try {
@@ -392,25 +455,25 @@ export function assertDraftHeaders(
   const cc: MailAddress[] = [];
   const bcc: MailAddress[] = [];
   const keptLists = new Map<string, MailAddress[]>();
-  const rawKept = new Map<string, { name: string; values: string[] }>();
+  const rawHeaders: Array<{ name: string; value: string }> = [];
   for (const field of fields) {
     const canonical = field.name.toLowerCase();
     counts.set(canonical, (counts.get(canonical) ?? 0) + 1);
     if (
-      (canonical.startsWith('x-') && routingHeaderDenied(canonical)) ||
+      (canonical.startsWith('x-') && routingHeaderDenied(field.name)) ||
       STORED_REJECTED_HEADERS.has(canonical)
     ) {
       throw new MailError(
         'PERMISSION_DENIED',
         `The ${field.name} header cannot be sent from a draft.`,
-        headerHint(canonical),
+        headerHint(field.name),
       );
     }
     if (canonical.startsWith('resent-') && !STORED_ADDRESS_HEADERS.has(canonical)) {
       throw new MailError(
         'PERMISSION_DENIED',
         `The ${field.name} header cannot be sent from a draft.`,
-        headerHint(canonical),
+        headerHint(field.name),
       );
     }
     if (canonical === 'to' || canonical === 'cc' || canonical === 'bcc') {
@@ -425,13 +488,8 @@ export function assertDraftHeaders(
       continue;
     }
     if (!STORED_ADDRESS_HEADERS.has(canonical)) {
-      if (headerAllowed(canonical)) {
-        const existing = rawKept.get(canonical);
-        if (existing) {
-          existing.values.push(field.value);
-        } else {
-          rawKept.set(canonical, { name: field.name, values: [field.value] });
-        }
+      if (headerAllowed(field.name)) {
+        rawHeaders.push({ name: field.name, value: field.value });
       }
       continue;
     }
@@ -463,10 +521,6 @@ export function assertDraftHeaders(
   const kept: Record<string, string> = {};
   for (const [name, list] of keptLists) {
     kept[name] = formatAddressList(list);
-  }
-  const rawHeaders: Record<string, string> = {};
-  for (const entry of rawKept.values()) {
-    rawHeaders[entry.name] = entry.values.join(', ');
   }
   return { from, sender, replyTo, to, cc, bcc, kept, rawHeaders };
 }

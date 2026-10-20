@@ -17,6 +17,7 @@ import type {
   MailboxTree,
   MessageSummary,
   OpenMailbox,
+  ThreadIdRow,
   QuotaInfo,
   ServerSortResult,
   StatusInfo,
@@ -331,6 +332,24 @@ class FakeBox implements OpenMailbox {
     this.exists = box.messages.length;
   }
 
+  async fetchIdIndex(): Promise<ThreadIdRow[]> {
+    return this.box.messages.flatMap((message) => {
+      if (this.session.ghostUids.has(message.uid)) {
+        return [];
+      }
+      const messageId = headerIds(message.raw, 'message-id')[0];
+      const inReplyTo = headerIds(message.raw, 'in-reply-to')[0];
+      return [
+        {
+          uid: message.uid,
+          references: headerIds(message.raw, 'references'),
+          messageId,
+          inReplyTo,
+        },
+      ];
+    });
+  }
+
   async search(compiled: CompiledSearch): Promise<number[]> {
     return this.box.messages
       .filter((message) => matches(message, compiled.query))
@@ -642,6 +661,10 @@ export class FakePool {
   async use<T>(_accountId: string, fn: (session: FakeSession) => Promise<T>): Promise<T> {
     await this.session.connect();
     return fn(this.session);
+  }
+
+  async tryUse(): Promise<undefined> {
+    return undefined;
   }
 
   async close(): Promise<void> {
