@@ -217,6 +217,18 @@ export class FakeSession implements ImapSession {
     fn: (box: OpenMailbox) => Promise<T>,
   ): Promise<T> {
     const stored = this.requireBox(path);
+    if (
+      stored.flags.some((flag) => {
+        const name = flag.toLowerCase();
+        return name === '\\noselect' || name === '\\nonexistent';
+      })
+    ) {
+      throw new MailError(
+        'MAILBOX_NOT_SELECTABLE',
+        `Mailbox "${path}" cannot be selected.`,
+        'The folder is marked \\Noselect or \\NonExistent. Open a mailbox that can hold messages.',
+      );
+    }
     return fn(new FakeBox(stored, this));
   }
 

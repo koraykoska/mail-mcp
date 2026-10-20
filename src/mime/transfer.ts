@@ -53,7 +53,7 @@ export function decodeQuotedPrintable(content: Buffer): Buffer {
   return Buffer.from(bytes);
 }
 
-/** Remove Bcc header fields, including folded continuation lines, from an RFC 5322 message. */
+/** Remove Bcc and Resent-Bcc, including folded continuation lines, from an RFC 5322 message. */
 export function stripBcc(raw: Buffer): Buffer {
   const text = raw.toString('latin1');
   const split = text.indexOf('\r\n\r\n');
@@ -74,7 +74,7 @@ export function stripBcc(raw: Buffer): Buffer {
       }
       continue;
     }
-    skipping = /^bcc\s*:/i.test(line);
+    skipping = /^(?:resent-)?bcc\s*:/i.test(line);
     if (!skipping) {
       kept.push(line);
     }

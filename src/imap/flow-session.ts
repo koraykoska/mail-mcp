@@ -8,8 +8,9 @@ import {
   type SearchObject,
 } from 'imapflow';
 import { searchCompiler } from 'imapflow/lib/search-compiler.js';
-import { MailError, mapTransportError } from '../errors.js';
+import { MailError, mapMailboxOpenError, mapTransportError } from '../errors.js';
 import { capabilityMatches, hasExactCapability as exactCapability } from './capabilities.js';
+import { headerValue, messageIds } from '../mime/headers.js';
 import { decodeTransfer, parseSequenceSet } from '../mime/transfer.js';
 import { VERSION } from '../version.js';
 import type { ResolvedAccount } from '../config/schema.js';
@@ -393,7 +394,7 @@ export class ImapFlowSession implements ImapSession {
       const box = new FlowMailbox(client, this, path, mailbox);
       return await fn(box);
     } catch (error) {
-      throw mapTransportError(error);
+      throw mapMailboxOpenError(path, error);
     } finally {
       lock?.release();
     }
@@ -806,6 +807,7 @@ class FlowMailbox implements OpenMailbox {
         envelope: true,
         internalDate: true,
         bodyStructure: true,
+        headers: ['REFERENCES', 'IN-REPLY-TO', 'MESSAGE-ID'],
         labels: this.session.hasCapability('X-GM-EXT-1'),
         threadId:
           this.session.hasCapability('OBJECTID') || this.session.hasCapability('X-GM-EXT-1'),
@@ -1377,6 +1379,7 @@ function toSummary(row: FetchMessageObject): MessageSummary {
   if (envelope?.inReplyTo) {
     summary.inReplyTo = envelope.inReplyTo;
   }
+  applyThreadingHeaders(summary, (row as { headers?: Buffer | string }).headers);
   if (row.labels) {
     summary.labels = [...row.labels];
   }
@@ -1392,6 +1395,29 @@ function toSummary(row: FetchMessageObject): MessageSummary {
   }
   summaryStructure.set(summary, structure);
   return summary;
+}
+
+/** References and In-Reply-To come from HEADER.FIELDS. ENVELOPE omits them on some servers. */
+function applyThreadingHeaders(
+  summary: MessageSummary,
+  headers: Buffer | string | undefined,
+): void {
+  if (!headers) {
+    return;
+  }
+  const text = Buffer.isBuffer(headers) ? headers.toString('utf8') : headers;
+  const messageId = headerValue(text, 'message-id');
+  const inReplyTo = messageIds(headerValue(text, 'in-reply-to'))[0];
+  const references = messageIds(headerValue(text, 'references'));
+  if (messageId) {
+    summary.messageId = messageId;
+  }
+  if (inReplyTo) {
+    summary.inReplyTo = inReplyTo;
+  }
+  if (references.length > 0) {
+    summary.references = references;
+  }
 }
 
 function mapAddresses(

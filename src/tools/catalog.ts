@@ -495,7 +495,7 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_list_messages',
     title: 'List message summaries',
     description:
-      'Page message summaries in a mailbox. Default mailbox is INBOX. Default sort is arrival descending (newest first) via the SORT extension, with a client-side fallback. A folder larger than limits.maxSortCandidates is truncated: snapshot.folders reports omitted and scanned, and paging continues inside that window. Each summary has uid, flags, size (octets), date, from, to, subject, hasAttachments, and a snippet of about snippetChars characters (default 160). Pass nextCursor back as cursor. Mail that arrives after the first page needs a new call without a cursor. For criteria use mail_search_messages; a search object is also accepted here. Optional uidValidity detects a recreated mailbox.',
+      'Page message summaries in a mailbox. Default mailbox is INBOX. Default sort is arrival descending (newest first) via the SORT extension, with a client-side fallback. A folder larger than limits.maxSortCandidates is truncated, including a single-folder server SORT: snapshot.folders reports omitted and scanned, and paging continues inside that window. Each summary has uid, flags, size (octets), date, from, to, subject, hasAttachments, and a snippet of about snippetChars characters (default 160). Pass nextCursor back as cursor. Mail that arrives after the first page needs a new call without a cursor. For criteria use mail_search_messages; a search object is also accepted here. Optional uidValidity detects a recreated mailbox. folders all, globs, and special-use skip mailboxes marked \\Noselect or \\NonExistent. Naming one of those paths returns MAILBOX_NOT_SELECTABLE.',
     input: z.object({
       account: fields.account,
       mailbox: fields.mailbox
@@ -878,7 +878,7 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_list_threads',
     title: 'List threads',
     description:
-      'Group messages into threads in one mailbox unless folders is set. source is server only when a single folder uses the server THREAD tree. Several folders are built on the client from References and In-Reply-To, and each node is mailbox plus UID. ORDEREDSUBJECT is the opt-in subject heuristic. Every item carries the same threadKey for that conversation: the earliest message with no parent in the set. A folder larger than maxSortCandidates is truncated and reports omitted and scanned. Later pages stay inside the first page UID bound.',
+      'Group messages into threads in one mailbox unless folders is set. source is server only when a single folder uses the server THREAD tree. Several folders are built on the client from the References, In-Reply-To, and Message-ID header fields, not from the ENVELOPE alone, and each node is mailbox plus UID. ORDEREDSUBJECT is the opt-in subject heuristic. Every item carries the same threadKey for that conversation: the earliest message with no parent in the set. A folder larger than maxSortCandidates is truncated and reports omitted and scanned. Later pages stay inside the first page UID bound.',
     input: z.object({
       account: fields.account,
       mailbox: fields.mailbox.optional(),
@@ -1369,7 +1369,7 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_send_message',
     title: 'Send a message',
     description:
-      'Submit a message over SMTP (RFC 5321 / RFC 6409). Supports text, HTML (multipart/alternative when both are set), attachments from base64 or a local path, inline cid images, extra headers, priority (high, normal, low), a read receipt (Disposition-Notification-To), and DSN options when the server advertises DSN. from must be a configured identity. recipientDomainAllowList and sendRateLimit are enforced. After a successful send, the message is appended to Sent unless the provider is Gmail (which stores Sent itself) or appendSent is false or the account sets appendSent false. envelopeFrom and envelopeTo override the SMTP envelope without changing headers. Blocked when allowSend is false or readOnly.',
+      'Submit a message over SMTP (RFC 5321 / RFC 6409). Supports text, HTML (multipart/alternative when both are set), attachments from base64 or a local path, inline cid images, extra headers, priority (high, normal, low), a read receipt (Disposition-Notification-To set from the From identity), and DSN options when the server advertises DSN. from and replyTo must be configured identities, or allowFromDomains must list the domain. When replyTo is omitted, the selected identity replyTo is used. headers is an allow-list: X-* plus List-Unsubscribe, List-Unsubscribe-Post, Auto-Submitted, Precedence, Importance, Keywords, and Comments. From, Sender, Reply-To, To, Cc, Bcc, Message-ID, Return-Path, Resent-*, and receipt or legacy reply headers are rejected; use the structured from, replyTo, to, cc, and bcc fields. Names that contain spaces, controls, or a colon are rejected. recipientDomainAllowList and sendRateLimit are enforced. After a successful send, the message is appended to Sent unless the provider is Gmail (which stores Sent itself) or appendSent is false or the account sets appendSent false. envelopeFrom and envelopeTo override the SMTP envelope without changing headers. Blocked when allowSend is false or readOnly.',
     input: z.object({
       account: fields.account,
       from: fields.address
@@ -1380,7 +1380,11 @@ export const TOOLS: ToolDefinition[] = [
       bcc: fields.addressList
         .optional()
         .describe('Envelope recipients. Not stored in the message header by the composer.'),
-      replyTo: fields.addressList.optional(),
+      replyTo: fields.addressList
+        .optional()
+        .describe(
+          'Reply-To. Omit to use the selected identity replyTo. Must be an identity or an allowFromDomains address. A display name that contains another address is not sent.',
+        ),
       subject: z.string().describe('Subject line.'),
       text: z.string().optional().describe('Plain text body. Provide text, html, or both.'),
       html: z.string().optional().describe('HTML body.'),
@@ -1388,7 +1392,9 @@ export const TOOLS: ToolDefinition[] = [
       headers: z
         .record(z.string(), z.string())
         .optional()
-        .describe('Additional headers, for example {"X-Entity":"42"}.'),
+        .describe(
+          'Allow-listed headers only: X-* plus List-Unsubscribe, List-Unsubscribe-Post, Auto-Submitted, Precedence, Importance, Keywords, and Comments. Address headers are rejected; use from, replyTo, to, cc, and bcc.',
+        ),
       priority: z
         .enum(['high', 'normal', 'low'])
         .optional()
@@ -1454,7 +1460,7 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_reply_message',
     title: 'Reply to a message',
     description:
-      'Reply to a message identified by account, mailbox, and UID. Sets In-Reply-To and References, prefixes the subject with Re: unless it already has a reply prefix (Re, Aw, Sv), and quotes the original plain text (or the HTML rendered to text). replyAll true puts the original From (or Reply-To) in To and the other recipients in Cc, omitting this account. The result is the same shape as mail_send_message. Requires allowSend.',
+      'Reply to a message identified by account, mailbox, and UID. Sets In-Reply-To and References, prefixes the subject with Re: unless it already has a reply prefix (Re, Aw, Sv), and quotes the original plain text (or the HTML rendered to text). replyAll true puts the original From (or Reply-To) in To and the other recipients in Cc, omitting this account. An omitted replyTo uses the selected identity replyTo. The result is the same shape as mail_send_message. Requires allowSend.',
     input: z.object({
       account: fields.account,
       mailbox: fields.mailbox,
@@ -1471,7 +1477,11 @@ export const TOOLS: ToolDefinition[] = [
         .describe(
           'From identity. When omitted, an identity is selected only if exactly one configured address is in the original To or Cc.',
         ),
-      replyTo: fields.addressList.optional().describe('Reply-To header. Omit to leave it unset.'),
+      replyTo: fields.addressList
+        .optional()
+        .describe(
+          'Reply-To. Omit to use the selected identity replyTo. The address must be an identity or an allowFromDomains address. A display name that contains another address is dropped.',
+        ),
       text: z.string().optional().describe('Your reply, placed above the quoted original.'),
       html: z
         .string()
@@ -1580,7 +1590,7 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_send_draft',
     title: 'Send a saved draft',
     description:
-      'Submit the raw RFC822 of a saved draft over SMTP, using its headers as the message and its To/Cc/Bcc as the envelope. mailbox defaults to wherever the draft lives; pass the Drafts path and the draft UID. Does not delete the draft; call mail_delete_draft afterwards if you want it gone. Same safety checks as mail_send_message.',
+      'Submit a saved draft over SMTP. The stored message is parsed on every send. From, Sender, Reply-To, every Resent-* address, and receipt or legacy reply headers must be configured identities, and recipientDomainAllowList and sendRateLimit apply. A stored Reply-To that is not an identity is PERMISSION_DENIED. When the draft has no Reply-To, the selected identity replyTo is applied. mailbox defaults to wherever the draft lives; pass the Drafts path and the draft UID. Does not delete the draft; call mail_delete_draft afterwards if you want it gone.',
     input: z.object({
       account: fields.account,
       mailbox: fields.mailbox.describe('Mailbox that holds the draft, usually Drafts.'),
@@ -1589,7 +1599,11 @@ export const TOOLS: ToolDefinition[] = [
       from: fields.address
         .optional()
         .describe('Replace the draft From. Must be an identity or an allowFromDomains address.'),
-      replyTo: fields.addressList.optional().describe('Replace Reply-To.'),
+      replyTo: fields.addressList
+        .optional()
+        .describe(
+          'Replace Reply-To. Omit to keep a stored Reply-To that is an identity, or to apply the identity replyTo when the draft has none.',
+        ),
       appendSent: z
         .boolean()
         .optional()
@@ -1676,7 +1690,7 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_get_thread',
     title: 'Get a conversation',
     description:
-      'Return one conversation, earlier and later messages, across folders. Pass mailbox and uid, or a messageId. A Message-ID that exists in several folders uses every matching folder plus Sent, Archive, and All. Junk and Trash are off unless you name them. Messages are linked by exact Message-ID, In-Reply-To, and References tokens. Gmail X-GM-THRID is used when X-GM-EXT-1 is present, otherwise OBJECTID THREADID. Each item says how it was linked: header, gmail-thrid, objectid, or subject. subject is opt-in via subjectHeuristic. Copies that share a Message-ID collapse; messages with no Message-ID stay separate. alsoIn lists the other folders. The envelope threadKey and every item threadKey are the earliest message with no parent in the set, and the first page freezes that UID set. includeBodies caps the page at 20. Identities are listed by mail_list_accounts.',
+      'Return one conversation, earlier and later messages, across folders. Pass mailbox and uid, or a messageId. A Message-ID that exists in several folders uses every matching selectable folder plus Sent, Archive, and All. A mailbox and uid seed also searches the referenced Message-IDs in that default scope plus INBOX, so a Sent reply includes its INBOX parent and the same threadKey. folders is applied before the Message-ID lookup. \\Noselect and \\NonExistent paths are skipped; naming one returns MAILBOX_NOT_SELECTABLE. Junk and Trash are off unless you name them. Messages are linked by exact Message-ID, In-Reply-To, and References tokens. Gmail X-GM-THRID is used when X-GM-EXT-1 is present, otherwise OBJECTID THREADID. Each item says how it was linked: header, gmail-thrid, objectid, or subject. subject is opt-in via subjectHeuristic. Copies that share a Message-ID collapse; messages with no Message-ID stay separate. alsoIn lists the other folders. The envelope threadKey and every item threadKey are the earliest message with no parent in the set. The first page freezes mailbox and UID keys. Later pages re-fetch those keys, including a child whose linking parent was expunged, and a UIDVALIDITY change returns CURSOR_INVALIDATED. includeBodies caps the page at 20. Identities are listed by mail_list_accounts.',
     input: z.object({
       account: fields.account,
       mailbox: fields.mailbox.optional().describe('Required with uid.'),

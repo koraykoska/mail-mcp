@@ -73,7 +73,7 @@ async function walk(
 ): Promise<string[]> {
   const keys: string[] = [];
   let cursor: string | undefined;
-  for (let page = 0; page < 300; page += 1) {
+  for (let page = 0; page < 800; page += 1) {
     const result = await run(cursor);
     for (const field of ENVELOPE) {
       expect(result, field).toHaveProperty(field);
@@ -438,6 +438,45 @@ async function exercise(label: string, service: MailService, email: string): Pro
   called.add('mail_list_subscribed');
   expect(subs).toContain(one);
   expect(subs).not.toContain(extraSub);
+
+  let lateAll = 0;
+  const allKeys = await walk(
+    (cursor) =>
+      listTool.run(
+        {
+          folders: { all: true },
+          limit: 1,
+          includeSnippet: false,
+          ...(cursor ? { cursor } : {}),
+        },
+        service,
+      ),
+    (item) => `${item.mailbox}:${item.uid}`,
+    async (page) => {
+      if (page !== 0) {
+        return;
+      }
+      lateAll = await uid(box, 'zz-all', `<${stamp}-all-late@ex>`);
+    },
+  );
+  expect(allKeys).not.toContain(`${box}:${lateAll}`);
+  expect(allKeys.some((key) => key.startsWith(`${box}:`))).toBe(true);
+
+  const byMessageId = await walk(
+    (cursor) =>
+      threadGet.run(
+        {
+          messageId: `<${stamp}-root@ex>`,
+          limit: 1,
+          order: 'oldest-first',
+          ...(cursor ? { cursor } : {}),
+        },
+        service,
+      ),
+    (item) => `${item.mailbox}:${item.uid}`,
+  );
+  expect(byMessageId).toContain(`${threadBox}:${root}`);
+  expect(byMessageId).toContain(`${threadBox}:${late}`);
 
   const paged = TOOLS.filter((tool) => tool.paged).map((tool) => tool.name);
   expect([...called].sort()).toEqual([...paged].sort());

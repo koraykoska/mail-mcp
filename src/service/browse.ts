@@ -190,7 +190,7 @@ export async function scanFolders(
         scannedIds = window;
         truncated = omitted > 0;
       }
-      if (serverUids && serverUids.length > options.maxPerFolder && paths.length > 1) {
+      if (serverUids && serverUids.length > options.maxPerFolder) {
         omitted = serverUids.length - options.maxPerFolder;
         scannedIds = serverUids.slice(0, options.maxPerFolder);
         truncated = true;

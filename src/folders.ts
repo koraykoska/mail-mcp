@@ -4,6 +4,7 @@ import type { ResolvedSpecialUse } from './imap/special-use.js';
 export interface ListedFolder {
   path: string;
   specialUse?: string;
+  flags?: readonly string[];
 }
 
 export interface FolderRequest {
@@ -108,6 +109,13 @@ function stringList(value: unknown, label: string): string[] {
   return value;
 }
 
+/** LIST flags that mean SELECT would fail. Matching is case-insensitive. */
+const UNSELECTABLE_FLAGS = new Set(['\\noselect', '\\nonexistent']);
+
+export function mailboxSelectable(folder: { flags?: readonly string[] }): boolean {
+  return !(folder.flags ?? []).some((flag) => UNSELECTABLE_FLAGS.has(flag.toLowerCase()));
+}
+
 export function defaultThreadFolders(seedMailbox: string, special: ResolvedSpecialUse): string[] {
   const paths = [seedMailbox];
   if (special.sent) {
@@ -145,7 +153,9 @@ export function resolveFolderPaths(
   const missing: string[] = [];
   if (request.all) {
     for (const mailbox of listed) {
-      selected.add(mailbox.path);
+      if (mailboxSelectable(mailbox)) {
+        selected.add(mailbox.path);
+      }
     }
   }
   for (const token of request.specialUse) {
@@ -154,24 +164,37 @@ export function resolveFolderPaths(
       missing.push(token);
     }
     for (const path of paths) {
+      const folder = byPath.get(path);
+      if (folder && !mailboxSelectable(folder)) {
+        continue;
+      }
       selected.add(path);
     }
   }
   for (const pattern of request.globs) {
     let hit = false;
     for (const mailbox of listed) {
-      if (globMatch(pattern, mailbox.path)) {
-        selected.add(mailbox.path);
-        hit = true;
+      if (!mailboxSelectable(mailbox) || !globMatch(pattern, mailbox.path)) {
+        continue;
       }
+      selected.add(mailbox.path);
+      hit = true;
     }
     if (!hit) {
       missing.push(pattern);
     }
   }
   for (const mailbox of request.mailboxes) {
+    const folder = byPath.get(mailbox);
+    if (folder && !mailboxSelectable(folder)) {
+      throw new MailError(
+        'MAILBOX_NOT_SELECTABLE',
+        `Mailbox "${mailbox}" cannot be selected.`,
+        'The folder is marked \\Noselect or \\NonExistent. Open a mailbox that can hold messages.',
+      );
+    }
     selected.add(mailbox);
-    if (!byPath.has(mailbox)) {
+    if (!folder) {
       missing.push(mailbox);
     }
   }

@@ -207,9 +207,10 @@ describe('expunged SORT anchor', () => {
     }
     box.uidNext = 7;
     const service = serviceFor(session, {
-      limits: { ...appConfig().limits, maxSortCandidates: 2 },
+      limits: { ...appConfig().limits, maxSortCandidates: 4 },
     });
     const first = await service.listMessages({ mailbox: 'INBOX', limit: 2, includeSnippet: false });
+    expect(first.truncated).toBe(true);
     expect((first.messages as Array<{ uid: number }>).map((item) => item.uid)).toEqual([6, 5]);
     box.messages = box.messages.filter((item) => item.uid !== 5);
     const seen = new Set<number>([6]);
@@ -227,7 +228,7 @@ describe('expunged SORT anchor', () => {
       }
       cursor = listed.nextCursor ? String(listed.nextCursor) : undefined;
     }
-    expect([...seen].sort((left, right) => left - right)).toEqual([1, 2, 3, 4, 6]);
+    expect([...seen].sort((left, right) => left - right)).toEqual([3, 4, 6]);
   });
 });
 

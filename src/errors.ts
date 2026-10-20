@@ -6,6 +6,7 @@ export const MAIL_ERROR_CODES = [
   'AUTH_FAILED',
   'TLS_FAILED',
   'NOT_FOUND',
+  'MAILBOX_NOT_SELECTABLE',
   'UIDVALIDITY_CHANGED',
   'CURSOR_INVALIDATED',
   'CAPABILITY_UNSUPPORTED',
@@ -48,6 +49,9 @@ interface ErrorLike {
   name?: unknown;
   authenticationFailed?: unknown;
   response?: unknown;
+  responseText?: unknown;
+  responseStatus?: unknown;
+  mailboxMissing?: unknown;
 }
 
 function asErrorLike(error: unknown): ErrorLike {
@@ -190,6 +194,41 @@ export function mapTransportError(error: unknown): MailError {
  * True when a connection attempt failed before a command could have been applied.
  * Timeouts are not retried: the command may already have reached the server.
  */
+/**
+ * Map a failed SELECT or EXAMINE.
+ * A mailbox that LIST returned but the server will not open is MAILBOX_NOT_SELECTABLE.
+ * A name LIST does not know is NOT_FOUND. It is never reported as a missing message.
+ */
+export function mapMailboxOpenError(path: string, error: unknown): MailError {
+  if (error instanceof MailError) {
+    return error;
+  }
+  const like = asErrorLike(error);
+  const responseText = typeof like.responseText === 'string' ? like.responseText : '';
+  const responseStatus = typeof like.responseStatus === 'string' ? like.responseStatus : '';
+  const combined = `${textOf(like)} ${responseText}`.toLowerCase();
+  if (like.mailboxMissing === true) {
+    return new MailError(
+      'NOT_FOUND',
+      `Mailbox "${path}" was not found.`,
+      'List mailboxes and retry with a path that exists.',
+    );
+  }
+  if (
+    responseStatus === 'NO' ||
+    /noselect|nonexistent|not selectable|no select|isn't selectable|is not selectable/.test(
+      combined,
+    )
+  ) {
+    return new MailError(
+      'MAILBOX_NOT_SELECTABLE',
+      `Mailbox "${path}" cannot be selected.`,
+      'The folder is marked \\Noselect or \\NonExistent. Open a mailbox that can hold messages.',
+    );
+  }
+  return mapTransportError(error);
+}
+
 export function isRetryableConnectionError(error: unknown): boolean {
   const mapped = error instanceof MailError ? error : mapTransportError(error);
   return mapped.code === 'CONNECTION_FAILED';

@@ -380,9 +380,8 @@ export class ScriptedImap {
           socket.write(')\r\n');
           continue;
         }
-        if (headerWanted) {
-          const split = message.raw.indexOf('\r\n\r\n');
-          const headers = Buffer.from(split >= 0 ? message.raw.slice(0, split + 4) : message.raw);
+        if (headerWanted && !wanted.includes('ENVELOPE')) {
+          const headers = headerSection(message.raw, args);
           ctx.write(`* ${sequence} FETCH (${common} BODY[HEADER] {${headers.length}}\r\n`);
           socket.write(headers);
           socket.write(')\r\n');
@@ -390,6 +389,15 @@ export class ScriptedImap {
         }
         if (wanted.includes('PREVIEW')) {
           ctx.write(`* ${sequence} FETCH (UID ${message.uid} PREVIEW "preview text")\r\n`);
+          continue;
+        }
+        if (headerWanted) {
+          const headers = headerSection(message.raw, args);
+          ctx.write(
+            `* ${sequence} FETCH (${common} ${envelopeOf(message.raw)} BODYSTRUCTURE ("TEXT" "PLAIN" ("CHARSET" "UTF-8") NIL NIL "8BIT" ${source.length} 1) BODY[HEADER.FIELDS (REFERENCES IN-REPLY-TO MESSAGE-ID)] {${headers.length}}\r\n`,
+          );
+          socket.write(headers);
+          socket.write(')\r\n');
           continue;
         }
         ctx.write(
@@ -555,6 +563,35 @@ export class ScriptedImap {
     }
     bad(`Unsupported ${command}`);
   }
+}
+
+function headerSection(raw: string, args: string): Buffer {
+  const split = raw.indexOf('\r\n\r\n');
+  const block = split >= 0 ? raw.slice(0, split) : raw;
+  const requested = /HEADER\.FIELDS\s*\(([^)]*)\)/i.exec(args)?.[1];
+  const names = requested
+    ? requested
+        .split(/\s+/)
+        .map((name) => name.toLowerCase())
+        .filter(Boolean)
+    : [];
+  const lines = block.split(/\r?\n/);
+  const kept: string[] = [];
+  let keeping = false;
+  for (const line of lines) {
+    if (/^[ \t]/.test(line)) {
+      if (keeping) {
+        kept.push(line);
+      }
+      continue;
+    }
+    const name = /^([^:]+):/.exec(line)?.[1]?.toLowerCase() ?? '';
+    keeping = names.length === 0 || names.includes(name);
+    if (keeping) {
+      kept.push(line);
+    }
+  }
+  return Buffer.from(`${kept.join('\r\n')}\r\n\r\n`);
 }
 
 function envelopeOf(raw: string): string {

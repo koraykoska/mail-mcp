@@ -35,6 +35,7 @@ import {
   parseFolderRequest,
   resolveFolderPaths,
   defaultThreadFolders,
+  mailboxSelectable,
   uniquePaths,
   type ListedFolder,
 } from '../folders.js';
@@ -89,6 +90,13 @@ import { capText, parseRawMessage, type ParsedMessage } from '../mime/parse.js';
 import { htmlToSafeText, quoteHtml, sanitizeHtml, textToHtml } from '../mime/html.js';
 import { hasHighOctets, stripBcc } from '../mime/transfer.js';
 import { headerValue, messageIds } from '../mime/headers.js';
+import {
+  allowlistedHeaderEntries,
+  assertStoredSenderHeaders,
+  guardOutboundHeaders,
+  replyAddresses,
+  sameReplyList,
+} from '../mime/outbound-headers.js';
 import { buildReferences, forwardSubject, replySubject } from '../mime/subject.js';
 import {
   flattenThread,
@@ -1320,6 +1328,9 @@ export class MailService {
       throw new MailError('NOT_FOUND', `Draft UID ${input.uid} was not found.`);
     }
     const parsed = await parseRawMessage(source);
+    assertStoredSenderHeaders(parsed.headers, (address, label) =>
+      assertAllowedSender(account, address, label),
+    );
     const recipients = [...asMail(parsed.to), ...asMail(parsed.cc), ...asMail(parsed.bcc)];
     assertRecipients(account, recipients);
     const draftedFrom = asMail(parsed.from)[0]?.address ?? account.email;
@@ -1330,20 +1341,34 @@ export class MailService {
       requested: input.from ?? draftedFrom,
     });
     const from = identity.address.address;
-    if (account.sendRateLimit) {
-      this.limiter.consume(account.id, account.sendRateLimit.max, account.sendRateLimit.windowMs);
+    const storedReply = asMail(parsed.replyTo);
+    const callerReply = input.replyTo ? normalizeRecipients(input.replyTo) : [];
+    const chosenReply = replyAddresses(
+      callerReply.length > 0
+        ? callerReply
+        : storedReply.length > 0
+          ? storedReply
+          : configuredReplyTo(account, identity.email),
+    );
+    for (const item of chosenReply) {
+      assertAllowedSender(account, item.address, 'Reply-To');
     }
     if (!account.smtp) {
       throw new MailError('CONFIG_ERROR', `Account "${account.id}" has no SMTP server configured.`);
     }
+    if (account.sendRateLimit) {
+      this.limiter.consume(account.id, account.sendRateLimit.max, account.sendRateLimit.windowMs);
+    }
+    const rebuild =
+      Boolean(input.from) || Boolean(input.replyTo) || !sameReplyList(storedReply, chosenReply);
     let wire = stripBcc(source);
-    if (input.from || input.replyTo) {
+    if (rebuild) {
       const built = await this.outboundFromParts(account, {
         from: identity.address,
         to: asMail(parsed.to),
         cc: asMail(parsed.cc),
         bcc: asMail(parsed.bcc),
-        ...(input.replyTo ? { replyTo: input.replyTo } : {}),
+        ...(chosenReply.length > 0 ? { replyTo: chosenReply } : {}),
         subject: parsed.subject,
         ...(parsed.text !== undefined ? { text: parsed.text } : {}),
         ...(parsed.html !== undefined ? { html: parsed.html } : {}),
@@ -1360,6 +1385,16 @@ export class MailService {
       built.message.from = identity.address;
       if (parsed.messageId) {
         built.message.messageId = parsed.messageId;
+      }
+      if (parsed.inReplyTo) {
+        built.message.inReplyTo = parsed.inReplyTo;
+      }
+      if (parsed.references.length > 0) {
+        built.message.references = parsed.references.join(' ');
+      }
+      const kept = allowlistedHeaderEntries(parsed.headers);
+      if (Object.keys(kept).length > 0) {
+        built.message.headers = { ...(built.message.headers ?? {}), ...kept };
       }
       wire = stripBcc(await buildRawMessage(built.message));
     }
@@ -1450,8 +1485,11 @@ export class MailService {
       input.includeBodies === true,
     );
     return this.withImap(account, async (session) => {
+      const live = cursor
+        ? await this.liveUidValidity(session, cursor.folders)
+        : new Map<string, string>();
       const special = await this.special(account, session);
-      const seeded = await this.seedMessage(session, input);
+      const seeded = await this.seedMessage(session, account, input);
       const seed = seeded.seed;
       const paths =
         input.folders !== undefined
@@ -1462,31 +1500,37 @@ export class MailService {
           : uniquePaths([
               ...seeded.matchedMailboxes,
               ...defaultThreadFolders(seed.mailbox, special),
+              ...(input.uid !== undefined ? [special.inbox ?? 'INBOX'] : []),
             ]);
       let messages: ConversationMessage[];
       let rounds = 0;
       let truncated: boolean;
-      const fast = await this.fastThread(session, paths, seed, maxMessages);
-      if (fast) {
-        messages = fast.messages;
-        truncated = fast.truncated;
+      if (cursor?.keys) {
+        messages = await this.fetchFrozenKeys(session, cursor.keys);
+        truncated = false;
       } else {
-        const closed = await closeByHeaders({
-          seed,
-          folders: paths,
-          maxMessages,
-          maxRounds,
-          search: (folder, ids) => this.searchHeaderIds(session, folder, ids),
-        });
-        messages = closed.messages;
-        rounds = closed.rounds;
-        truncated = closed.truncated;
-      }
-      if (input.subjectHeuristic) {
-        const candidates = await this.subjectCandidates(session, paths, seed);
-        const applied = applySubjectHeuristic(messages, candidates, maxMessages);
-        messages = applied.messages;
-        truncated = truncated || applied.truncated;
+        const fast = await this.fastThread(session, paths, seed, maxMessages);
+        if (fast) {
+          messages = fast.messages;
+          truncated = fast.truncated;
+        } else {
+          const closed = await closeByHeaders({
+            seed,
+            folders: paths,
+            maxMessages,
+            maxRounds,
+            search: (folder, ids) => this.searchHeaderIds(session, folder, ids),
+          });
+          messages = closed.messages;
+          rounds = closed.rounds;
+          truncated = closed.truncated;
+        }
+        if (input.subjectHeuristic) {
+          const candidates = await this.subjectCandidates(session, paths, seed);
+          const applied = applySubjectHeuristic(messages, candidates, maxMessages);
+          messages = applied.messages;
+          truncated = truncated || applied.truncated;
+        }
       }
       const prefer = [
         input.mailbox ?? seed.mailbox,
@@ -1495,10 +1539,6 @@ export class MailService {
         special.archive ?? '',
       ];
       messages = dedupeMessages(messages, prefer);
-      if (cursor?.keys) {
-        const allow = new Set(cursor.keys);
-        messages = messages.filter((item) => allow.has(`${item.mailbox}\0${item.uid}`));
-      }
       if (cursor) {
         messages = messages.filter((item) => {
           const folder = cursor.folders.find((entry) => entry.mailbox === item.mailbox);
@@ -1539,23 +1579,56 @@ export class MailService {
           threadId: item.threadId,
         },
       }));
-      const folders = paths.map((mailbox) => {
+      for (const mailbox of paths) {
+        if (live.has(mailbox)) {
+          continue;
+        }
+        const known = ordered.find((item) => item.mailbox === mailbox)?.uidValidity;
+        if (known) {
+          live.set(mailbox, known);
+          continue;
+        }
+        if (mailbox === seed.mailbox && seed.uidValidity) {
+          live.set(mailbox, seed.uidValidity);
+          continue;
+        }
+        try {
+          const status = await session.status(mailbox);
+          if (status.uidValidity) {
+            live.set(mailbox, status.uidValidity);
+          }
+        } catch (error) {
+          if (
+            error instanceof MailError &&
+            (error.code === 'NOT_FOUND' ||
+              error.code === 'MAILBOX_NOT_SELECTABLE' ||
+              error.code === 'PROTOCOL_ERROR')
+          ) {
+            continue;
+          }
+          throw error;
+        }
+      }
+      const folders = paths.flatMap((mailbox) => {
+        const uidValidity = live.get(mailbox);
+        if (!uidValidity) {
+          return [];
+        }
         const stored = cursor?.folders.find((entry) => entry.mailbox === mailbox);
         const inFolder = ordered.filter((item) => item.mailbox === mailbox);
         const upperUid =
           stored?.upperUid ?? inFolder.reduce((highest, item) => Math.max(highest, item.uid), 0);
-        return {
-          mailbox,
-          uidValidity:
-            stored?.uidValidity ??
-            inFolder[0]?.uidValidity ??
-            (mailbox === seed.mailbox ? seed.uidValidity : ''),
-          upperUid,
-          matched: inFolder.length,
-          scanned: inFolder.length,
-          omitted: 0,
-          truncated: false,
-        };
+        return [
+          {
+            mailbox,
+            uidValidity,
+            upperUid,
+            matched: inFolder.length,
+            scanned: inFolder.length,
+            omitted: 0,
+            truncated: false,
+          },
+        ];
       });
       const scope = scopeFor(
         paths,
@@ -2105,6 +2178,15 @@ export class MailService {
       const folders = folderPayload(scans);
       const mailbox = paths[0] ?? 'INBOX';
       const single = scans.length === 1 ? scans[0] : undefined;
+      // A capped server SORT freezes its UID window on the first page. Later
+      // pages must not re-slice a fresh SORT: expunging a UID inside the
+      // window would otherwise pull in the next message past the cap.
+      if (cursor?.keys && single) {
+        const frozen = frozenSortUids(cursor.keys, single.mailbox);
+        if (frozen.length > 0) {
+          single.serverUids = frozen;
+        }
+      }
       const serverUids = single?.serverUids;
       const anchorMissing = Boolean(
         cursor?.anchor && serverUids && !serverUids.includes(cursor.anchor.uid),
@@ -2150,6 +2232,7 @@ export class MailService {
                   reverse: Boolean(keys[0]?.reverse),
                   value: anchorSource ? scalar(anchorSource, keys[0]?.field ?? 'arrival') : '',
                 },
+                keys: serverUids.map((uid) => `${single.mailbox}\0${uid}`),
               })
             : null;
         if (cursor) {
@@ -2170,15 +2253,13 @@ export class MailService {
         });
       }
       if (single?.serverUids && anchorMissing) {
-        // The anchor UID is gone. Keep the rest of the sorted list and resume
-        // at the next surviving row. Do not clip it to maxPerFolder.
+        // The anchor UID is gone. Resume inside the frozen window. Do not widen
+        // it back to the whole mailbox, and do not clear an earlier truncation.
         const ids = single.serverUids;
         single.summaries = await session.withMailbox(single.mailbox, 'read', (box) =>
           fetchSummariesBatched(box, ids, { snippet: false, snippetChars: 0 }),
         );
         single.scanned = single.summaries.length;
-        single.truncated = false;
-        single.omitted = 0;
       }
       const page = pageSummaryRows(rowsFromScans(scans), {
         limit,
@@ -2325,9 +2406,86 @@ export class MailService {
     );
   }
 
+  private async liveUidValidity(
+    session: ImapSession,
+    folders: ReadonlyArray<{ mailbox: string; uidValidity: string }>,
+  ): Promise<Map<string, string>> {
+    const live = new Map<string, string>();
+    for (const folder of folders) {
+      let status: { uidValidity?: string };
+      try {
+        status = await session.status(folder.mailbox);
+      } catch (error) {
+        if (
+          error instanceof MailError &&
+          (error.code === 'NOT_FOUND' ||
+            error.code === 'MAILBOX_NOT_SELECTABLE' ||
+            error.code === 'PROTOCOL_ERROR')
+        ) {
+          throw new MailError(
+            'CURSOR_INVALIDATED',
+            `Mailbox ${folder.mailbox} changed since this cursor was issued.`,
+            'The mailbox was recreated. Start again without a cursor.',
+          );
+        }
+        throw error;
+      }
+      if (!status.uidValidity || status.uidValidity !== folder.uidValidity) {
+        throw new MailError(
+          'CURSOR_INVALIDATED',
+          `UIDVALIDITY for ${folder.mailbox} is ${status.uidValidity ?? 'unknown'}, but this cursor was issued for ${folder.uidValidity}.`,
+          'The mailbox was recreated. Start again without a cursor.',
+        );
+      }
+      live.set(folder.mailbox, status.uidValidity);
+    }
+    return live;
+  }
+
+  private async fetchFrozenKeys(
+    session: ImapSession,
+    keys: readonly string[],
+  ): Promise<ConversationMessage[]> {
+    const grouped = new Map<string, number[]>();
+    for (const key of keys) {
+      const splitAt = key.lastIndexOf('\0');
+      if (splitAt <= 0) {
+        continue;
+      }
+      const mailbox = key.slice(0, splitAt);
+      const uid = Number(key.slice(splitAt + 1));
+      if (!Number.isInteger(uid)) {
+        continue;
+      }
+      const list = grouped.get(mailbox) ?? [];
+      list.push(uid);
+      grouped.set(mailbox, list);
+    }
+    const messages: ConversationMessage[] = [];
+    for (const [mailbox, uids] of grouped) {
+      const found = await session.withMailbox(mailbox, 'read', async (box) => {
+        const summaries = await box.fetchSummaries(uids, { snippet: true, snippetChars: 160 });
+        const rows: ConversationMessage[] = [];
+        for (const summary of summaries) {
+          rows.push(await this.conversationFrom(box, summary, mailbox, 'header'));
+        }
+        return rows;
+      });
+      messages.push(...found);
+    }
+    return messages;
+  }
+
   private async seedMessage(
     session: ImapSession,
-    input: { mailbox?: string; uid?: number; uidValidity?: string; messageId?: string },
+    account: ResolvedAccount,
+    input: {
+      mailbox?: string;
+      uid?: number;
+      uidValidity?: string;
+      messageId?: string;
+      folders?: unknown;
+    },
   ): Promise<{ seed: ConversationMessage; matchedMailboxes: string[] }> {
     if (input.uid !== undefined && input.mailbox) {
       const seed = await session.withMailbox(input.mailbox, 'read', async (box) => {
@@ -2342,9 +2500,13 @@ export class MailService {
       throw new MailError('INVALID_ARGUMENT', 'messageId is empty.');
     }
     const listed = await session.listMailboxes();
+    const candidates =
+      input.folders !== undefined
+        ? await this.folderPaths(account, session, input)
+        : listed.filter((item) => mailboxSelectable(item)).map((item) => item.path);
     const hits: ConversationMessage[] = [];
     const matchedMailboxes: string[] = [];
-    for (const mailbox of listed.map((item) => item.path)) {
+    for (const mailbox of candidates) {
       const found = await this.searchHeaderIds(session, mailbox, [id]);
       if (found.length > 0) {
         matchedMailboxes.push(mailbox);
@@ -2693,7 +2855,9 @@ export class MailService {
     const cc = normalizeRecipients(input.cc);
     const bcc = normalizeRecipients(input.bcc);
     const replyTo = normalizeRecipients(input.replyTo);
-    const chosenReply = replyTo.length > 0 ? replyTo : configuredReplyTo(account, identity.email);
+    const chosenReply = replyAddresses(
+      replyTo.length > 0 ? replyTo : configuredReplyTo(account, identity.email),
+    );
     for (const item of chosenReply) {
       assertAllowedSender(account, item.address, 'Reply-To');
     }
@@ -2716,7 +2880,7 @@ export class MailService {
       message.attachments = await this.confineAttachments(account, input.attachments);
     }
     if (input.headers) {
-      message.headers = guardOutboundHeaders(account, input.headers);
+      message.headers = guardOutboundHeaders(input.headers);
     }
     if (input.inReplyTo) {
       message.inReplyTo = input.inReplyTo;
@@ -3137,9 +3301,11 @@ function topCounts(
 }
 
 function listedFolder(mailbox: MailboxInfo): ListedFolder {
-  return mailbox.specialUse
-    ? { path: mailbox.path, specialUse: mailbox.specialUse }
-    : { path: mailbox.path };
+  const folder: ListedFolder = { path: mailbox.path, flags: mailbox.flags };
+  if (mailbox.specialUse) {
+    folder.specialUse = mailbox.specialUse;
+  }
+  return folder;
 }
 
 function groupRows(rows: readonly SummaryRow[]): Map<string, SummaryRow[]> {
@@ -3239,6 +3405,21 @@ function pruneThreads(nodes: ThreadNode[], allow: Set<string>): ThreadNode[] {
   return pruned;
 }
 
+function frozenSortUids(keys: readonly string[], mailbox: string): number[] {
+  const prefix = `${mailbox}\0`;
+  const uids: number[] = [];
+  for (const key of keys) {
+    if (!key.startsWith(prefix)) {
+      continue;
+    }
+    const uid = Number(key.slice(prefix.length));
+    if (Number.isInteger(uid) && uid > 0) {
+      uids.push(uid);
+    }
+  }
+  return uids;
+}
+
 function withCursorKeys(cursor: string | null, keys: readonly string[]): string | null {
   if (!cursor) {
     return null;
@@ -3279,45 +3460,6 @@ function assertAllowedSender(account: ResolvedAccount, address: string, label: s
     }
     throw error;
   }
-}
-
-const CONTROLLED_HEADERS = new Set([
-  'from',
-  'sender',
-  'reply-to',
-  'to',
-  'cc',
-  'bcc',
-  'message-id',
-  'return-path',
-]);
-
-function guardOutboundHeaders(
-  account: ResolvedAccount,
-  headers: Record<string, string>,
-): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const [name, value] of Object.entries(headers)) {
-    const key = name.toLowerCase();
-    if (key === 'message-id' || key === 'return-path') {
-      throw new MailError(
-        'PERMISSION_DENIED',
-        `The ${name} header cannot be set from headers.`,
-        'Message-ID is chosen by the composer. Return-Path is set by the mail system.',
-      );
-    }
-    if (CONTROLLED_HEADERS.has(key)) {
-      const addresses = parseAddressList(value);
-      if (addresses.length === 0) {
-        throw new MailError('PERMISSION_DENIED', `The ${name} header is not a list of addresses.`);
-      }
-      for (const item of addresses) {
-        assertAllowedSender(account, item.address, name);
-      }
-    }
-    out[name] = value;
-  }
-  return out;
 }
 
 function locatePart(

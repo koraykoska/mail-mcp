@@ -15,6 +15,11 @@
 - `mail_list_correspondents` and the sender and attachment counts of `mail_search_facets` read every match, in batches, up to 10000 messages per folder. Above that cap `truncated` and `partial` are true.
 - `mail_modify_by_search` is a write. A non-dry-run that did not load every match fails with `SIZE_LIMIT` and changes nothing.
 - `replyTo`, and `From`, `Sender`, `Reply-To`, `To`, `Cc`, and `Bcc` inside `headers`, are checked like `from`. `Message-ID` and `Return-Path` in `headers` are rejected. An identity's `replyTo` is listed and used when the caller does not pass one. A draft send appends the bytes that were sent, without Bcc.
+- `folders: all`, globs, and special-use skip `\Noselect` and `\NonExistent` mailboxes. A Message-ID lookup uses that scope first. Selecting one of those paths returns `MAILBOX_NOT_SELECTABLE`.
+- `mail_list_threads` reads References, In-Reply-To, and Message-ID from the header, so a server whose ENVELOPE omits In-Reply-To still matches `mail_get_thread`.
+- Custom `headers` are an allow-list after the composer's header-name canonicalization. `mail_send_draft` checks the stored From, Sender, Reply-To, Resent-* addresses, and receipt headers on every send. Reply-To is emitted from the parsed address list. `Resent-Bcc` is stripped with `Bcc`.
+- A later `mail_get_thread` page re-fetches the frozen mailbox and UID keys and returns `CURSOR_INVALIDATED` when UIDVALIDITY changes. A mailbox and uid seed also searches INBOX.
+- A single-folder server SORT honors `maxSortCandidates` / `maxPerFolder` and reports `truncated`.
 
 ## 0.1.0
 

@@ -570,6 +570,140 @@ describe('Dovecot', () => {
   });
 });
 
+describe('Dovecot nested mailboxes', () => {
+  it('skips unselectable parents for all-folder reads and Message-ID lookup', async () => {
+    const runtime = runtimeFor(dovecot.imapPort);
+    const stamp = `nest-${Date.now()}`;
+    const leaf = `Nest/${stamp}/leaf`;
+    await runtime.service.createMailbox(undefined, leaf);
+    const messageId = `<${stamp}@example.com>`;
+    await runtime.service.append({
+      mailbox: leaf,
+      rawBase64: simpleMessage({
+        subject: stamp,
+        text: 'in the leaf',
+        messageId,
+        from: `User <${dovecot.email}>`,
+      }).toString('base64'),
+    });
+    await runtime.service.append({
+      mailbox: leaf,
+      rawBase64: Buffer.from(
+        [
+          `From: User <${dovecot.email}>`,
+          'To: Ada <ada@example.com>',
+          `Subject: ${stamp} file`,
+          'Date: Tue, 02 Jan 2026 00:00:00 +0000',
+          `Message-ID: <${stamp}-file@example.com>`,
+          'MIME-Version: 1.0',
+          'Content-Type: text/plain; charset=utf-8',
+          'Content-Disposition: attachment; filename="note.txt"',
+          '',
+          'file',
+        ].join('\r\n'),
+      ).toString('base64'),
+    });
+
+    const listed: Array<{ path: string; flags: string[] }> = [];
+    let cursor: string | undefined;
+    for (let page = 0; page < 20; page += 1) {
+      const result = await runtime.service.listMailboxes(undefined, false, {
+        limit: 200,
+        ...(cursor ? { cursor } : {}),
+      });
+      listed.push(...(result.mailboxes as Array<{ path: string; flags: string[] }>));
+      cursor = result.nextCursor ? String(result.nextCursor) : undefined;
+      if (!cursor) {
+        break;
+      }
+    }
+    const unselectable = listed.filter(
+      (item) =>
+        leaf.startsWith(`${item.path}/`) &&
+        item.flags.some((flag) => {
+          const name = flag.toLowerCase();
+          return name === '\\noselect' || name === '\\nonexistent';
+        }),
+    );
+    expect(unselectable.length).toBeGreaterThan(0);
+    const parent = unselectable[0]?.path;
+    if (!parent) {
+      throw new Error('nested parent was not listed');
+    }
+
+    const all = await runtime.service.listMessages({
+      folders: { all: true },
+      search: { subject: stamp },
+      limit: 10,
+      includeSnippet: false,
+    });
+    expect(all.ok).toBe(true);
+    expect(
+      (all.messages as Array<{ mailbox?: string; subject?: string }>).some(
+        (item) => item.subject === stamp,
+      ),
+    ).toBe(true);
+
+    const thread = await runtime.service.getThread({ messageId });
+    expect(thread.ok).toBe(true);
+    expect((thread.items as Array<{ mailbox: string }>).some((item) => item.mailbox === leaf)).toBe(
+      true,
+    );
+    const scoped = await runtime.service.getThread({ messageId, folders: [leaf] });
+    expect(scoped.ok).toBe(true);
+
+    const search = await runtime.service.searchMessages({
+      folders: { all: true },
+      search: { subject: stamp },
+      limit: 10,
+      includeSnippet: false,
+    });
+    expect(search.ok).toBe(true);
+    const threads = await runtime.service.listThreads({
+      folders: { all: true },
+      search: { subject: stamp },
+      limit: 10,
+    });
+    expect(threads.ok).toBe(true);
+    const attachments = await runtime.service.listAttachments({
+      folders: { all: true },
+      search: { subject: stamp },
+      limit: 10,
+    });
+    expect(attachments.ok).toBe(true);
+    const people = await runtime.service.listCorrespondents({
+      folders: { all: true },
+      search: { subject: stamp },
+      limit: 10,
+    });
+    expect(people.ok).toBe(true);
+    const facets = await runtime.service.searchFacets({
+      folders: { all: true },
+      search: { subject: stamp },
+      top: 5,
+    });
+    expect(facets.ok).toBe(true);
+    const bulk = await runtime.service.modifyBySearch({
+      folders: { all: true },
+      search: { subject: stamp },
+      action: 'addFlags',
+      flags: ['\\Seen'],
+      dryRun: true,
+      limit: 10,
+    });
+    expect(bulk.ok).toBe(true);
+    expect(bulk.dryRun).toBe(true);
+
+    await expect(runtime.service.listMessages({ mailbox: parent, limit: 5 })).rejects.toMatchObject(
+      { code: 'MAILBOX_NOT_SELECTABLE' },
+    );
+    await expect(runtime.service.getThread({ messageId, folders: [parent] })).rejects.toMatchObject(
+      { code: 'MAILBOX_NOT_SELECTABLE' },
+    );
+    await runtime.close();
+  }, 120_000);
+});
+
 function listenForward(targetPort: number): Promise<{ port: number; close: () => Promise<void> }> {
   return new Promise((resolve, reject) => {
     const server = net.createServer((socket) => {

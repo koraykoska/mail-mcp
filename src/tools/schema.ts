@@ -309,7 +309,7 @@ const maxPerFolder = z
   .positive()
   .optional()
   .describe(
-    'Most messages scanned in one folder when the server cannot sort the whole snapshot. Default and maximum are limits.maxSortCandidates (5000). A higher value is rejected. Truncated folders report omitted and scanned.',
+    'Most messages kept from one folder. Default and maximum are limits.maxSortCandidates (5000). A higher value is rejected. A longer match is truncated for a server SORT and for a client scan: snapshot.folders reports omitted and scanned, and later pages stay inside that window.',
   );
 
 const order = z
