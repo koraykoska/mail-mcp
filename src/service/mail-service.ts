@@ -8,9 +8,15 @@ import { requireAccount } from '../config/load.js';
 import type { Logger } from '../log.js';
 import { SlidingWindowLimiter } from '../rate-limit.js';
 import { assertMutation, assertRecipients } from '../safety.js';
-import { decodeCursor, clampLimit, pageAfterUid } from '../pagination.js';
+import { decodeCursor, encodeCursor, clampLimit, pageAfterUid } from '../pagination.js';
 import type { ImapPool } from '../imap/pool.js';
-import { assertSearchCapabilities, compileSearch, type SearchCriteria } from '../imap/search.js';
+import {
+  andSearchUid,
+  assertSearchCapabilities,
+  compileSearch,
+  type CompiledSearch,
+  type SearchCriteria,
+} from '../imap/search.js';
 import { sortMessages, type SortKey, type SortableMessage } from '../imap/sort.js';
 import { resolveSpecialUse, type ResolvedSpecialUse } from '../imap/special-use.js';
 import { normalizeFlags, touchesDeleted } from '../imap/flags.js';
@@ -293,10 +299,9 @@ export class MailService {
           structure,
           parts: parts.map((part) => {
             const maxChars = input.maxBodyChars ?? account.limits.maxBodyChars;
-            const isText = (part.contentType ?? '').startsWith('text/');
-            const text = isText
-              ? capText(part.content.toString('utf8'), maxChars)
-              : { text: undefined, truncated: false };
+            const rawText = textFromPart(part.content, part.contentType);
+            const text =
+              rawText === null ? { text: undefined, truncated: false } : capText(rawText, maxChars);
             return {
               partId: part.partId,
               contentType: part.contentType ?? null,
@@ -304,7 +309,7 @@ export class MailService {
               size: part.content.length,
               truncated: Boolean(part.truncated) || text.truncated,
               text: text.text,
-              contentBase64: isText ? undefined : part.content.toString('base64'),
+              contentBase64: rawText === null ? part.content.toString('base64') : undefined,
             };
           }),
         };
@@ -317,11 +322,8 @@ export class MailService {
           'Pass parts to fetch specific MIME sections, or raise limits.maxMessageBytes.',
         );
       }
-      const source = await box.fetchSource(
-        input.uid,
-        (summary.size ?? 0) > 0 ? undefined : limit + 1,
-      );
-      if (source && (summary.size ?? 0) === 0 && source.length > limit) {
+      const source = await box.fetchSource(input.uid, limit + 1);
+      if (source && source.length > limit) {
         throw new MailError(
           'SIZE_LIMIT',
           `Message UID ${input.uid} exceeds the maxMessageBytes limit of ${limit}.`,
@@ -441,7 +443,8 @@ export class MailService {
         );
       }
       const truncated = Boolean(part.truncated);
-      const isText = (part.contentType ?? '').startsWith('text/');
+      const contentType = part.contentType ?? 'application/octet-stream';
+      const text = textFromPart(part.content, contentType);
       const bytes = part.content.length;
       return {
         ok: true as const,
@@ -449,12 +452,12 @@ export class MailService {
         mailbox: input.mailbox,
         uid: input.uid,
         partId: part.partId,
-        contentType: part.contentType ?? 'application/octet-stream',
+        contentType,
         filename: part.filename ?? null,
         bytes,
         truncated,
-        text: isText ? part.content.toString('utf8') : null,
-        contentBase64: isText ? null : part.content.toString('base64'),
+        text,
+        contentBase64: text === null ? part.content.toString('base64') : null,
       };
     });
   }
@@ -620,14 +623,23 @@ export class MailService {
   async setFlags(input: FlagInput): Promise<Record<string, unknown>> {
     const account = this.account(input.account);
     const flags = normalizeFlags(input.flags);
-    if (touchesDeleted(flags)) {
+    const explicitDelete = touchesDeleted(flags);
+    const replaceMayClearDeleted = input.operation === 'set' && !explicitDelete;
+    if (explicitDelete) {
       assertMutation(account, 'delete');
-    } else {
+    } else if (!replaceMayClearDeleted) {
       assertMutation(account, 'message-write');
     }
     this.assertBulk(input.uids, account.limits.maxBulk);
     return this.withMailbox(account, input.mailbox, 'write', async (box, session) => {
       this.assertUid(box, input.uidValidity);
+      if (replaceMayClearDeleted) {
+        const summaries = await box.fetchSummaries(input.uids, { snippet: false, snippetChars: 0 });
+        const clearsDeleted = summaries.some((item) =>
+          item.flags.some((flag) => flag.toLowerCase() === '\\deleted'),
+        );
+        assertMutation(account, clearsDeleted ? 'delete' : 'message-write');
+      }
       if (input.unchangedSince && !session.condstoreEnabled()) {
         throw new MailError(
           'CAPABILITY_UNSUPPORTED',
@@ -760,16 +772,35 @@ export class MailService {
     assertMutation(account, 'message-write');
     return this.withMailbox(account, input.mailbox, 'write', async (box) => {
       this.assertUid(box, input.uidValidity);
-      await this.perUid(input.uids, account.limits.maxBulk, async (uid) => {
-        await box.setLabels([uid], input.labels, input.operation);
-      });
+      this.assertBulk(input.uids, account.limits.maxBulk);
+      const results: Array<{ uid: number; ok: boolean; code?: string; message?: string }> = [];
+      for (const uid of input.uids) {
+        try {
+          await box.setLabels([uid], input.labels, input.operation);
+          results.push({ uid, ok: true });
+        } catch (error) {
+          const mapped =
+            error instanceof MailError
+              ? error
+              : new MailError('PROTOCOL_ERROR', 'The UID operation failed.');
+          results.push({ uid, ok: false, code: mapped.code, message: mapped.message });
+        }
+      }
+      if (results.every((item) => !item.ok && item.code === 'CAPABILITY_UNSUPPORTED')) {
+        const first = results[0];
+        throw new MailError(
+          'CAPABILITY_UNSUPPORTED',
+          first?.message ?? 'Gmail labels require the X-GM-EXT-1 extension.',
+        );
+      }
       return {
-        ok: true as const,
+        ok: results.every((item) => item.ok),
         account: account.id,
         mailbox: input.mailbox,
-        uids: input.uids,
+        uids: results.filter((item) => item.ok).map((item) => item.uid),
         labels: input.labels,
         operation: input.operation,
+        results,
       };
     });
   }
@@ -1039,9 +1070,14 @@ export class MailService {
       ? quoteHtml(loaded.parsed.html, label, when)
       : quoteHtml(textToHtml(loaded.parsed.text || ''), label, when);
     const html = input.html ? `${input.html}${originalHtml}` : originalHtml;
-    const source = await this.withMailbox(account, input.mailbox, 'read', async (box) =>
-      box.fetchSource(input.uid, account.limits.maxMessageBytes),
-    );
+    const source = await this.withMailbox(account, input.mailbox, 'read', async (box) => {
+      const limit = account.limits.maxMessageBytes;
+      const raw = await box.fetchSource(input.uid, limit + 1);
+      if (raw && raw.length > limit) {
+        throw new MailError('SIZE_LIMIT', `Message UID ${input.uid} exceeds maxMessageBytes.`);
+      }
+      return raw;
+    });
     const attachments: OutboundAttachment[] = [...(input.attachments ?? [])];
     if (source) {
       attachments.push({
@@ -1153,14 +1189,17 @@ export class MailService {
       throw new MailError('INVALID_ARGUMENT', 'timeoutMs must be between 1000 and 120000.');
     }
     const mailbox = input.mailbox ?? 'INBOX';
-    return this.withImap(account, async (session) => {
-      const waited = await withTimeout(
-        timeoutMs + 5_000,
-        'IDLE',
-        session.waitForChanges(mailbox, timeoutMs),
-      );
-      return { ok: true as const, account: account.id, mailbox, ...waited };
-    });
+    // The wait's own deadline is the command budget. The pool closes the
+    // socket if the session is still inside the wait after a short grace,
+    // which is what happens when IDLE ignores its timer.
+    return this.withImap(
+      account,
+      async (session) => {
+        const waited = await session.waitForChanges(mailbox, timeoutMs);
+        return { ok: true as const, account: account.id, mailbox, ...waited };
+      },
+      timeoutMs + 500,
+    );
   }
 
   async close(): Promise<void> {
@@ -1179,7 +1218,6 @@ export class MailService {
       assertSearchCapabilities(compiled.requires, (name) => session.hasCapability(name));
       const matched = await box.search(compiled);
       const keys = input.sort ?? [{ field: 'arrival', reverse: true }];
-      let ordered: number[];
       let sortSource: 'server' | 'client' | 'uid' = 'uid';
       const limitForPage = clampLimit(
         input.limit,
@@ -1187,18 +1225,74 @@ export class MailService {
         account.limits.maxPageSize,
       );
       const decoded = input.cursor ? decodeCursor(input.cursor, box.uidValidity) : undefined;
+      const afterUid = decoded?.v === 2 ? decoded.afterUid : undefined;
+      const direction = arrivalDirection(keys);
+      let sortCompiled: CompiledSearch = compiled;
+      let window: { start: number; count: number } | undefined;
+      let bounded = false;
+      if (session.hasCapability('SORT') && session.hasCapability('ESORT')) {
+        if (afterUid !== undefined && direction) {
+          const range =
+            direction === 'desc'
+              ? afterUid > 1
+                ? `1:${afterUid - 1}`
+                : undefined
+              : `${afterUid + 1}:*`;
+          if (!range) {
+            return {
+              ok: true as const,
+              account: account.id,
+              mailbox,
+              uidValidity: box.uidValidity,
+              total: matched.length,
+              offset: matched.length,
+              sort: keys,
+              sortSource: 'server' as const,
+              search: fromSearch,
+              messages: [],
+              nextCursor: null,
+            };
+          }
+          sortCompiled = andSearchUid(compiled, range);
+          bounded = true;
+          window = { start: 1, count: limitForPage };
+        } else if (afterUid === undefined) {
+          window = { start: 1, count: limitForPage };
+        }
+      }
       const serverSorted = session.hasCapability('SORT')
-        ? await box.serverSort(
-            compiled,
-            keys,
-            session.hasCapability('ESORT')
-              ? { start: 1, count: Math.max(matched.length, limitForPage) }
-              : undefined,
-          )
+        ? await box.serverSort(sortCompiled, keys, window)
         : null;
+      let pageUids: number[];
+      let nextCursor: string | null;
+      let offset: number;
+      let total: number;
       if (serverSorted) {
         const allow = new Set(matched);
-        ordered = serverSorted.filter((uid) => allow.has(uid));
+        if (serverSorted.partial) {
+          pageUids = serverSorted.uids.filter((uid) => allow.has(uid));
+          total = matched.length;
+          offset = 0;
+          const last = pageUids[pageUids.length - 1];
+          nextCursor =
+            last !== undefined &&
+            pageUids.length >= limitForPage &&
+            serverSorted.total > pageUids.length
+              ? encodeCursor({ v: 2, afterUid: last, uidValidity: box.uidValidity })
+              : null;
+        } else {
+          const ordered = serverSorted.uids.filter((uid) => allow.has(uid));
+          const paged = pageAfterUid(
+            ordered,
+            limitForPage,
+            bounded ? undefined : afterUid,
+            box.uidValidity,
+          );
+          pageUids = paged.uids;
+          nextCursor = paged.nextCursor;
+          offset = paged.offset;
+          total = bounded ? matched.length : ordered.length;
+        }
         sortSource = 'server';
       } else if (matched.length > account.limits.maxSortCandidates) {
         throw new MailError(
@@ -1218,17 +1312,14 @@ export class MailService {
           subject: item.subject,
           size: item.size,
         }));
-        ordered = sortMessages(sortable, keys).map((item) => item.uid);
+        const ordered = sortMessages(sortable, keys).map((item) => item.uid);
+        const paged = pageAfterUid(ordered, limitForPage, afterUid, box.uidValidity);
+        pageUids = paged.uids;
+        nextCursor = paged.nextCursor;
+        offset = paged.offset;
+        total = ordered.length;
         sortSource = 'client';
       }
-      const limit = limitForPage;
-      const paged = pageAfterUid(
-        ordered,
-        limit,
-        decoded?.v === 2 ? decoded.afterUid : undefined,
-        box.uidValidity,
-      );
-      const pageUids = paged.uids;
       const messages = await box.fetchSummaries(pageUids, {
         snippet: input.includeSnippet !== false,
         snippetChars: input.snippetChars ?? 160,
@@ -1242,13 +1333,13 @@ export class MailService {
         account: account.id,
         mailbox,
         uidValidity: box.uidValidity,
-        total: ordered.length,
-        offset: paged.offset,
+        total,
+        offset,
         sort: keys,
         sortSource,
         search: fromSearch,
         messages: orderedMessages.map(publicSummary),
-        nextCursor: paged.nextCursor,
+        nextCursor,
       };
     });
   }
@@ -1256,8 +1347,9 @@ export class MailService {
   private async withImap<T>(
     account: ResolvedAccount,
     fn: (session: ImapSession) => Promise<T>,
+    timeoutMs?: number,
   ): Promise<T> {
-    return this.pool.use(account.id, (session) => fn(session), account.imap.timeoutMs);
+    return this.pool.use(account.id, (session) => fn(session), timeoutMs ?? account.imap.timeoutMs);
   }
 
   private async withMailbox<T>(
@@ -1388,7 +1480,11 @@ export class MailService {
       if ((summary.size ?? 0) > account.limits.maxMessageBytes) {
         throw new MailError('SIZE_LIMIT', `Message UID ${input.uid} exceeds maxMessageBytes.`);
       }
-      const source = await box.fetchSource(input.uid);
+      const limit = account.limits.maxMessageBytes;
+      const source = await box.fetchSource(input.uid, limit + 1);
+      if (source && source.length > limit) {
+        throw new MailError('SIZE_LIMIT', `Message UID ${input.uid} exceeds maxMessageBytes.`);
+      }
       if (!source) {
         throw new MailError('NOT_FOUND', `Message UID ${input.uid} was not found.`);
       }
@@ -1854,20 +1950,59 @@ function flattenParts(node: BodyNode | null): Array<{
   if (!node) {
     return [];
   }
-  const type = `${node.type}/${node.subtype ?? ''}`.replace(/\/$/, '');
-  const self =
-    node.children.length === 0
-      ? [
-          {
-            partId: node.part || '1',
-            filename: node.dispositionParameters.filename || node.parameters.name,
-            contentType: type || 'application/octet-stream',
-            disposition: node.disposition,
-            cid: node.id,
-          },
-        ]
-      : [];
+  const self = isAttachmentNode(node)
+    ? [
+        {
+          partId: node.part || '1',
+          filename: node.dispositionParameters.filename || node.parameters.name,
+          contentType:
+            `${node.type}/${node.subtype ?? ''}`.replace(/\/$/, '') || 'application/octet-stream',
+          disposition: node.disposition,
+          cid: node.id,
+        },
+      ]
+    : [];
   return [...self, ...node.children.flatMap((child) => flattenParts(child))];
+}
+
+/** Same attachment set mail_get_message lists: not the text or html body. */
+function isAttachmentNode(node: BodyNode): boolean {
+  if (node.children.length > 0) {
+    return false;
+  }
+  const type = `${node.type}/${node.subtype ?? ''}`.toLowerCase();
+  if (type.startsWith('multipart/')) {
+    return false;
+  }
+  const filename = node.dispositionParameters.filename || node.parameters.name;
+  const disposition = (node.disposition ?? '').toLowerCase();
+  if (disposition === 'attachment' || filename || node.id) {
+    return true;
+  }
+  return type !== 'text/plain' && type !== 'text/html';
+}
+
+function textFromPart(content: Buffer, contentType: string | undefined): string | null {
+  const type = (contentType ?? '').toLowerCase();
+  if (!type.startsWith('text/')) {
+    return null;
+  }
+  const text = content.toString('utf8');
+  return type.startsWith('text/html') ? sanitizeHtml(text) : text;
+}
+
+function arrivalDirection(keys: readonly SortKey[]): 'asc' | 'desc' | null {
+  if (keys.length === 0 || keys.some((key) => key.field !== 'arrival')) {
+    return null;
+  }
+  const reversed = keys.map((key) => Boolean(key.reverse));
+  if (reversed.every((value) => value)) {
+    return 'desc';
+  }
+  if (reversed.every((value) => !value)) {
+    return 'asc';
+  }
+  return null;
 }
 
 export interface UidInput {

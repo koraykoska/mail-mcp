@@ -50,8 +50,8 @@ export async function ensureDovecot(): Promise<DovecotEndpoints> {
     },
   );
   await start('mail-mcp-dovecot-full', DEFAULTS.imapPort, DEFAULTS.imapsPort, '');
-  await start('mail-mcp-dovecot-nouidplus', DEFAULTS.noUidPlusPort, 0, '-UIDPLUS');
-  await start('mail-mcp-dovecot-noidle', DEFAULTS.noIdlePort, 0, '-IDLE');
+  await start('mail-mcp-dovecot-nouidplus', DEFAULTS.noUidPlusPort, 0, 'UIDPLUS');
+  await start('mail-mcp-dovecot-noidle', DEFAULTS.noIdlePort, 0, 'IDLE');
   await waitFor(DEFAULTS.host, DEFAULTS.imapPort);
   await waitFor(DEFAULTS.host, DEFAULTS.noUidPlusPort);
   await waitFor(DEFAULTS.host, DEFAULTS.noIdlePort);

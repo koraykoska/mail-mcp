@@ -127,6 +127,32 @@ describe('Dovecot', () => {
       includeSnippet: false,
     });
     expect(left.total).toBe(2);
+    const caps = await runtime.service.capabilities();
+    const list = caps.capabilities as string[];
+    expect(list).toContain('IMAP4rev1');
+    expect(list).toContain('SORT');
+    expect(list).not.toContain('UIDPLUS');
+    expect(list.some((token) => token.startsWith('-'))).toBe(false);
+    await runtime.close();
+  });
+
+  it('returns a parsed view of malformed MIME instead of failing the fetch', async () => {
+    const runtime = runtimeFor(dovecot.imapPort);
+    const stamp = `broken-${Date.now()}`;
+    await runtime.service.createMailbox(undefined, stamp);
+    const appended = await runtime.service.append({
+      mailbox: stamp,
+      rawBase64: Buffer.from(
+        'From: ada@example.com\r\nTo: user@example.com\r\nSubject: =?unknown?Q?broken?=\r\nContent-Type: text/plain; charset=x-not-a-charset\r\nContent-Transfer-Encoding: 8bit\r\n\r\ncaf\u00e9 raw\r\n',
+      ).toString('base64'),
+    });
+    const uid = Number(appended.uid);
+    const message = await runtime.service.getMessage({ mailbox: stamp, uid });
+    expect(message.ok).toBe(true);
+    expect(message.uid).toBe(uid);
+    expect(message.text === null || typeof message.text === 'string').toBe(true);
+    const source = await runtime.service.getSource({ mailbox: stamp, uid });
+    expect(Number(source.bytes)).toBeGreaterThan(20);
     await runtime.close();
   });
 
@@ -141,6 +167,12 @@ describe('Dovecot', () => {
       rawBase64: simpleMessage({ subject: 'arrived', text: 'now' }).toString('base64'),
     });
     const result = await waiting;
+    const caps = await runtime.service.capabilities();
+    const list = caps.capabilities as string[];
+    expect(list).toContain('IMAP4rev1');
+    expect(list).toContain('UIDPLUS');
+    expect(list).not.toContain('IDLE');
+    expect(list.some((token) => token.startsWith('-'))).toBe(false);
     expect(result.idleSupported).toBe(false);
     expect(result.timedOut).toBe(false);
     expect((result.changes as unknown[]).length).toBeGreaterThan(0);

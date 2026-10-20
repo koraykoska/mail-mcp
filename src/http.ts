@@ -38,6 +38,13 @@ export async function startHttpServer(options: {
         res.writeHead(404).end('Not found');
         return;
       }
+      if (options.token) {
+        const authorization = header(req.headers.authorization);
+        if (authorization !== `Bearer ${options.token}`) {
+          res.writeHead(401).end('Unauthorized');
+          return;
+        }
+      }
       const sessionId = header(req.headers['mcp-session-id']);
       if (sessionId && sessions.has(sessionId)) {
         const existing = sessions.get(sessionId);
@@ -49,13 +56,6 @@ export async function startHttpServer(options: {
       if (req.method !== 'POST') {
         res.writeHead(405).end('Method not allowed');
         return;
-      }
-      if (options.token) {
-        const authorization = header(req.headers.authorization);
-        if (authorization !== `Bearer ${options.token}`) {
-          res.writeHead(401).end('Unauthorized');
-          return;
-        }
       }
       const body = await readJson(req, maxBodyBytes);
       if (!isInitializeRequest(body)) {

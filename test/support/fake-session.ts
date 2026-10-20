@@ -18,6 +18,7 @@ import type {
   MessageSummary,
   OpenMailbox,
   QuotaInfo,
+  ServerSortResult,
   StatusInfo,
   WaitResult,
 } from '../../src/imap/session.js';
@@ -51,6 +52,9 @@ export class FakeSession implements ImapSession {
   connected = false;
   idleSupported = true;
   changes: MailboxChange[] = [];
+  structure: BodyNode | null = null;
+  sourceMissing = false;
+  partBodies = new Map<string, { content: Buffer; contentType: string; filename?: string }>();
 
   constructor(
     capabilities: string[] = [
@@ -349,6 +353,9 @@ class FakeBox implements OpenMailbox {
   }
 
   async fetchSource(uid: number): Promise<Buffer | null> {
+    if (this.session.sourceMissing) {
+      return null;
+    }
     return this.box.messages.find((message) => message.uid === uid)?.raw ?? null;
   }
 
@@ -371,12 +378,28 @@ class FakeBox implements OpenMailbox {
       return [];
     }
     return parts.map((part) => {
+      const canned = this.session.partBodies.get(part.key);
+      if (canned) {
+        const content = canned.content.subarray(0, part.maxLength ?? canned.content.length);
+        const fetched: FetchedPart = {
+          partId: part.key,
+          content: Buffer.from(content),
+          contentType: canned.contentType,
+        };
+        if (canned.filename) {
+          fetched.filename = canned.filename;
+        }
+        return fetched;
+      }
       const content = raw.subarray(0, part.maxLength ?? raw.length);
       return { partId: part.key, content: Buffer.from(content), contentType: 'text/plain' };
     });
   }
 
   async fetchStructure(): Promise<BodyNode | null> {
+    if (this.session.structure) {
+      return this.session.structure;
+    }
     return {
       type: 'text',
       subtype: 'plain',
@@ -422,12 +445,15 @@ class FakeBox implements OpenMailbox {
     return { updated, modified, missing };
   }
 
-  async setLabels(): Promise<void> {
+  async setLabels(uids: number[]): Promise<void> {
     if (!this.session.hasCapability('X-GM-EXT-1')) {
       throw new MailError(
         'CAPABILITY_UNSUPPORTED',
         'Gmail labels require the X-GM-EXT-1 extension.',
       );
+    }
+    for (const uid of uids) {
+      this.require(uid);
     }
   }
 
@@ -469,13 +495,21 @@ class FakeBox implements OpenMailbox {
   async serverSort(
     compiled: CompiledSearch,
     _keys: SortKey[],
-    _window?: { start: number; count: number },
-  ): Promise<number[] | null> {
+    window?: { start: number; count: number },
+  ): Promise<ServerSortResult | null> {
     if (!this.session.hasCapability('SORT')) {
       return null;
     }
-    const uids = await this.search(compiled);
-    return uids.sort((left, right) => right - left);
+    const uids = (await this.search(compiled)).sort((left, right) => right - left);
+    if (!window) {
+      return { uids, total: uids.length, partial: false };
+    }
+    const start = Math.max(0, window.start - 1);
+    return {
+      uids: uids.slice(start, start + window.count),
+      total: uids.length,
+      partial: true,
+    };
   }
 
   async serverThread(
@@ -513,7 +547,7 @@ function matches(message: StoredMessage, query: Record<string, unknown>): boolea
   if (query.seen === false && message.flags.includes('\\Seen')) {
     return false;
   }
-  if (typeof query.uid === 'string' && !query.uid.split(',').includes(String(message.uid))) {
+  if (typeof query.uid === 'string' && !uidInSet(message.uid, query.uid)) {
     return false;
   }
   if (typeof query.from === 'string' && !(message.from ?? '').includes(String(query.from))) {
@@ -530,6 +564,19 @@ function matches(message: StoredMessage, query: Record<string, unknown>): boolea
     return false;
   }
   return true;
+}
+
+function uidInSet(uid: number, set: string): boolean {
+  return set.split(',').some((piece) => {
+    const trimmed = piece.trim();
+    const range = /^(\d+|\*):(\d+|\*)$/.exec(trimmed);
+    if (range) {
+      const start = range[1] === '*' ? Number.MAX_SAFE_INTEGER : Number(range[1]);
+      const end = range[2] === '*' ? Number.MAX_SAFE_INTEGER : Number(range[2]);
+      return uid >= Math.min(start, end) && uid <= Math.max(start, end);
+    }
+    return trimmed === String(uid);
+  });
 }
 
 function header(raw: Buffer, name: string): string | undefined {

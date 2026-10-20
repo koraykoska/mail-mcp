@@ -99,7 +99,14 @@ export function pageAfterUid(
   let start = 0;
   if (afterUid !== undefined) {
     const index = ordered.indexOf(afterUid);
-    start = index >= 0 ? index + 1 : 0;
+    if (index < 0) {
+      throw new MailError(
+        'INVALID_ARGUMENT',
+        `The page cursor points at UID ${afterUid}, which is no longer in this result.`,
+        'Repeat the list or search without a cursor.',
+      );
+    }
+    start = index + 1;
   }
   const uids = ordered.slice(start, start + limit);
   const last = uids[uids.length - 1];

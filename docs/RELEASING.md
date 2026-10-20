@@ -29,14 +29,14 @@ There is no `NPM_TOKEN` secret. Do not create one.
 
 After the trusted publisher exists:
 
-1. Bump `package.json` from `0.0.1` to `0.1.0` (locally, or with the Release workflow's `workflow_dispatch` bump, which only commits and tags).
-2. Tag `v0.1.0` and push the tag. A push made with `GITHUB_TOKEN` does not start another workflow, so push the tag with credentials that trigger Actions.
+1. Bump `package.json` from `0.0.1` to `0.1.0` on `main`. The Release workflow's `workflow_dispatch` bump can commit that change and push the branch. It does not create or push the tag.
+2. On that commit, tag locally and push the tag with credentials that can start Actions: `git tag v0.1.0` then `git push origin v0.1.0`. A `GITHUB_TOKEN` push does not start the tag workflow, so the bump job never pushes the tag.
 3. The tag workflow runs the full CI workflow first. Only after that passes does it stage the tarball CI packed, with `npm stage publish <tarball> --access public --provenance --tag latest`.
 4. The job summary prints the stage id and the approve commands. The GitHub Release is created as a draft.
 5. Approve the stage with 2FA. Then publish the GitHub Release draft.
 
 If OIDC is not configured yet, the stage job fails and points back at the v0.0.1 bootstrap. It does not fall back to a token.
 
-Later versions repeat the v0.1.0 path: bump, tag `vX.Y.Z` matching `package.json`, push the tag, approve the stage.
+Later versions repeat the v0.1.0 path: bump the version on the default branch, tag `vX.Y.Z` locally so it matches `package.json`, push that tag, and approve the stage.
 
-`workflow_dispatch` only bumps the version, updates `CHANGELOG.md`, commits, tags, and pushes. It does not stage or publish. The tag workflow does that after CI passes.
+`workflow_dispatch` only bumps the version, updates `CHANGELOG.md`, commits, and pushes the branch. It prints the `git tag` and `git push origin vX.Y.Z` commands and stops there. It does not stage or publish. The tag workflow does that after CI passes.

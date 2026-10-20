@@ -497,7 +497,33 @@ export const TOOLS: ToolDefinition[] = [
       sort: z.array(z.object({ field: z.string(), reverse: z.boolean().optional() }).strict()),
       sortSource: z.enum(['server', 'client', 'uid']),
       search: z.boolean(),
-      messages: z.array(z.record(z.string(), z.unknown())),
+      messages: z.array(
+        z
+          .object({
+            uid: z.number(),
+            flags: z.array(z.string()),
+            size: z.number().nullable(),
+            date: z.string().nullable(),
+            internalDate: z.string().nullable(),
+            subject: z.string().nullable(),
+            from: z.array(
+              z.object({ name: z.string().optional(), address: z.string().optional() }).strict(),
+            ),
+            to: z.array(
+              z.object({ name: z.string().optional(), address: z.string().optional() }).strict(),
+            ),
+            cc: z.array(
+              z.object({ name: z.string().optional(), address: z.string().optional() }).strict(),
+            ),
+            messageId: z.string().nullable(),
+            hasAttachments: z.boolean(),
+            snippet: z.string().nullable(),
+            labels: z.array(z.string()),
+            threadId: z.string().nullable(),
+            modseq: z.string().nullable(),
+          })
+          .strict(),
+      ),
       nextCursor: z.string().nullable(),
     }),
     annotations: {
@@ -679,7 +705,7 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_download_attachment',
     title: 'Download an attachment',
     description:
-      'Download one attachment chosen by filename, Content-ID (cid), or partIndex (0-based index in the attachment list from mail_get_message). Without savePath the bytes are base64 and must be under maxAttachmentBytes or the call fails with SIZE_LIMIT. With savePath the file is written on the machine running this server and the result contains savedPath and no base64. If attachmentsDir is configured, savePath must stay inside it.',
+      'Download one attachment chosen by filename, Content-ID (cid), or partIndex (0-based index in the attachment list from mail_get_message, not every MIME leaf). Without savePath the bytes are base64 and must be under maxAttachmentBytes or the call fails with SIZE_LIMIT. With savePath the file is written on the machine running this server and the result contains savedPath and no base64. savePath is rejected unless attachmentsDir is configured, and the resolved path must stay inside that directory.',
     input: z.object({
       account: fields.account,
       mailbox: fields.mailbox,
@@ -696,7 +722,9 @@ export const TOOLS: ToolDefinition[] = [
       savePath: z
         .string()
         .optional()
-        .describe('Local file path to write. Parent directories are created.'),
+        .describe(
+          'File path to write. Requires attachmentsDir. The resolved path must stay inside that directory. Parent directories are created.',
+        ),
     }),
     output: strictOutput({
       ...baseOut,
@@ -766,7 +794,7 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_set_flags',
     title: 'Add, remove, or replace flags',
     description:
-      'Change flags or keywords on one or more UIDs. operation add is +FLAGS, remove is -FLAGS, set replaces the whole flag set (FLAGS). System flags may be written "\\\\Seen" or "seen". Custom keywords must not contain spaces. unchangedSince is the CONDSTORE UNCHANGEDSINCE mod-sequence; omit it when the server has no CONDSTORE. Blocked when the account is readOnly. Does not expunge.',
+      'Change flags or keywords on one or more UIDs. operation add is +FLAGS, remove is -FLAGS, set replaces the whole flag set (FLAGS). Adding or removing \\Deleted, and a set that would clear \\Deleted, require allowDelete. System flags may be written "\\\\Seen" or "seen". Custom keywords must not contain spaces. unchangedSince is the CONDSTORE UNCHANGEDSINCE mod-sequence; omit it when the server has no CONDSTORE. Blocked when the account is readOnly. Does not expunge. ok is false when any UID failed; uids lists only the UIDs that changed.',
     input: z.object({
       account: fields.account,
       mailbox: fields.mailbox,
@@ -991,7 +1019,7 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_set_labels',
     title: 'Set Gmail labels',
     description:
-      'Add, remove, or replace Gmail labels on UIDs. Requires X-GM-EXT-1; other servers return CAPABILITY_UNSUPPORTED. Labels are names such as "Work" or "\\\\Inbox", not IMAP keywords. operation set replaces the label set. This is not mail_set_flags.',
+      'Add, remove, or replace Gmail labels on UIDs. Requires X-GM-EXT-1; other servers return CAPABILITY_UNSUPPORTED. Labels are names such as "Work" or "\\\\Inbox", not IMAP keywords. operation set replaces the label set. This is not mail_set_flags. ok is false when any UID failed. uids lists only the UIDs that changed. results has one row per requested UID.',
     input: z.object({
       account: fields.account,
       mailbox: fields.mailbox,
@@ -1008,6 +1036,16 @@ export const TOOLS: ToolDefinition[] = [
       uids: z.array(z.number()),
       labels: z.array(z.string()),
       operation: z.string(),
+      results: z.array(
+        z
+          .object({
+            uid: z.number(),
+            ok: z.boolean(),
+            code: z.string().optional(),
+            message: z.string().optional(),
+          })
+          .strict(),
+      ),
     }),
     annotations: {
       readOnlyHint: false,

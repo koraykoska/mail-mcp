@@ -25,7 +25,7 @@ See `docs/RELEASING.md`. Short version:
 
 `0.0.1` is the manual bootstrap. `npm login`, then `npm stage publish --access public` of the tested tarball, approve with 2FA, then configure the trusted publisher on npmjs.com (owner `koraykoska`, repository `mail-mcp`, workflow filename `release.yml`, stage publish allowed). That configuration must complete its first CI publish within 2 days. Then set **Require two-factor authentication and disallow tokens**. There is no `NPM_TOKEN`.
 
-`0.1.0` is the first tag-triggered trusted-publishing release. Bump the version, tag `v0.1.0`, push the tag, and approve the staged version the workflow prints. Later tags follow that same path. `workflow_dispatch` only bumps, commits, and tags.
+`0.1.0` is the first tag-triggered trusted-publishing release. Bump the version on `main`, tag `v0.1.0` locally, push that tag, and approve the staged version the workflow prints. Later tags follow that same path. `workflow_dispatch` only bumps, commits, and pushes the branch. It does not push the tag.
 
 ## Docs
 

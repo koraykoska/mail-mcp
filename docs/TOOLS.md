@@ -5,7 +5,7 @@ Run `npm run docs:tools` after changing a tool and commit the result. `npm run d
 
 The server registers 41 tools. A tool that mutates mail or sends it is omitted only when every configured account forbids that class of operation. Calls are still checked against the selected account.
 
-Results are JSON in `structuredContent` plus a text rendering. Errors use `isError: true` and a `structuredContent.error.code` from this set:
+Results are JSON in `structuredContent` plus a text rendering. Errors use `isError: true` and text only, shaped as `CODE: message` with an optional `Hint:` line. There is no structured error object. Codes:
 
 `AUTH_FAILED`, `TLS_FAILED`, `NOT_FOUND`, `UIDVALIDITY_CHANGED`, `CAPABILITY_UNSUPPORTED`, `PERMISSION_DENIED`, `SIZE_LIMIT`, `TIMEOUT`, `RATE_LIMITED`, `CONFIG_ERROR`, `PROTOCOL_ERROR`, `CONNECTION_FAILED`, `INVALID_ARGUMENT`.
 
@@ -364,7 +364,7 @@ Annotations: readOnlyHint=true, destructiveHint=false, idempotentHint=true, open
   - `field`: arrival is the internal received date. date is the Date header.
   - `reverse` (optional): true sorts descending. Default false (ascending). Newest-first is arrival + reverse.
 - `limit` (optional): Page size. Default is limits.pageSize (25). The schema allows up to 10000; the server rejects values above the configured limits.maxPageSize (default 100).
-- `cursor` (optional): Opaque cursor from the previous page's nextCursor. Cursors are tied to uidValidity and are not stable if the mailbox changes. Omit to start at the first page.
+- `cursor` (optional): Opaque cursor from the previous page's nextCursor. A cursor resumes after the UID it names. If that UID is no longer in the result, the call fails with INVALID_ARGUMENT; repeat the request without a cursor. Cursors are tied to uidValidity. Omit to start at the first page.
 - `uidValidity` (optional): Expected UIDVALIDITY decimal string from mail_get_mailbox_status or a previous list. When set, the call fails with UIDVALIDITY_CHANGED if the mailbox was recreated.
 - `includeSnippet` (optional): Include a text snippet. Default true. Set false for a faster list.
 - `snippetChars` (optional): Maximum snippet length. Default 160.
@@ -431,7 +431,7 @@ Annotations: readOnlyHint=true, destructiveHint=false, idempotentHint=true, open
   - `field`: arrival is the internal received date. date is the Date header.
   - `reverse` (optional): true sorts descending. Default false (ascending). Newest-first is arrival + reverse.
 - `limit` (optional): Page size. Default is limits.pageSize (25). The schema allows up to 10000; the server rejects values above the configured limits.maxPageSize (default 100).
-- `cursor` (optional): Opaque cursor from the previous page's nextCursor. Cursors are tied to uidValidity and are not stable if the mailbox changes. Omit to start at the first page.
+- `cursor` (optional): Opaque cursor from the previous page's nextCursor. A cursor resumes after the UID it names. If that UID is no longer in the result, the call fails with INVALID_ARGUMENT; repeat the request without a cursor. Cursors are tied to uidValidity. Omit to start at the first page.
 - `uidValidity` (optional): Expected UIDVALIDITY decimal string from mail_get_mailbox_status or a previous list. When set, the call fails with UIDVALIDITY_CHANGED if the mailbox was recreated.
 - `includeSnippet` (optional): Include a text snippet. Default true. Set false for a faster search.
 - `snippetChars` (optional): Maximum snippet length in characters. Default 160.
@@ -535,7 +535,7 @@ Annotations: readOnlyHint=true, destructiveHint=false, idempotentHint=true, open
 
 Download an attachment
 
-Download one attachment chosen by filename, Content-ID (cid), or partIndex (0-based index in the attachment list from mail_get_message). Without savePath the bytes are base64 and must be under maxAttachmentBytes or the call fails with SIZE_LIMIT. With savePath the file is written on the machine running this server and the result contains savedPath and no base64. If attachmentsDir is configured, savePath must stay inside it.
+Download one attachment chosen by filename, Content-ID (cid), or partIndex (0-based index in the attachment list from mail_get_message, not every MIME leaf). Without savePath the bytes are base64 and must be under maxAttachmentBytes or the call fails with SIZE_LIMIT. With savePath the file is written on the machine running this server and the result contains savedPath and no base64. savePath is rejected unless attachmentsDir is configured, and the resolved path must stay inside that directory.
 
 Annotations: readOnlyHint=false, destructiveHint=true, idempotentHint=false, openWorldHint=true.
 
@@ -548,7 +548,7 @@ Annotations: readOnlyHint=false, destructiveHint=true, idempotentHint=false, ope
 - `filename` (optional): Exact filename match.
 - `cid` (optional): Content-ID, with or without angle brackets as stored.
 - `partIndex` (optional): Index in the attachment array from mail_get_message.
-- `savePath` (optional): Local file path to write. Parent directories are created.
+- `savePath` (optional): File path to write. Requires attachmentsDir. The resolved path must stay inside that directory. Parent directories are created.
 
 ### Examples
 
@@ -610,7 +610,7 @@ Annotations: readOnlyHint=true, destructiveHint=false, idempotentHint=true, open
   - `and` (optional): Match if every nested object matches. Top-level fields are already ANDed; use this for grouped clauses.
 - `algorithm` (optional): Default REFERENCES.
 - `limit` (optional): Page size. Default is limits.pageSize (25). The schema allows up to 10000; the server rejects values above the configured limits.maxPageSize (default 100).
-- `cursor` (optional): Opaque cursor from the previous page's nextCursor. Cursors are tied to uidValidity and are not stable if the mailbox changes. Omit to start at the first page.
+- `cursor` (optional): Opaque cursor from the previous page's nextCursor. A cursor resumes after the UID it names. If that UID is no longer in the result, the call fails with INVALID_ARGUMENT; repeat the request without a cursor. Cursors are tied to uidValidity. Omit to start at the first page.
 - `uidValidity` (optional): Expected UIDVALIDITY decimal string from mail_get_mailbox_status or a previous list. When set, the call fails with UIDVALIDITY_CHANGED if the mailbox was recreated.
 
 ### Examples
@@ -623,7 +623,7 @@ Annotations: readOnlyHint=true, destructiveHint=false, idempotentHint=true, open
 
 Add, remove, or replace flags
 
-Change flags or keywords on one or more UIDs. operation add is +FLAGS, remove is -FLAGS, set replaces the whole flag set (FLAGS). System flags may be written "\\Seen" or "seen". Custom keywords must not contain spaces. unchangedSince is the CONDSTORE UNCHANGEDSINCE mod-sequence; omit it when the server has no CONDSTORE. Blocked when the account is readOnly. Does not expunge.
+Change flags or keywords on one or more UIDs. operation add is +FLAGS, remove is -FLAGS, set replaces the whole flag set (FLAGS). Adding or removing \Deleted, and a set that would clear \Deleted, require allowDelete. System flags may be written "\\Seen" or "seen". Custom keywords must not contain spaces. unchangedSince is the CONDSTORE UNCHANGEDSINCE mod-sequence; omit it when the server has no CONDSTORE. Blocked when the account is readOnly. Does not expunge. ok is false when any UID failed; uids lists only the UIDs that changed.
 
 Annotations: readOnlyHint=false, destructiveHint=false, idempotentHint=true, openWorldHint=true.
 
@@ -773,7 +773,7 @@ Annotations: readOnlyHint=false, destructiveHint=false, idempotentHint=false, op
 
 Set Gmail labels
 
-Add, remove, or replace Gmail labels on UIDs. Requires X-GM-EXT-1; other servers return CAPABILITY_UNSUPPORTED. Labels are names such as "Work" or "\\Inbox", not IMAP keywords. operation set replaces the label set. This is not mail_set_flags.
+Add, remove, or replace Gmail labels on UIDs. Requires X-GM-EXT-1; other servers return CAPABILITY_UNSUPPORTED. Labels are names such as "Work" or "\\Inbox", not IMAP keywords. operation set replaces the label set. This is not mail_set_flags. ok is false when any UID failed. uids lists only the UIDs that changed. results has one row per requested UID.
 
 Annotations: readOnlyHint=false, destructiveHint=false, idempotentHint=true, openWorldHint=true.
 

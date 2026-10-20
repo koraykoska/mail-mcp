@@ -58,16 +58,17 @@ async function connected() {
 
 describe('MCP session over an in-memory transport', () => {
   it('calls the tool surface, a resource, and both prompts', async () => {
-    const { client, dir } = await connected();
+    const { client, dir, session } = await connected();
     const tools = await client.listTools();
     expect(tools.tools.length).toBeGreaterThan(30);
     const call = (name: string, args: Record<string, unknown> = {}) =>
       client.callTool({ name, arguments: args });
 
     const accounts = await call('mail_list_accounts');
-    if (accounts.isError) {
-      throw new Error(JSON.stringify(accounts.content));
-    }
+    expect(accounts.isError).toBeFalsy();
+    expect(
+      (accounts.structuredContent as { accounts?: Array<{ id?: string }> }).accounts?.[0]?.id,
+    ).toBe('work');
     expect((await call('mail_verify_connection', { smtp: true, imap: true })).isError).toBeFalsy();
     expect((await call('mail_get_capabilities')).isError).toBeFalsy();
     expect((await call('mail_get_namespaces')).isError).toBeFalsy();
@@ -87,12 +88,33 @@ describe('MCP session over an in-memory transport', () => {
     const listed = await call('mail_list_messages', { mailbox: 'INBOX', limit: 5 });
     expect(listed.isError).toBeFalsy();
     expect(
-      (await call('mail_search_messages', { mailbox: 'INBOX', search: { subject: 'Hello' } }))
-        .isError,
-    ).toBeFalsy();
+      (listed.structuredContent as { messages: Array<{ subject: string | null }> }).messages.some(
+        (message) => message.subject === 'Hello',
+      ),
+    ).toBe(true);
+    const found = await call('mail_search_messages', {
+      mailbox: 'INBOX',
+      search: { subject: 'Hello' },
+    });
+    expect(found.isError).toBeFalsy();
     expect(
-      (await call('mail_get_message', { mailbox: 'INBOX', uid: 1, maxBodyChars: 20 })).isError,
-    ).toBeFalsy();
+      (found.structuredContent as { total: number; messages: Array<{ subject: string | null }> })
+        .total,
+    ).toBeGreaterThan(0);
+    expect(
+      (found.structuredContent as { messages: Array<{ subject: string | null }> }).messages[0]
+        ?.subject,
+    ).toBe('Hello');
+    const message = await call('mail_get_message', {
+      mailbox: 'INBOX',
+      uid: 1,
+      maxBodyChars: 20,
+    });
+    expect(message.isError).toBeFalsy();
+    expect(
+      (message.structuredContent as { headers: { subject: string | null } }).headers.subject,
+    ).toBe('Hello');
+    expect((message.structuredContent as { text: string | null }).text).toContain('Body');
     expect(
       (await call('mail_get_message', { mailbox: 'INBOX', uid: 1, parts: ['1'] })).isError,
     ).toBeFalsy();
@@ -112,17 +134,19 @@ describe('MCP session over an in-memory transport', () => {
       ).isError,
     ).toBeFalsy();
     expect((await call('mail_list_threads', { mailbox: 'INBOX', limit: 10 })).isError).toBeFalsy();
-    expect(
-      (
-        await call('mail_set_flags', {
-          mailbox: 'INBOX',
-          uids: [1],
-          flags: ['\\Flagged'],
-          operation: 'add',
-          unchangedSince: '1',
-        })
-      ).isError,
-    ).toBeFalsy();
+    const flagged = await call('mail_set_flags', {
+      mailbox: 'INBOX',
+      uids: [1],
+      flags: ['\\Flagged'],
+      operation: 'add',
+      unchangedSince: '1',
+    });
+    expect(flagged.isError).toBeFalsy();
+    expect((flagged.structuredContent as { ok: boolean; uids: number[] }).ok).toBe(true);
+    expect((flagged.structuredContent as { uids: number[] }).uids).toEqual([1]);
+    expect(session.boxes.get('INBOX')?.messages.find((item) => item.uid === 1)?.flags).toContain(
+      '\\Flagged',
+    );
     expect(
       (await call('mail_copy_messages', { mailbox: 'INBOX', uids: [1], destination: 'Sent' }))
         .isError,

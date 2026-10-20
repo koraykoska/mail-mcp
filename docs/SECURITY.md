@@ -24,6 +24,8 @@ Implicit TLS is the default for the usual IMAP and submission ports. Cleartext i
 
 ## Network
 
-The optional HTTP transport binds to `127.0.0.1` by default. A non-loopback `--host` is refused unless `--http-token` or `MAIL_HTTP_TOKEN` is set, and that bearer token is required on `/mcp`. Request bodies are capped. Stdio does not listen.
+The optional HTTP transport binds to `127.0.0.1` by default. A non-loopback `--host` is refused unless `--http-token` or `MAIL_HTTP_TOKEN` is set. When a token is configured it is required on every `/mcp` request, including requests that already carry `mcp-session-id`. `/health` stays open. Request bodies are capped. Stdio does not listen.
+
+HTML returned by the tools, and HTML quoted into a reply or forward, is passed through an allow-list sanitizer. Only a fixed set of tags and the `http`, `https`, `mailto`, and `cid` URL schemes are kept. Event handlers, style, and embedded content are dropped. The text rendering does not delete those scheme names from ordinary prose.
 
 Attachment `path` values and `savePath` are local filesystem paths. A client that can call tools can read files the process can read and write files the process can write, subject to `attachmentsDir`.

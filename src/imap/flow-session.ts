@@ -35,6 +35,7 @@ import {
   type MessageSummary,
   type OpenMailbox,
   type QuotaInfo,
+  type ServerSortResult,
   type StatusInfo,
   type WaitResult,
   type MailboxChange,
@@ -978,7 +979,7 @@ class FlowMailbox implements OpenMailbox {
     compiled: CompiledSearch,
     keys: SortKey[],
     window?: { start: number; count: number },
-  ): Promise<number[] | null> {
+  ): Promise<ServerSortResult | null> {
     if (!this.session.hasCapability('SORT') || keys.length === 0) {
       return null;
     }
@@ -997,28 +998,31 @@ class FlowMailbox implements OpenMailbox {
         }
       }
       const plain = [criteria, { type: 'ATOM', value: 'UTF-8' }, searchKey];
-      const attempts: unknown[][] = [];
+      const attempts: Array<{ args: unknown[]; partial: boolean }> = [];
       if (this.session.hasCapability('ESORT') && window && !display) {
         const end = window.start + window.count - 1;
-        attempts.push([
-          [
-            { type: 'ATOM', value: 'RETURN' },
+        attempts.push({
+          partial: true,
+          args: [
             [
-              { type: 'ATOM', value: 'PARTIAL' },
-              { type: 'ATOM', value: `${window.start}:${end}` },
-              { type: 'ATOM', value: 'COUNT' },
+              { type: 'ATOM', value: 'RETURN' },
+              [
+                { type: 'ATOM', value: 'PARTIAL' },
+                { type: 'ATOM', value: `${window.start}:${end}` },
+                { type: 'ATOM', value: 'COUNT' },
+              ],
             ],
+            ...plain,
           ],
-          ...plain,
-        ]);
+        });
       }
-      attempts.push(plain);
-      for (const commandArgs of attempts) {
+      attempts.push({ args: plain, partial: false });
+      for (const attempt of attempts) {
         const numbers: number[] = [];
         let count: number | undefined;
         try {
           const raw = this.client as unknown as RawClient;
-          const response = await raw.exec('UID SORT', commandArgs, {
+          const response = await raw.exec('UID SORT', attempt.args, {
             untagged: {
               SORT: (untagged) => {
                 for (const attribute of untagged.attributes ?? []) {
@@ -1039,9 +1043,18 @@ class FlowMailbox implements OpenMailbox {
           });
           response.next();
           if (count === 0) {
-            return [];
+            return { uids: [], total: 0, partial: attempt.partial };
           }
-          return numbers;
+          if (attempt.partial && window) {
+            const total =
+              count !== undefined
+                ? count
+                : numbers.length < window.count
+                  ? window.start - 1 + numbers.length
+                  : window.start + numbers.length;
+            return { uids: numbers, total, partial: true };
+          }
+          return { uids: numbers, total: count ?? numbers.length, partial: false };
         } catch (error) {
           lastError = error;
         }
@@ -1133,19 +1146,28 @@ class FlowMailbox implements OpenMailbox {
           {
             untagged: {
               FETCH: (untagged) => {
-                const values = untagged.attributes ?? [];
                 let uid: number | undefined;
                 let preview: string | undefined;
-                for (let index = 0; index < values.length; index += 1) {
-                  const token = String(values[index]?.value ?? '').toUpperCase();
-                  const next = values[index + 1]?.value;
-                  if (token === 'UID' && next !== undefined) {
-                    uid = Number(next);
+                const visit = (nodes: ImapAttr[] | undefined): void => {
+                  if (!nodes) {
+                    return;
                   }
-                  if (token === 'PREVIEW' && typeof next === 'string') {
-                    preview = next;
+                  for (let index = 0; index < nodes.length; index += 1) {
+                    const node = nodes[index];
+                    const token = String(node?.value ?? '').toUpperCase();
+                    const next = nodes[index + 1];
+                    if (token === 'UID' && next?.value !== undefined) {
+                      uid = Number(next.value);
+                    }
+                    if (token === 'PREVIEW' && typeof next?.value === 'string') {
+                      preview = next.value;
+                    }
+                    if (node?.attributes) {
+                      visit(node.attributes);
+                    }
                   }
-                }
+                };
+                visit(untagged.attributes);
                 if (uid && preview) {
                   out.set(uid, preview);
                 }

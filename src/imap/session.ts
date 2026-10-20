@@ -108,6 +108,14 @@ export interface BodyNode {
   lineCount?: number;
 }
 
+export interface ServerSortResult {
+  uids: number[];
+  /** Matches for this SORT. Larger than `uids` when `partial` is a page window. */
+  total: number;
+  /** True when `uids` is only the requested window, not the whole ordered match. */
+  partial: boolean;
+}
+
 export interface OpenMailbox {
   path: string;
   uidValidity: string;
@@ -141,7 +149,7 @@ export interface OpenMailbox {
     compiled: CompiledSearch,
     keys: SortKey[],
     window?: { start: number; count: number },
-  ): Promise<number[] | null>;
+  ): Promise<ServerSortResult | null>;
   /** Null when THREAD is unavailable. */
   serverThread(
     algorithm: 'REFERENCES' | 'ORDEREDSUBJECT' | 'REFS',

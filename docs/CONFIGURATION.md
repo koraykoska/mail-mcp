@@ -71,17 +71,17 @@ A top-level `password` is shorthand for password auth.
 
 ## Safety
 
-| Field                                          | Default  | Effect                                                                                       |
-| ---------------------------------------------- | -------- | -------------------------------------------------------------------------------------------- |
-| `readOnly`                                     | false    | No mailbox or message changes, no send.                                                      |
-| `allowSend`                                    | true     | `false` blocks every SMTP submission tool.                                                   |
-| `allowDelete`                                  | true     | `false` blocks delete, move, and mailbox deletion.                                           |
-| `allowPermanentDelete`                         | false    | `true` allows expunge and permanent UID delete.                                              |
-| `recipientDomainAllowList`                     | empty    | Empty allows every domain. Otherwise recipients must match a listed domain or its subdomain. |
-| `sendRateLimit`                                | unset    | Sliding window, `max` messages per `windowMs`.                                               |
-| `appendSent`                                   | `"auto"` | `true` always APPEND to Sent, `false` never, `"auto"` skips Gmail.                           |
-| `sentMailbox`, `trashMailbox`, `draftsMailbox` | unset    | Override special-use resolution.                                                             |
-| `attachmentsDir`                               | unset    | When set, `savePath` must stay inside this directory.                                        |
+| Field                                          | Default  | Effect                                                                                            |
+| ---------------------------------------------- | -------- | ------------------------------------------------------------------------------------------------- |
+| `readOnly`                                     | false    | No mailbox or message changes, no send.                                                           |
+| `allowSend`                                    | true     | `false` blocks every SMTP submission tool.                                                        |
+| `allowDelete`                                  | true     | `false` blocks delete, move, and mailbox deletion.                                                |
+| `allowPermanentDelete`                         | false    | `true` allows expunge and permanent UID delete.                                                   |
+| `recipientDomainAllowList`                     | empty    | Empty allows every domain. Otherwise recipients must match a listed domain or its subdomain.      |
+| `sendRateLimit`                                | unset    | Sliding window, `max` messages per `windowMs`.                                                    |
+| `appendSent`                                   | `"auto"` | `true` always APPEND to Sent, `false` never, `"auto"` skips Gmail.                                |
+| `sentMailbox`, `trashMailbox`, `draftsMailbox` | unset    | Override special-use resolution.                                                                  |
+| `attachmentsDir`                               | unset    | Required for `savePath` writes and attachment `path` reads. Both must stay inside this directory. |
 
 `readOnly` together with `allowPermanentDelete` is rejected at startup.
 

@@ -39,7 +39,7 @@ export function renderToolsMarkdown(): string {
     '',
     `The server registers ${TOOLS.length} tools. A tool that mutates mail or sends it is omitted only when every configured account forbids that class of operation. Calls are still checked against the selected account.`,
     '',
-    'Results are JSON in `structuredContent` plus a text rendering. Errors use `isError: true` and a `structuredContent.error.code` from this set:',
+    'Results are JSON in `structuredContent` plus a text rendering. Errors use `isError: true` and text only, shaped as `CODE: message` with an optional `Hint:` line. There is no structured error object. Codes:',
     '',
     '`AUTH_FAILED`, `TLS_FAILED`, `NOT_FOUND`, `UIDVALIDITY_CHANGED`, `CAPABILITY_UNSUPPORTED`, `PERMISSION_DENIED`, `SIZE_LIMIT`, `TIMEOUT`, `RATE_LIMITED`, `CONFIG_ERROR`, `PROTOCOL_ERROR`, `CONNECTION_FAILED`, `INVALID_ARGUMENT`.',
     '',

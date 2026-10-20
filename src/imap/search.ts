@@ -51,6 +51,18 @@ export interface CompiledSearch {
   requires: SearchCapability[];
 }
 
+/** AND a UID set onto a compiled query. `1:5` and `8:*` are sequence-set text. */
+export function andSearchUid(compiled: CompiledSearch, range: string): CompiledSearch {
+  const query = compiled.query;
+  if (Object.keys(query).length === 1 && query.all === true) {
+    return { query: { uid: range }, requires: [...compiled.requires] };
+  }
+  return {
+    query: { not: { or: [{ not: query }, { not: { uid: range } }] } },
+    requires: [...compiled.requires],
+  };
+}
+
 export function compileSearch(criteria: SearchCriteria | undefined): CompiledSearch {
   if (!criteria || Object.keys(criteria).length === 0 || criteria.all) {
     const onlyAll =

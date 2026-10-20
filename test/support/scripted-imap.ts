@@ -19,6 +19,14 @@ export interface ScriptedOptions {
   /** When set, SELECT reports this UIDVALIDITY after the given number of selects. */
   bumpUidValidityAfter?: number;
   refuseSearch?: boolean;
+  /** BAD any UID SORT whose arguments include this substring. */
+  badSortIncluding?: string;
+  refuseStore?: boolean;
+  /** Answer UID SORT RETURN with an ESEARCH untagged line. */
+  esearchSort?: boolean;
+  /** Answer UNCHANGEDSINCE STORE with a MODIFIED response code. */
+  modifiedStore?: boolean;
+  refuseCopy?: boolean;
 }
 
 /**
@@ -31,6 +39,7 @@ export class ScriptedImap {
   private uidValidity: number;
   private selects = 0;
   private messages: ScriptedMessage[] = [];
+  private readonly copies = new Map<string, ScriptedMessage[]>();
   private nextUid = 1;
   private clients = new Set<Socket>();
   readonly trace: string[] = [];
@@ -138,6 +147,17 @@ export class ScriptedImap {
     return uid;
   }
 
+  /** Messages currently in INBOX or a mailbox created by COPY. */
+  messagesIn(path: string): ScriptedMessage[] {
+    if (path.toUpperCase() === 'INBOX') {
+      return this.messages.map((message) => ({ ...message, flags: [...message.flags] }));
+    }
+    return (this.copies.get(path) ?? []).map((message) => ({
+      ...message,
+      flags: [...message.flags],
+    }));
+  }
+
   async close(): Promise<void> {
     for (const client of this.clients) {
       client.destroy();
@@ -191,6 +211,10 @@ export class ScriptedImap {
       ctx.markTls();
       return;
     }
+    if (command === 'AUTHENTICATE') {
+      no('[AUTHENTICATIONFAILED] authentication failed');
+      return;
+    }
     if (command === 'LOGIN') {
       const user = unquote(argParts[0] ?? '');
       const password = unquote(argParts[1] ?? '');
@@ -237,7 +261,7 @@ export class ScriptedImap {
         bad('QUOTA not supported');
         return;
       }
-      ctx.write('* QUOTA "" (STORAGE 10 100)\r\n');
+      ctx.write('* QUOTA "" (STORAGE 10 100 MESSAGE 1 50)\r\n');
       ok('QUOTA completed');
       return;
     }
@@ -310,13 +334,60 @@ export class ScriptedImap {
       return;
     }
     if (command === 'UID' && args.toUpperCase().startsWith('FETCH')) {
+      const wanted = args.toUpperCase();
+      const section = /BODY(?:\.PEEK)?\[([^\]]*)\]/i.exec(args);
+      const sectionId = section?.[1] ?? '';
+      const sourceWanted = sectionId === '' && Boolean(section);
+      const headerWanted = sectionId.toUpperCase().includes('HEADER');
+      const partWanted = Boolean(section) && !sourceWanted && !headerWanted;
+      const uidFilter = /^\d+$/.test(argParts[1] ?? '') ? Number(argParts[1]) : undefined;
+      let sequence = 0;
       for (const message of this.messages) {
+        sequence += 1;
+        if (uidFilter !== undefined && message.uid !== uidFilter) {
+          continue;
+        }
         const source = Buffer.from(message.raw);
+        const flags = message.flags.join(' ');
+        const common = `UID ${message.uid} FLAGS (${flags}) RFC822.SIZE ${source.length} INTERNALDATE "01-Jan-2026 00:00:00 +0000"`;
+        if (sourceWanted) {
+          const partial = /<(\d+)\.(\d+)>/.exec(args);
+          let payload = source;
+          if (partial?.[1] && partial[2]) {
+            const start = Number(partial[1]);
+            const count = Number(partial[2]);
+            payload = source.subarray(start, start + count);
+          }
+          ctx.write(`* ${sequence} FETCH (${common} BODY[] {${payload.length}}\r\n`);
+          socket.write(payload);
+          socket.write(')\r\n');
+          continue;
+        }
+        if (partWanted) {
+          const body = message.raw.includes('\r\n\r\n')
+            ? message.raw.slice(message.raw.indexOf('\r\n\r\n') + 4)
+            : message.raw;
+          const payload = Buffer.from(body);
+          ctx.write(`* ${sequence} FETCH (${common} BODY[${sectionId}] {${payload.length}}\r\n`);
+          socket.write(payload);
+          socket.write(')\r\n');
+          continue;
+        }
+        if (headerWanted) {
+          const split = message.raw.indexOf('\r\n\r\n');
+          const headers = Buffer.from(split >= 0 ? message.raw.slice(0, split + 4) : message.raw);
+          ctx.write(`* ${sequence} FETCH (${common} BODY[HEADER] {${headers.length}}\r\n`);
+          socket.write(headers);
+          socket.write(')\r\n');
+          continue;
+        }
+        if (wanted.includes('PREVIEW')) {
+          ctx.write(`* ${sequence} FETCH (UID ${message.uid} PREVIEW "preview text")\r\n`);
+          continue;
+        }
         ctx.write(
-          `* ${message.uid} FETCH (UID ${message.uid} FLAGS (${message.flags.join(' ')}) RFC822.SIZE ${source.length} INTERNALDATE "01-Jan-2026 00:00:00 +0000" BODY[] {${source.length}}\r\n`,
+          `* ${sequence} FETCH (${common} ${envelopeOf(message.raw)} BODYSTRUCTURE ("TEXT" "PLAIN" ("CHARSET" "UTF-8") NIL NIL "8BIT" ${source.length} 1))\r\n`,
         );
-        socket.write(source);
-        socket.write('\r\n)\r\n');
       }
       ok('FETCH completed');
       return;
@@ -327,20 +398,80 @@ export class ScriptedImap {
       return;
     }
     if (command === 'UID' && args.toUpperCase().startsWith('SORT')) {
-      ctx.write('* SORT 2 1\r\n');
+      if (
+        this.options.badSortIncluding &&
+        args.toUpperCase().includes(this.options.badSortIncluding.toUpperCase())
+      ) {
+        bad('Unknown sort argument');
+        return;
+      }
+      const uids = this.messages.map((message) => message.uid).join(',');
+      if (this.options.esearchSort && args.toUpperCase().includes('RETURN')) {
+        ctx.write(
+          `* ESEARCH (TAG "${tag}") UID COUNT ${this.messages.length} ALL ${uids || '1'}\r\n`,
+        );
+        ok('SORT completed');
+        return;
+      }
+      ctx.write(`* SORT ${uids.replaceAll(',', ' ')}\r\n`);
       ok('SORT completed');
       return;
     }
     if (command === 'UID' && args.toUpperCase().startsWith('STORE')) {
+      if (this.options.refuseStore) {
+        no('STORE failed');
+        return;
+      }
+      if (this.options.modifiedStore && args.toUpperCase().includes('UNCHANGEDSINCE')) {
+        ok('[MODIFIED 1] STORE completed');
+        return;
+      }
+      const uid = Number(argParts[1]);
+      const message = this.messages.find((item) => item.uid === uid);
+      if (message) {
+        const flags = flagsIn(args);
+        const upper = args.toUpperCase();
+        if (upper.includes('-FLAGS')) {
+          message.flags = message.flags.filter((flag) => !flags.includes(flag));
+        } else if (upper.includes('+FLAGS')) {
+          for (const flag of flags) {
+            if (!message.flags.includes(flag)) {
+              message.flags.push(flag);
+            }
+          }
+        } else if (flags.length > 0) {
+          message.flags = flags;
+        }
+      }
       ok('STORE completed');
       return;
     }
-    if (command === 'UID' && /COPY|MOVE/.test(args.toUpperCase())) {
-      if (args.toUpperCase().includes('MOVE') && !ctx.capabilities.includes('MOVE')) {
+    if (command === 'UID' && args.toUpperCase().includes('COPY')) {
+      if (this.options.refuseCopy) {
+        no('COPY failed');
+        return;
+      }
+      const uid = Number(argParts[1]);
+      const destination = unquote(argParts[argParts.length - 1] ?? '');
+      const source = this.messages.find((item) => item.uid === uid);
+      if (!source || !destination) {
+        no('COPY failed');
+        return;
+      }
+      const copied = this.copies.get(destination) ?? [];
+      const newUid = this.nextUid;
+      this.nextUid += 1;
+      copied.push({ uid: newUid, raw: source.raw, flags: [...source.flags] });
+      this.copies.set(destination, copied);
+      ok(`[COPYUID ${this.uidValidity} ${uid} ${newUid}] COPY completed`);
+      return;
+    }
+    if (command === 'UID' && args.toUpperCase().includes('MOVE')) {
+      if (!ctx.capabilities.includes('MOVE')) {
         bad('MOVE not supported');
         return;
       }
-      ok('COPY completed');
+      ok('MOVE completed');
       return;
     }
     if (command === 'APPEND') {
@@ -355,13 +486,22 @@ export class ScriptedImap {
         return;
       }
       ctx.write('+ idling\r\n');
+      const poke = setTimeout(() => {
+        ctx.write('* 1 EXISTS\r\n');
+      }, 40);
       const onData = (chunk: Buffer): void => {
         if (chunk.toString('utf8').toUpperCase().includes('DONE')) {
+          clearTimeout(poke);
           socket.off('data', onData);
           ok('IDLE completed');
         }
       };
       socket.on('data', onData);
+      return;
+    }
+    if (command === 'EXPUNGE') {
+      this.messages = this.messages.filter((message) => !message.flags.includes('\\Deleted'));
+      ok('EXPUNGE completed');
       return;
     }
     if (
@@ -370,18 +510,46 @@ export class ScriptedImap {
       command === 'RENAME' ||
       command === 'SUBSCRIBE' ||
       command === 'UNSUBSCRIBE' ||
-      command === 'CLOSE' ||
-      command === 'EXPUNGE'
+      command === 'CLOSE'
     ) {
       ok(`${command} completed`);
       return;
     }
     if (command === 'UID' && args.toUpperCase().startsWith('EXPUNGE')) {
+      const uid = Number(argParts[1]);
+      this.messages = this.messages.filter((message) => message.uid !== uid);
       ok('EXPUNGE completed');
       return;
     }
     bad(`Unsupported ${command}`);
   }
+}
+
+function envelopeOf(raw: string): string {
+  const subject = headerOf(raw, 'subject') ?? 'message';
+  const from = headerOf(raw, 'from') ?? 'ada@example.com';
+  const address = /([^\s<>]+@[^\s<>]+)/.exec(from)?.[1] ?? 'ada@example.com';
+  const [local, domain] = address.split('@');
+  const messageId = headerOf(raw, 'message-id') ?? '<m@example.com>';
+  const date = '01-Jan-2026 00:00:00 +0000';
+  return `ENVELOPE ("${date}" "${imapQuote(subject)}" (("Ada" NIL "${imapQuote(local ?? 'ada')}" "${imapQuote(domain ?? 'example.com')}")) NIL NIL NIL NIL NIL NIL "${imapQuote(messageId)}")`;
+}
+
+function headerOf(raw: string, name: string): string | undefined {
+  const match = new RegExp(`^${name}:\\s*(.+)$`, 'im').exec(raw);
+  return match?.[1]?.trim();
+}
+
+function imapQuote(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+
+function flagsIn(args: string): string[] {
+  const match = /\(([^)]*)\)/.exec(args);
+  if (!match?.[1]) {
+    return [];
+  }
+  return match[1].split(/\s+/).filter(Boolean);
 }
 
 function quote(value: string): string {

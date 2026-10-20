@@ -170,7 +170,7 @@ jobs:
           node-version: '22'
           package-manager-cache: false
 
-      - name: Bump, commit, and tag
+      - name: Bump and commit
         run: |
           git config user.name "Koray Koska"
           git config user.email "koray@koska.family"
@@ -179,6 +179,14 @@ jobs:
           git add package.json package-lock.json CHANGELOG.md
           version=$(node -p "require('./package.json').version")
           git commit -m "Release ${version}"
-          git tag "v${version}"
-          git push origin HEAD --follow-tags
-          echo "Tagged v${version}. Publish runs only when that tag workflow starts. This job does not stage or publish."
+          git push origin HEAD
+          {
+            echo "Bumped to ${version} and pushed that commit. This job does not create or push a tag, and it does not stage or publish."
+            echo
+            echo "A push made with GITHUB_TOKEN does not start the tag workflow. After this commit is on the default branch, tag it locally and push the tag with credentials that can start Actions:"
+            echo
+            echo '```'
+            echo "git tag v${version}"
+            echo "git push origin v${version}"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
