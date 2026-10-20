@@ -84,7 +84,7 @@ const ROUTING_HEADER_NAMES = new Set([
 
 /**
  * Trailing tokens that make an X- name an address header. Compared after the
- * name is split on "-", "_", and camelCase boundaries.
+ * name is lowercased and split on "-" and "_". CamelCase is not a boundary.
  */
 const ADDRESS_BEARING_NAMES = new Set([
   'to',
@@ -92,14 +92,18 @@ const ADDRESS_BEARING_NAMES = new Set([
   'sender',
   'cc',
   'bcc',
+  'recipient',
   'reply-to',
   'errors-to',
   'return-path',
+  'rcpt-to',
   'delivered-to',
   'apparently-to',
   'apparently-from',
   'original-from',
+  'original-sender',
   'original-to',
+  'original-recipient',
   'receipt-to',
   'read-receipt-to',
   'return-receipt-to',
@@ -117,8 +121,8 @@ const ADDRESS_BEARING_NAMES = new Set([
 const X_DENY_TOKENS = new Set(['resent', 'envelope', 'rcpt', 'bounce']);
 
 /**
- * Compact suffixes for a single blob: no "-" or "_", and no camelCase boundary.
- * "to" alone is not in this list.
+ * Compact forms of the lowercased name after "-" and "_" are removed.
+ * "to" alone is not a suffix, so X-Notification and X-Photo stay allowed.
  */
 const COMPACT_ADDRESS_SUFFIXES = [
   'apparentlyto',
@@ -129,14 +133,16 @@ const COMPACT_ADDRESS_SUFFIXES = [
   'readingto',
   'returnpath',
   'receiptto',
+  'recipient',
   'errorsto',
   'replyto',
+  'rcptto',
   'sender',
   'mdnto',
   'from',
 ];
 
-const CAMEL_BOUNDARY = /(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])/;
+const COMPACT_CONTAINS = ['resent', 'envelope', 'rcpt', 'bounce'] as const;
 
 const STRUCTURED_FIELD: Record<string, string> = {
   from: 'from',
@@ -201,15 +207,20 @@ function headerHint(name: string): string {
   const canonical = canonicalHeaderName(name);
   if (canonical.startsWith('x-') && routingHeaderDenied(name)) {
     return (
-      'An X- header is rejected when the tokens after X- (split on "-", "_", and camelCase) ' +
-      'end with an address-bearing header (to, from, sender, cc, bcc, reply-to, errors-to, ' +
-      'return-path, delivered-to, apparently-to, apparently-from, original-from, original-to, ' +
+      'An X- header is lowercased first and split on "-" and "_", never on camelCase. ' +
+      'Trailing digits are stripped from the last token. It is rejected when that token is ' +
+      'to, from, sender, cc, bcc, or recipient, when the trailing tokens are an address-bearing ' +
+      'name (reply-to, errors-to, return-path, rcpt-to, delivered-to, apparently-to, ' +
+      'apparently-from, original-from, original-sender, original-to, original-recipient, ' +
       'receipt-to, read-receipt-to, return-receipt-to, notification-to, ' +
       'disposition-notification-to, confirm-reading-to, reading-to, mdn-to, mail-followup-to, ' +
       'followup-to, mail-reply-to), or when any token is resent, envelope, rcpt, or bounce. ' +
-      'A name with no separator and no camelCase is also rejected when it ends with from, sender, ' +
-      'replyto, errorsto, returnpath, deliveredto, receiptto, notificationto, readingto, mdnto, ' +
-      'apparentlyto, followupto, or originalto. Other X-* headers are allowed.'
+      'The lowercased name with "-" and "_" and trailing digits removed is always rejected when ' +
+      'it ends with from, sender, recipient, replyto, errorsto, returnpath, deliveredto, ' +
+      'receiptto, notificationto, readingto, mdnto, apparentlyto, followupto, originalto, or ' +
+      'rcptto, or when it contains resent, envelope, rcpt, or bounce. Names such as ' +
+      'X-Report-Abuse-To, X-Complaint-To, X-Authenticated-Sender, and X-Forwarded-To are ' +
+      'rejected on purpose. Other X-* headers are allowed.'
     );
   }
   const field = STRUCTURED_FIELD[canonical];
@@ -225,11 +236,12 @@ export function isFieldName(name: string): boolean {
 
 /**
  * True when `name` is a routing or receipt header, or an X- alias of one.
- * Tokens are taken from the original spelling so a camelCase boundary survives.
+ * The name is lowercased before it is split. CamelCase is not a boundary.
  * A trailing token sequence that equals an address-bearing header name is denied.
- * Any token equal to resent, envelope, rcpt, or bounce is denied. A name with no
- * separator and no camelCase is denied when its compact form ends with an address
- * suffix such as from or mdnto. X-Sender-IP and X-Notification are not denied.
+ * Any token equal to resent, envelope, rcpt, or bounce is denied. The compact
+ * form (separators and trailing digits removed) is always checked as well.
+ * X-Sender-IP and X-Notification are not denied. X-Report-Abuse-To is denied
+ * because its last token is an address token; that over-block is intentional.
  */
 export function routingHeaderDenied(name: string): boolean {
   const canonical = canonicalHeaderName(name);
@@ -246,33 +258,18 @@ export function routingHeaderDenied(name: string): boolean {
   if (!remainder || routingNameDenied(remainder)) {
     return true;
   }
-  return xHeaderTokensDenied(name);
+  return xHeaderDenied(canonical);
 }
 
-function xHeaderTokensDenied(original: string): boolean {
-  const cleaned = original.replace(HEADER_NAME_JUNK, '');
-  let rest = cleaned;
-  while (/^x[-_]/i.test(rest)) {
+function xHeaderDenied(canonical: string): boolean {
+  let rest = canonical;
+  while (rest.startsWith('x-') || rest.startsWith('x_')) {
     rest = rest.slice(2);
   }
-  if (!rest) {
-    return true;
-  }
-  const separated = /[-_]/.test(rest);
-  const tokens: string[] = [];
-  let camel = false;
-  for (const piece of rest.split(/[-_]+/)) {
-    if (!piece) {
-      continue;
-    }
-    const parts = piece.split(CAMEL_BOUNDARY).filter((part) => part.length > 0);
-    if (parts.length > 1) {
-      camel = true;
-    }
-    for (const part of parts) {
-      tokens.push(part.toLowerCase());
-    }
-  }
+  const pieces = rest.split(/[-_]+/).filter((piece) => piece.length > 0);
+  const tokens = pieces.map((piece, index) =>
+    index === pieces.length - 1 ? piece.replace(/\d+$/, '') : piece,
+  );
   if (tokens.length === 0) {
     return true;
   }
@@ -284,11 +281,11 @@ function xHeaderTokensDenied(original: string): boolean {
       return true;
     }
   }
-  if (!separated && !camel) {
-    const compact = tokens.join('');
-    return COMPACT_ADDRESS_SUFFIXES.some((suffix) => compact.endsWith(suffix));
+  const compact = canonical.replace(/[-_]/g, '').replace(/\d+$/, '');
+  if (COMPACT_CONTAINS.some((token) => compact.includes(token))) {
+    return true;
   }
-  return false;
+  return COMPACT_ADDRESS_SUFFIXES.some((suffix) => compact.endsWith(suffix));
 }
 
 function routingNameDenied(name: string): boolean {

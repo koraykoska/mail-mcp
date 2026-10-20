@@ -124,8 +124,11 @@ export function domainOf(address: string): string {
   return at >= 0 ? ascii.slice(at + 1).toLowerCase() : '';
 }
 
+/** RFC 5322 specials. A display name that contains one is quoted so it survives parsing. */
+const RFC5322_SPECIAL = /[()<>[\]:;@\\,"]/;
+
 function needsQuotes(name: string): boolean {
-  return name.includes('"') || name.includes(',') || name.includes('<') || name.includes('>');
+  return RFC5322_SPECIAL.test(name);
 }
 
 function escapeQuoted(name: string): string {

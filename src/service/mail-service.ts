@@ -74,7 +74,6 @@ import type {
   MailboxInfo,
   MessageSummary,
   OpenMailbox,
-  ThreadIdRow,
 } from '../imap/session.js';
 import {
   formatAddress,
@@ -1510,6 +1509,8 @@ export class MailService {
               special.inbox ?? 'INBOX',
             ]);
       let messages: ConversationMessage[];
+      let outsideMessages: ConversationMessage[] = [];
+      let walkedOutside = false;
       let rounds = 0;
       let truncated: boolean;
       if (cursor?.keys) {
@@ -1527,8 +1528,11 @@ export class MailService {
             maxMessages,
             maxRounds,
             search: (folder, ids) => this.searchHeaderIds(session, folder, ids),
+            outside: (ids) => this.outsideMessages(account.id, session, paths, ids),
           });
           messages = closed.messages;
+          outsideMessages = closed.outside;
+          walkedOutside = true;
           rounds = closed.rounds;
           truncated = closed.truncated;
         }
@@ -1548,16 +1552,9 @@ export class MailService {
         special.archive ?? '',
       ];
       messages = dedupeMessages(messages, prefer);
-      const threadIds = messages.flatMap((item) => {
-        const id = normalizeMessageId(item.messageId);
-        return id ? [id] : [];
-      });
-      const seedId = normalizeMessageId(seed.messageId);
-      if (seedId) {
-        threadIds.push(seedId);
-      }
-      const excludedMatches = seeded.mentions
-        ? excludedFromMentions(seeded.mentions, paths, threadIds)
+      const threadIds = threadIdSet(messages, seed);
+      const excludedMatches = walkedOutside
+        ? excludedFromMentions(mentionsByMailbox(outsideMessages), paths, threadIds)
         : await this.excludedFolderHits(account.id, session, paths, threadIds);
       if (cursor) {
         messages = messages.filter((item) => {
@@ -2511,8 +2508,6 @@ export class MailService {
     seed: ConversationMessage;
     matchedMailboxes: string[];
     folderHits: Array<{ mailbox: string; count: number }>;
-    /** Messages found while resolving a Message-ID with no folder limit, keyed by mailbox. */
-    mentions: Map<string, ConversationMessage[]> | null;
   }> {
     if (input.uid !== undefined && input.mailbox) {
       const seed = await session.withMailbox(input.mailbox, 'read', async (box) => {
@@ -2522,27 +2517,25 @@ export class MailService {
       });
       const matched = [seed.mailbox];
       const seedId = normalizeMessageId(seed.messageId);
-      let mentions: Map<string, ConversationMessage[]> | null = null;
       if (seedId && input.folders === undefined) {
         const listed = await session.listMailboxes();
         const special = await this.special(account, session);
         const excluded = new Set(
-          [special.trash, special.junk].filter((item): item is string => Boolean(item)),
+          [special.trash, special.junk, seed.mailbox].filter((item): item is string =>
+            Boolean(item),
+          ),
         );
         const selectable = listed
-          .filter((mailbox) => mailboxSelectable(mailbox))
+          .filter((mailbox) => mailboxSelectable(mailbox) && !excluded.has(mailbox.path))
           .map((mailbox) => mailbox.path);
-        mentions = await this.scanMentions(account.id, session, selectable);
-        for (const [mailbox, found] of mentions) {
-          if (mailbox === seed.mailbox || excluded.has(mailbox)) {
-            continue;
-          }
+        const copies = await this.scanHeaderHits(account.id, session, selectable, [seedId]);
+        for (const [mailbox, found] of copies) {
           if (found.some((item) => normalizeMessageId(item.messageId) === seedId)) {
             matched.push(mailbox);
           }
         }
       }
-      return { seed, matchedMailboxes: uniquePaths(matched), folderHits: [], mentions };
+      return { seed, matchedMailboxes: uniquePaths(matched), folderHits: [] };
     }
     const id = normalizeMessageId(input.messageId);
     if (!id) {
@@ -2563,25 +2556,10 @@ export class MailService {
     const excludedHits: ConversationMessage[] = [];
     const matchedMailboxes: string[] = [];
     const folderHits: Array<{ mailbox: string; count: number }> = [];
-    const mentions =
-      input.folders === undefined ? await this.scanMentions(account.id, session, candidates) : null;
-    const scanned = mentions ?? new Map<string, ConversationMessage[]>();
-    if (!mentions) {
-      for (const mailbox of candidates) {
-        const found = await this.searchHeaderIds(session, mailbox, [id]);
-        if (found.length > 0) {
-          scanned.set(mailbox, found);
-        }
-      }
-    }
-    const seedIds = new Set([id]);
+    const scanned = await this.scanHeaderHits(account.id, session, candidates, [id]);
     for (const [mailbox, found] of scanned) {
-      const mentioned = found.filter((item) => headerMentions(item, seedIds));
-      if (mentioned.length === 0) {
-        continue;
-      }
-      folderHits.push({ mailbox, count: mentioned.length });
-      const exact = mentioned.filter((item) => normalizeMessageId(item.messageId) === id);
+      folderHits.push({ mailbox, count: found.length });
+      const exact = found.filter((item) => normalizeMessageId(item.messageId) === id);
       if (exact.length === 0) {
         continue;
       }
@@ -2590,31 +2568,21 @@ export class MailService {
         continue;
       }
       matchedMailboxes.push(mailbox);
-      // The index rows are ids only. The seed has to be a full message so the
-      // closure keeps subjects and addresses.
-      openHits.push(
-        ...(mentions
-          ? await this.loadConversations(
-              session,
-              mailbox,
-              exact.map((item) => item.uid),
-            )
-          : exact),
-      );
+      openHits.push(...exact);
     }
     if (openHits.length === 0) {
-      if (excludedHits.length === 0) {
+      const excludedHit = excludedHits[0];
+      if (!excludedHit) {
         throw new MailError(
           'NOT_FOUND',
           `No message with Message-ID ${input.messageId} was found.`,
         );
       }
-      // Walk the default scope with this id. The Trash or Junk copy stays out of items.
+      // Walk both directions from the excluded copy's ids. The copy stays out of items.
       return {
-        seed: closureSeed(excludedHits[0]?.messageId ?? input.messageId ?? ''),
+        seed: closureSeed(excludedHit),
         matchedMailboxes: [],
         folderHits,
-        mentions,
       };
     }
     const seed = [...openHits].sort((left, right) => {
@@ -2639,7 +2607,6 @@ export class MailService {
       seed,
       matchedMailboxes: uniquePaths(matchedMailboxes),
       folderHits,
-      mentions,
     };
   }
 
@@ -2715,23 +2682,42 @@ export class MailService {
     const mailboxes = listed
       .filter((mailbox) => mailboxSelectable(mailbox) && !inScope.has(mailbox.path))
       .map((mailbox) => mailbox.path);
-    const mentions = await this.scanMentions(accountId, session, mailboxes);
+    const mentions = await this.scanHeaderHits(accountId, session, mailboxes, wanted);
     return excludedFromMentions(mentions, paths, wanted);
   }
 
+  /** Out-of-scope hits for one walk round. Ids from these messages extend the closure. */
+  private async outsideMessages(
+    accountId: string,
+    session: ImapSession,
+    paths: readonly string[],
+    ids: readonly string[],
+  ): Promise<ConversationMessage[]> {
+    const inScope = new Set(paths);
+    const listed = await session.listMailboxes();
+    const mailboxes = listed
+      .filter((mailbox) => mailboxSelectable(mailbox) && !inScope.has(mailbox.path))
+      .map((mailbox) => mailbox.path);
+    const mentions = await this.scanHeaderHits(accountId, session, mailboxes, ids);
+    return [...mentions.values()].flat();
+  }
+
   /**
-   * Read threading ids for every message in `mailboxes`.
-   * One header fetch per mailbox, shared with a free pool session.
-   * A HEADER search scans each message again for every id, which does not
-   * finish inside the account timeout once a server has many mailboxes.
-   * Callers filter the rows. An empty mailbox is not fetched.
+   * UID SEARCH for threading ids, then fetch only the hits.
+   * An empty mailbox is not searched. More than eight mailboxes share the work
+   * with a free pool session and two short-lived connections.
    */
-  private async scanMentions(
+  private async scanHeaderHits(
     accountId: string,
     primary: ImapSession,
     mailboxes: readonly string[],
+    ids: readonly string[],
   ): Promise<Map<string, ConversationMessage[]>> {
     const found = new Map<string, ConversationMessage[]>();
+    if (mailboxes.length === 0) {
+      return found;
+    }
+    const wanted = [...new Set(ids.map((item) => normalizeMessageId(item)).filter(Boolean))];
     const queue = [...mailboxes];
     let next = 0;
     const take = (): string | undefined => {
@@ -2748,14 +2734,14 @@ export class MailService {
         if (!mailbox) {
           return;
         }
-        const messages = await this.readIdIndex(workerSession, mailbox);
-        if (messages.length > 0) {
-          found.set(mailbox, messages);
+        const hit = await this.readHeaderHits(workerSession, mailbox, wanted);
+        if (hit.messages.length > 0) {
+          found.set(mailbox, hit.messages);
         }
       }
     };
-    // Two pooled sessions are not enough once a server has a hundred mailboxes:
-    // each one is a SELECT plus a header fetch, and the whole tool call has to
+    // Two pooled sessions are not enough once a server has a hundred mailboxes.
+    // Each one is a SELECT plus a UID SEARCH, and the whole tool call has to
     // finish inside the account timeout. Extra sessions are closed afterwards.
     const parallel = mailboxes.length > 8;
     await Promise.all([
@@ -2769,31 +2755,6 @@ export class MailService {
         : []),
     ]);
     return found;
-  }
-
-  private async readIdIndex(session: ImapSession, folder: string): Promise<ConversationMessage[]> {
-    return session.withMailbox(folder, 'read', async (box) => {
-      if (box.exists === 0) {
-        return [];
-      }
-      const rows = await box.fetchIdIndex();
-      return rows.map((row) => indexMessage(folder, box.uidValidity, row));
-    });
-  }
-
-  private async loadConversations(
-    session: ImapSession,
-    folder: string,
-    uids: readonly number[],
-  ): Promise<ConversationMessage[]> {
-    return session.withMailbox(folder, 'read', async (box) => {
-      const summaries = await box.fetchSummaries([...uids], { snippet: true, snippetChars: 160 });
-      const messages: ConversationMessage[] = [];
-      for (const summary of summaries) {
-        messages.push(await this.conversationFrom(box, summary, folder, 'header'));
-      }
-      return messages;
-    });
   }
 
   private async searchHeaderIds(
@@ -3352,13 +3313,14 @@ function publicHeaders(parsed: ParsedMessage): Record<string, unknown> {
   };
 }
 
-function closureSeed(messageId: string): ConversationMessage {
+function closureSeed(source: ConversationMessage): ConversationMessage {
   return {
     mailbox: '',
     uid: 0,
     uidValidity: '',
-    messageId,
-    references: [],
+    messageId: source.messageId,
+    inReplyTo: source.inReplyTo,
+    references: source.references,
     from: [],
     to: [],
     cc: [],
@@ -3660,28 +3622,6 @@ function withCursorKeys(cursor: string | null, keys: readonly string[]): string 
   return encodeSnapshotCursor({ ...decoded, keys: [...keys] });
 }
 
-function indexMessage(folder: string, uidValidity: string, row: ThreadIdRow): ConversationMessage {
-  const message: ConversationMessage = {
-    mailbox: folder,
-    uid: row.uid,
-    uidValidity,
-    references: row.references,
-    from: [],
-    to: [],
-    cc: [],
-    flags: [],
-    hasAttachments: false,
-    linked: 'header',
-  };
-  if (row.messageId) {
-    message.messageId = row.messageId;
-  }
-  if (row.inReplyTo) {
-    message.inReplyTo = row.inReplyTo;
-  }
-  return message;
-}
-
 function headerMentions(message: ConversationMessage, wanted: ReadonlySet<string>): boolean {
   return mentionIds(message).some((token) => wanted.has(token));
 }
@@ -3690,6 +3630,32 @@ function mentionIds(message: ConversationMessage): string[] {
   return [message.messageId, message.inReplyTo, ...message.references]
     .map((item) => normalizeMessageId(item))
     .filter((item) => item.length > 0);
+}
+
+/** Item ids, ids those items cite, and the seed's own ids. */
+function threadIdSet(
+  messages: readonly ConversationMessage[],
+  seed: ConversationMessage,
+): string[] {
+  const ids = new Set<string>();
+  for (const message of [...messages, seed]) {
+    for (const id of mentionIds(message)) {
+      ids.add(id);
+    }
+  }
+  return [...ids];
+}
+
+function mentionsByMailbox(
+  messages: readonly ConversationMessage[],
+): Map<string, ConversationMessage[]> {
+  const grouped = new Map<string, ConversationMessage[]>();
+  for (const message of messages) {
+    const list = grouped.get(message.mailbox) ?? [];
+    list.push(message);
+    grouped.set(message.mailbox, list);
+  }
+  return grouped;
 }
 
 function excludedFromMentions(

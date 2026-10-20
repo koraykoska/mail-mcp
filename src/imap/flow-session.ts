@@ -37,7 +37,6 @@ import {
   type MessageSummary,
   type OpenMailbox,
   type QuotaInfo,
-  type ThreadIdRow,
   type ServerSortResult,
   type StatusInfo,
   type WaitResult,
@@ -762,35 +761,6 @@ class FlowMailbox implements OpenMailbox {
     if (modseq) {
       this.highestModseq = modseq;
     }
-  }
-
-  async fetchIdIndex(): Promise<ThreadIdRow[]> {
-    const rows = await this.client.fetchAll(
-      '1:*',
-      {
-        uid: true,
-        headers: ['MESSAGE-ID', 'REFERENCES', 'IN-REPLY-TO'],
-      },
-      { uid: true },
-    );
-    return rows.map((row) => {
-      const summary: MessageSummary = {
-        uid: row.uid,
-        flags: [],
-        from: [],
-        to: [],
-        cc: [],
-        replyTo: [],
-        hasAttachments: false,
-      };
-      applyThreadingHeaders(summary, (row as { headers?: Buffer | string }).headers);
-      return {
-        uid: row.uid,
-        references: summary.references ?? [],
-        messageId: summary.messageId,
-        inReplyTo: summary.inReplyTo,
-      };
-    });
   }
 
   async search(compiled: CompiledSearch): Promise<number[]> {

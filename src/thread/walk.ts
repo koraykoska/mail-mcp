@@ -195,8 +195,11 @@ function overlaps(left: Set<string>, right: Set<string>): boolean {
 
 /**
  * Header closure. `search` returns messages in one folder whose Message-ID,
- * References, or In-Reply-To contains one of the ids. The walk repeats until
- * no new ids appear or a bound is hit.
+ * References, or In-Reply-To contains one of the ids. `outside` returns
+ * out-of-scope messages for the same ids. Those messages contribute ids and
+ * are returned for excluded counts; they are not items and do not use a cap
+ * slot. The walk repeats until no new ids appear or a bound is hit.
+ * A placeholder seed (empty mailbox, uid 0) records its ids without using a slot.
  */
 export async function closeByHeaders(options: {
   seed: ConversationMessage;
@@ -204,26 +207,39 @@ export async function closeByHeaders(options: {
   maxMessages: number;
   maxRounds: number;
   search: (folder: string, ids: readonly string[]) => Promise<ConversationMessage[]>;
-}): Promise<{ messages: ConversationMessage[]; rounds: number; truncated: boolean }> {
+  outside?: (ids: readonly string[]) => Promise<ConversationMessage[]>;
+}): Promise<{
+  messages: ConversationMessage[];
+  outside: ConversationMessage[];
+  rounds: number;
+  truncated: boolean;
+}> {
   const byKey = new Map<string, ConversationMessage>();
   const known = new Set<string>();
   const searched = new Set<string>();
   const counted = new Set<string>();
+  const outsideMessages: ConversationMessage[] = [];
+  const outsideSeen = new Set<string>();
   let truncated = false;
   const remember = (message: ConversationMessage): void => {
     const key = messageKey(message);
     if (byKey.has(key)) {
       return;
     }
-    // Copies of one Message-ID are one message. The cap is applied after that,
-    // so a second folder does not consume a slot and hide a different message.
-    const id = normalizeMessageId(message.messageId);
-    const capKey = id || key;
-    if (!counted.has(capKey) && counted.size >= options.maxMessages) {
-      truncated = true;
-      return;
+    // The Trash/Junk placeholder is not an item. Counting it would hide the
+    // last in-scope message under the cap, and the scope filter drops it later.
+    const placeholder = message.mailbox === '' && message.uid === 0;
+    if (!placeholder) {
+      // Copies of one Message-ID are one message. The cap is applied after that,
+      // so a second folder does not consume a slot and hide a different message.
+      const id = normalizeMessageId(message.messageId);
+      const capKey = id || key;
+      if (!counted.has(capKey) && counted.size >= options.maxMessages) {
+        truncated = true;
+        return;
+      }
+      counted.add(capKey);
     }
-    counted.add(capKey);
     byKey.set(key, { ...message, linked: message.linked || 'header' });
     for (const id of idsOf(message)) {
       known.add(id);
@@ -249,11 +265,25 @@ export async function closeByHeaders(options: {
         }
       }
     }
+    if (!options.outside) {
+      continue;
+    }
+    const found = await options.outside(pending);
+    for (const message of found) {
+      const key = messageKey(message);
+      if (!outsideSeen.has(key)) {
+        outsideSeen.add(key);
+        outsideMessages.push(message);
+      }
+      for (const id of idsOf(message)) {
+        known.add(id);
+      }
+    }
   }
   if ([...known].some((id) => !searched.has(id))) {
     truncated = true;
   }
-  return { messages: [...byKey.values()], rounds, truncated };
+  return { messages: [...byKey.values()], outside: outsideMessages, rounds, truncated };
 }
 
 /** Add messages that share a normalized subject and at least one participant. Opt-in only. */

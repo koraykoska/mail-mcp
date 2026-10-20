@@ -116,14 +116,6 @@ export interface ServerSortResult {
   partial: boolean;
 }
 
-/** Message-ID, In-Reply-To, and References for one stored message. */
-export interface ThreadIdRow {
-  uid: number;
-  messageId?: string;
-  inReplyTo?: string;
-  references: string[];
-}
-
 export interface OpenMailbox {
   path: string;
   uidValidity: string;
@@ -131,11 +123,6 @@ export interface OpenMailbox {
   exists: number;
   highestModseq?: string;
   search(compiled: CompiledSearch): Promise<number[]>;
-  /**
-   * Every message's threading ids in one fetch.
-   * A HEADER search repeats a full scan for each id; this reads each message once.
-   */
-  fetchIdIndex(): Promise<ThreadIdRow[]>;
   fetchSummaries(
     uids: number[],
     options: { snippet: boolean; snippetChars: number },
