@@ -3,7 +3,10 @@ import { clearTokenCache, getAccessToken } from '../../src/auth/oauth.js';
 import { htmlToRoughText } from '../../src/mime/snippet.js';
 import { findTextPart } from '../../src/mime/parse.js';
 import { sortMessages } from '../../src/imap/sort.js';
-import { decodeBody } from '../../src/charset.js';
+import { decodeBody, encodeBody } from '../../src/charset.js';
+import { parseJsonc } from '../../src/config/jsonc.js';
+import { SlidingWindowLimiter } from '../../src/rate-limit.js';
+import { makeSnippet } from '../../src/mime/snippet.js';
 import { redactValue } from '../../src/redact.js';
 import { headerValue } from '../../src/mime/headers.js';
 import { replySubject, forwardSubject } from '../../src/mime/subject.js';
@@ -47,6 +50,14 @@ describe('edges', () => {
       ).map((item) => item.uid),
     ).toEqual([2, 3, 1]);
     expect(decodeBody(Buffer.from('h'), '')).toBe('h');
+    expect(encodeBody('é', 'latin1').length).toBeGreaterThan(0);
+    expect(encodeBody('x', 'not-a-charset').toString()).toBe('x');
+    expect(makeSnippet('hello world', 5).endsWith('…')).toBe(true);
+    expect(htmlToRoughText('<script>no</script>&#x41;&unknown;')).toContain('A');
+    expect(() => parseJsonc('{', 'bad')).toThrow(/Could not parse/);
+    const limiter = new SlidingWindowLimiter();
+    limiter.consume('k', 0, 1);
+    limiter.reset();
     expect(redactValue(1)).toBe(1);
     expect(headerValue('Subject: hi\n continuation\nFrom: a\n', 'subject')).toContain('hi');
     expect(replySubject('')).toBe('Re:');
