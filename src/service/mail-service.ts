@@ -1232,7 +1232,7 @@ export class MailService {
       assertSearchCapabilities(compiled.requires, (name) => session.hasCapability(name));
       const matched = await box.search(compiled);
       const keys = input.sort ?? [{ field: 'arrival', reverse: true }];
-      let sortSource: 'server' | 'client' | 'uid' = 'uid';
+      let sortSource: 'server' | 'client';
       const limitForPage = clampLimit(
         input.limit,
         account.limits.pageSize,
