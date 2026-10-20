@@ -276,7 +276,7 @@ const cursor = z
   .string()
   .optional()
   .describe(
-    'Opaque cursor from the previous page. It freezes the folder scope, sort, page size, and a snapshot upper UID (uidNext - 1 at the first page) so later arrivals do not shift the walk. The next page starts strictly after the last row in the total order (sort keys, then date, folder, UID). If that row was expunged, the page continues at the first row that sorts after it, so a deletion does not skip the following message. A uidValidity change returns CURSOR_INVALIDATED. An older cursor returns INVALID_ARGUMENT. Omit to start a new snapshot.',
+    'Opaque cursor from the previous page. It freezes the folder scope, sort, page size, and the highest UID the first search returned, so later arrivals do not shift the walk. The next page starts strictly after the last row in the total order (sort keys, then date, folder, UID). If that row was expunged, the page continues at the first row that sorts after it, so a deletion does not skip the following message. A uidValidity change returns CURSOR_INVALIDATED. An older cursor returns INVALID_ARGUMENT. Omit to start a new snapshot.',
   );
 
 const folders = z

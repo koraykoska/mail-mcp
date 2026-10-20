@@ -256,18 +256,6 @@ export function assertCursorFits(
   }
 }
 
-export function upperUidOf(
-  cursor: SnapshotCursor | undefined,
-  mailbox: string,
-  uidNext: number,
-): number {
-  const stored = cursor?.folders.find((item) => item.mailbox === mailbox);
-  if (stored) {
-    return stored.upperUid;
-  }
-  return Math.max(0, uidNext - 1);
-}
-
 export interface PageSlice<T> {
   items: T[];
   nextCursor: string | null;

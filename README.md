@@ -93,7 +93,7 @@ Full argument lists: [docs/TOOLS.md](docs/TOOLS.md).
 
 `order` is `newest-first` (default) or `oldest-first` when `sort` is omitted. When `sort` is set, `order` must agree with the first key. Ties break by date, then folder path (UTF-16 code units), then UID.
 
-The first page records an upper UID of `uidNext - 1` for each folder. Later pages reuse that bound, so mail that arrives afterwards does not shift the walk and is not skipped or duplicated inside it. To see mail that arrived after the snapshot, call again without a cursor. The cursor also freezes the folder scope, the sort, and the page size. A `uidValidity` change returns `CURSOR_INVALIDATED`. A cursor from an older release returns `INVALID_ARGUMENT`. If the last row of a page was expunged, the next page starts at the first row that sorts after it.
+The first page records the highest UID that search returned for each folder. Later pages reuse that bound, so mail that arrives afterwards does not shift the walk and is not skipped or duplicated inside it. To see mail that arrived after the snapshot, call again without a cursor. The cursor also freezes the folder scope, the sort, and the page size. A `uidValidity` change returns `CURSOR_INVALIDATED`. A cursor from an older release returns `INVALID_ARGUMENT`. If the last row of a page was expunged, the next page starts at the first row that sorts after it.
 
 `snapshot.folders` reports `scanned`, `omitted`, and `truncated` per folder when a cap cuts the scan.
 

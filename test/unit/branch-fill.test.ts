@@ -146,14 +146,14 @@ describe('remaining service and helper branches', () => {
       JSON.stringify({ v: 2, afterUid: 1, uidValidity: '100' }),
       'utf8',
     ).toString('base64url');
-    const empty = await paged.service.listMessages({
-      mailbox: 'INBOX',
-      limit: 2,
-      cursor,
-      includeSnippet: false,
-    });
-    expect(empty.messages).toEqual([]);
-    expect(empty.total).toBe(1);
+    await expect(
+      paged.service.listMessages({
+        mailbox: 'INBOX',
+        limit: 2,
+        cursor,
+        includeSnippet: false,
+      }),
+    ).rejects.toMatchObject({ code: 'INVALID_ARGUMENT' });
   });
 
   it('rejects an oversized reported size, a missing source, and trash edges', async () => {

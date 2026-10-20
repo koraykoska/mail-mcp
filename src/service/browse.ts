@@ -20,7 +20,6 @@ import {
   scopeKey,
   snapshotPayload,
   sortKeysFor,
-  upperUidOf,
   type PageOrder,
   type PageRow,
   type SnapshotCursor,
@@ -122,20 +121,44 @@ export async function scanFolders(
           'List the mailbox again. UIDs from the previous session are not safe to use.',
         );
       }
-      const upperUid = upperUidOf(options.cursor, mailbox, box.uidNext);
+      const storedUpper = options.cursor?.folders.find(
+        (item) => item.mailbox === mailbox,
+      )?.upperUid;
+      if (storedUpper !== undefined && storedUpper < 1) {
+        return emptyScan(mailbox, box, storedUpper);
+      }
+      // A fresh page searches every current UID and freezes the highest one.
+      // Later pages reuse that bound, so mail that arrives afterwards stays out.
+      // The bound is the highest UID the search returned, not a cached UIDNEXT:
+      // a stale UIDNEXT would drop the newest message.
+      const range = storedUpper === undefined ? '1:*' : `1:${storedUpper}`;
+      const ranged = andSearchUid(options.compiled, range);
+      const found = (await box.search(ranged)).filter((uid) =>
+        storedUpper === undefined ? true : uid <= storedUpper,
+      );
+      const upperUid =
+        storedUpper ?? found.reduce((highest, uid) => (uid > highest ? uid : highest), 0);
       if (upperUid < 1) {
         return emptyScan(mailbox, box, upperUid);
       }
-      const ranged = andSearchUid(options.compiled, `1:${upperUid}`);
-      const matched = (await box.search(ranged)).filter((uid) => uid <= upperUid);
+      const matched = found.filter((uid) => uid <= upperUid);
       const canSort = session.hasCapability('SORT');
       let serverUids: number[] | undefined;
       if (canSort && matched.length > 0) {
-        const sorted = await box.serverSort(ranged, [...options.keys]);
-        if (sorted && !sorted.partial) {
-          const allow = new Set(matched);
-          serverUids = sorted.uids.filter((uid) => allow.has(uid) && uid <= upperUid);
-          sortSource = paths.length === 1 ? 'server' : sortSource;
+        try {
+          const sorted = await box.serverSort(ranged, [...options.keys]);
+          if (sorted && !sorted.partial) {
+            const allow = new Set(matched);
+            serverUids = sorted.uids.filter((uid) => allow.has(uid) && uid <= upperUid);
+            sortSource = paths.length === 1 ? 'server' : sortSource;
+          }
+        } catch (error) {
+          if (
+            !(error instanceof MailError) ||
+            (error.code !== 'PROTOCOL_ERROR' && error.code !== 'CAPABILITY_UNSUPPORTED')
+          ) {
+            throw error;
+          }
         }
       }
       let scannedIds = serverUids ?? matched;

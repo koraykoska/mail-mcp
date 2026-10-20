@@ -53,7 +53,7 @@ const pageFields = {
   snapshot: z
     .record(z.string(), z.unknown())
     .describe(
-      'Frozen view from the first page. Message lists store each folder uidValidity and upper UID (uidNext - 1). Later arrivals stay outside this walk.',
+      'Frozen view from the first page. Message lists store each folder uidValidity and the highest UID that search returned. Later arrivals stay outside this walk.',
     ),
   order: z.enum(['newest-first', 'oldest-first']).describe('Order used for this page.'),
 };
