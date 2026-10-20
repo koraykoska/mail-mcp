@@ -199,6 +199,8 @@ function overlaps(left: Set<string>, right: Set<string>): boolean {
  * out-of-scope messages for the same ids. Those messages contribute ids and
  * are returned for excluded counts; they are not items and do not use a cap
  * slot. The walk repeats until no new ids appear or a bound is hit.
+ * Ids an out-of-scope hit adds are searched in that same round, so a uid seed
+ * does not spend a round only learning the next id.
  * A placeholder seed (empty mailbox, uid 0) records its ids without using a slot.
  */
 export async function closeByHeaders(options: {
@@ -245,6 +247,31 @@ export async function closeByHeaders(options: {
       known.add(id);
     }
   };
+  const searchIds = async (pendingIds: readonly string[]): Promise<void> => {
+    for (const folder of options.folders) {
+      for (let offset = 0; offset < pendingIds.length && !truncated; offset += 8) {
+        const batch = pendingIds.slice(offset, offset + 8);
+        const found = await options.search(folder, batch);
+        for (const message of found) {
+          remember({ ...message, linked: 'header' });
+        }
+      }
+    }
+    if (!options.outside || truncated) {
+      return;
+    }
+    const found = await options.outside(pendingIds);
+    for (const message of found) {
+      const key = messageKey(message);
+      if (!outsideSeen.has(key)) {
+        outsideSeen.add(key);
+        outsideMessages.push(message);
+      }
+      for (const id of idsOf(message)) {
+        known.add(id);
+      }
+    }
+  };
   remember({ ...options.seed, linked: 'header' });
   let rounds = 0;
   for (let round = 0; round < options.maxRounds && !truncated; round += 1) {
@@ -256,28 +283,15 @@ export async function closeByHeaders(options: {
     for (const id of pending) {
       searched.add(id);
     }
-    for (const folder of options.folders) {
-      for (let offset = 0; offset < pending.length && !truncated; offset += 8) {
-        const batch = pending.slice(offset, offset + 8);
-        const found = await options.search(folder, batch);
-        for (const message of found) {
-          remember({ ...message, linked: 'header' });
-        }
+    await searchIds(pending);
+    // An outside hit can add the next hop's id. Search it before the round
+    // ends so a uid seed and a Message-ID seed stay inside the same budget.
+    const learned = [...known].filter((id) => !searched.has(id)).sort();
+    if (learned.length > 0 && !truncated) {
+      for (const id of learned) {
+        searched.add(id);
       }
-    }
-    if (!options.outside) {
-      continue;
-    }
-    const found = await options.outside(pending);
-    for (const message of found) {
-      const key = messageKey(message);
-      if (!outsideSeen.has(key)) {
-        outsideSeen.add(key);
-        outsideMessages.push(message);
-      }
-      for (const id of idsOf(message)) {
-        known.add(id);
-      }
+      await searchIds(learned);
     }
   }
   if ([...known].some((id) => !searched.has(id))) {

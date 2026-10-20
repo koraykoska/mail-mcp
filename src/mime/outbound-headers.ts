@@ -208,14 +208,16 @@ function headerHint(name: string): string {
   if (canonical.startsWith('x-') && routingHeaderDenied(name)) {
     return (
       'An X- header is lowercased first and split on "-" and "_", never on camelCase. ' +
-      'Trailing digits are stripped from the last token. It is rejected when that token is ' +
+      'Each token is normalized before the match: 0 is read as o and other digits are removed, ' +
+      'so digits are stripped from every token. A token that becomes from, to, cc, bcc, or ' +
+      'recipient is rejected in any position. It is rejected when the last token is ' +
       'to, from, sender, cc, bcc, or recipient, when the trailing tokens are an address-bearing ' +
       'name (reply-to, errors-to, return-path, rcpt-to, delivered-to, apparently-to, ' +
       'apparently-from, original-from, original-sender, original-to, original-recipient, ' +
       'receipt-to, read-receipt-to, return-receipt-to, notification-to, ' +
       'disposition-notification-to, confirm-reading-to, reading-to, mdn-to, mail-followup-to, ' +
       'followup-to, mail-reply-to), or when any token is resent, envelope, rcpt, or bounce. ' +
-      'The lowercased name with "-" and "_" and trailing digits removed is always rejected when ' +
+      'The lowercased name with "-" and "_" removed, 0 read as o, and other digits removed is always rejected when ' +
       'it ends with from, sender, recipient, replyto, errorsto, returnpath, deliveredto, ' +
       'receiptto, notificationto, readingto, mdnto, apparentlyto, followupto, originalto, or ' +
       'rcptto, or when it contains resent, envelope, rcpt, or bounce. Names such as ' +
@@ -238,10 +240,14 @@ export function isFieldName(name: string): boolean {
  * True when `name` is a routing or receipt header, or an X- alias of one.
  * The name is lowercased before it is split. CamelCase is not a boundary.
  * A trailing token sequence that equals an address-bearing header name is denied.
- * Any token equal to resent, envelope, rcpt, or bounce is denied. The compact
- * form (separators and trailing digits removed) is always checked as well.
- * X-Sender-IP and X-Notification are not denied. X-Report-Abuse-To is denied
- * because its last token is an address token; that over-block is intentional.
+ * Any token equal to resent, envelope, rcpt, or bounce is denied. Digits are
+ * normalized in every token (0 is read as o, other digits are removed) before
+ * that match, and a token that becomes from, to, cc, bcc, or recipient is denied
+ * in any position. sender is denied only as the last token or a compact suffix,
+ * so X-Sender-IP stays allowed. The compact form is always checked as well.
+ * X-Report-Abuse-To is denied because its last token is an address token; that
+ * over-block is intentional, as is denying from, to, cc, bcc, or recipient
+ * when the token is not last (X-From2-Not).
  */
 export function routingHeaderDenied(name: string): boolean {
   const canonical = canonicalHeaderName(name);
@@ -261,19 +267,30 @@ export function routingHeaderDenied(name: string): boolean {
   return xHeaderDenied(canonical);
 }
 
+/** Address words denied in any token position. sender stays last-token only. */
+const ANY_POSITION_TOKENS = new Set(['from', 'to', 'cc', 'bcc', 'recipient']);
+
+/**
+ * Read 0 as o and drop every other digit, so a digit inside a token cannot
+ * hide from, envelope, or bounce, and a trailing digit cannot hide the last token.
+ */
+function matchToken(piece: string): string {
+  return piece.replace(/0/g, 'o').replace(/\d/g, '');
+}
+
 function xHeaderDenied(canonical: string): boolean {
   let rest = canonical;
   while (rest.startsWith('x-') || rest.startsWith('x_')) {
     rest = rest.slice(2);
   }
-  const pieces = rest.split(/[-_]+/).filter((piece) => piece.length > 0);
-  const tokens = pieces.map((piece, index) =>
-    index === pieces.length - 1 ? piece.replace(/\d+$/, '') : piece,
-  );
+  const tokens = rest
+    .split(/[-_]+/)
+    .map((piece) => matchToken(piece))
+    .filter((token) => token.length > 0);
   if (tokens.length === 0) {
     return true;
   }
-  if (tokens.some((token) => X_DENY_TOKENS.has(token))) {
+  if (tokens.some((token) => X_DENY_TOKENS.has(token) || ANY_POSITION_TOKENS.has(token))) {
     return true;
   }
   for (let start = 0; start < tokens.length; start += 1) {
@@ -281,7 +298,7 @@ function xHeaderDenied(canonical: string): boolean {
       return true;
     }
   }
-  const compact = canonical.replace(/[-_]/g, '').replace(/\d+$/, '');
+  const compact = matchToken(canonical.replace(/[-_]/g, ''));
   if (COMPACT_CONTAINS.some((token) => compact.includes(token))) {
     return true;
   }

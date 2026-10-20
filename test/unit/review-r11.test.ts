@@ -232,7 +232,8 @@ describe('Trash-only seed walks both directions', () => {
     expect(byId.threadKey).toBe(byUid.threadKey);
     expect(byId.excludedMatches).toEqual([{ mailbox: 'Trash', count: 1 }]);
     expect(byUid.excludedMatches).toEqual([{ mailbox: 'Trash', count: 1 }]);
-    expect(byUid.rounds).toBeGreaterThanOrEqual(2);
+    expect(byUid.rounds).toBeGreaterThanOrEqual(1);
+    expect(byId.rounds).toBeGreaterThanOrEqual(1);
     const thread = TOOLS.find((tool) => tool.name === 'mail_get_thread')?.description ?? '';
     expect(thread).toMatch(/every id they cite in In-Reply-To or References/);
     expect(thread).toMatch(/both directions/);
