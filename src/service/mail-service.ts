@@ -29,7 +29,12 @@ import {
   type PageRequest,
   type SummaryRow,
 } from './browse.js';
-import { parseFolderRequest, resolveFolderPaths, defaultThreadFolders, type ListedFolder } from '../folders.js';
+import {
+  parseFolderRequest,
+  resolveFolderPaths,
+  defaultThreadFolders,
+  type ListedFolder,
+} from '../folders.js';
 import { selectIdentity, type IdentityChoice } from '../identities.js';
 import {
   applySubjectHeuristic,
@@ -81,7 +86,12 @@ import { htmlToSafeText, quoteHtml, sanitizeHtml, textToHtml } from '../mime/htm
 import { hasHighOctets, stripBcc } from '../mime/transfer.js';
 import { headerValue, messageIds } from '../mime/headers.js';
 import { buildReferences, forwardSubject, replySubject } from '../mime/subject.js';
-import { flattenThread, normalizedSubject, threadMessages, type ThreadNode } from '../mime/thread.js';
+import {
+  flattenThread,
+  normalizedSubject,
+  threadMessages,
+  type ThreadNode,
+} from '../mime/thread.js';
 import { ownAddressesOf, planReply, planReplyAll, quotePlain } from '../mime/reply.js';
 import type { SmtpSender } from '../smtp/client.js';
 import { withTimeout } from '../timeout.js';
@@ -651,12 +661,17 @@ export class MailService {
         order,
         ...(cursor ? { cursor } : {}),
         maxPerFolder,
-        ...(paths.length === 1 && input.uidValidity ? { singleUidValidity: input.uidValidity } : {}),
+        ...(paths.length === 1 && input.uidValidity
+          ? { singleUidValidity: input.uidValidity }
+          : {}),
         materialize: true,
       });
       const folders = folderPayload(scans);
       let source: 'server' | 'client' = 'client';
-      if (paths.length === 1 && (session.hasCapability('THREAD') || session.hasCapability(`THREAD=${algorithm}`))) {
+      if (
+        paths.length === 1 &&
+        (session.hasCapability('THREAD') || session.hasCapability(`THREAD=${algorithm}`))
+      ) {
         const serverThreads = await session.withMailbox(mailbox, 'read', (box) =>
           box.serverThread(algorithm, compiled),
         );
@@ -665,7 +680,11 @@ export class MailService {
         }
       }
       const summaries = scans.flatMap((scan) =>
-        scan.summaries.map((summary) => ({ summary, mailbox: scan.mailbox, uidValidity: scan.uidValidity })),
+        scan.summaries.map((summary) => ({
+          summary,
+          mailbox: scan.mailbox,
+          uidValidity: scan.uidValidity,
+        })),
       );
       const threads = threadMessages(
         summaries.map((item) => ({
@@ -677,11 +696,15 @@ export class MailService {
         })),
         algorithm === 'ORDEREDSUBJECT',
       );
-      const byUid = new Map(summaries.map((item) => [`${item.mailbox}\0${item.summary.uid}`, item]));
+      const byUid = new Map(
+        summaries.map((item) => [`${item.mailbox}\0${item.summary.uid}`, item]),
+      );
       const link: LinkKind = algorithm === 'ORDEREDSUBJECT' ? 'subject' : 'header';
       const roots = threads
         .map((node) => threadSummary(node, mailbox, byUid, link))
-        .filter((item): item is NonNullable<ReturnType<typeof threadSummary>> => item !== undefined);
+        .filter(
+          (item): item is NonNullable<ReturnType<typeof threadSummary>> => item !== undefined,
+        );
       const page = pageSummaryRows(roots, {
         limit,
         keys: [{ field: 'date', reverse: order !== 'oldest-first' }],
@@ -1415,7 +1438,10 @@ export class MailService {
       const seed = await this.seedMessage(session, input);
       const paths =
         input.folders !== undefined
-          ? await this.folderPaths(account, session, { folders: input.folders, mailbox: seed.mailbox })
+          ? await this.folderPaths(account, session, {
+              folders: input.folders,
+              mailbox: seed.mailbox,
+            })
           : defaultThreadFolders(seed.mailbox, special);
       let messages: ConversationMessage[];
       let rounds = 0;
@@ -1442,7 +1468,12 @@ export class MailService {
         messages = applied.messages;
         truncated = truncated || applied.truncated;
       }
-      const prefer = [input.mailbox ?? seed.mailbox, 'INBOX', special.sent ?? '', special.archive ?? ''];
+      const prefer = [
+        input.mailbox ?? seed.mailbox,
+        'INBOX',
+        special.sent ?? '',
+        special.archive ?? '',
+      ];
       messages = dedupeMessages(messages, prefer);
       if (input.onlyUnread) {
         messages = messages.filter((item) => !item.flags.includes('\\Seen'));
@@ -1485,7 +1516,12 @@ export class MailService {
         omitted: 0,
         truncated: false,
       }));
-      const scope = scopeFor(paths, undefined, maxMessages, `thread:${normalizeMessageId(seed.messageId) || seed.uid}`);
+      const scope = scopeFor(
+        paths,
+        undefined,
+        maxMessages,
+        `thread:${normalizeMessageId(seed.messageId) || seed.uid}`,
+      );
       const page = pageSummaryRows(rows, {
         limit,
         keys: [{ field: 'date', reverse: order !== 'oldest-first' }],
@@ -1577,7 +1613,11 @@ export class MailService {
         const status = await session.status(mailbox);
         let matches: number | null = null;
         if (compiled) {
-          matches = await session.withMailbox(mailbox, 'read', async (box) => (await box.search(compiled)).length);
+          matches = await session.withMailbox(
+            mailbox,
+            'read',
+            async (box) => (await box.search(compiled)).length,
+          );
         }
         items.push({
           mailbox,
@@ -1606,7 +1646,10 @@ export class MailService {
   async listAttachments(input: ListInput): Promise<Record<string, unknown>> {
     const account = this.account(input.account);
     const cursor = readPageCursor(input.cursor);
-    const { order } = resolveOrder({ ...(input.sort ? { sort: input.sort } : {}), ...(input.order ? { order: input.order } : {}) });
+    const { order } = resolveOrder({
+      ...(input.sort ? { sort: input.sort } : {}),
+      ...(input.order ? { order: input.order } : {}),
+    });
     const limit = pageLimit(
       cursorLimit(cursor, input.limit, account.limits.pageSize),
       account.limits.pageSize,
@@ -1632,7 +1675,9 @@ export class MailService {
           if (!summary.hasAttachments) {
             continue;
           }
-          const structure = await session.withMailbox(scan.mailbox, 'read', (box) => box.fetchStructure(summary.uid));
+          const structure = await session.withMailbox(scan.mailbox, 'read', (box) =>
+            box.fetchStructure(summary.uid),
+          );
           for (const part of flattenParts(structure)) {
             attachments.push({
               ...rowFromSummary(scan, summary),
@@ -1656,7 +1701,11 @@ export class MailService {
         folders: folderPayload(scans),
       });
       const items = page.items.map((row) => {
-        const extra = row as SummaryRow & { partId?: string; filename?: string | null; contentType?: string };
+        const extra = row as SummaryRow & {
+          partId?: string;
+          filename?: string | null;
+          contentType?: string;
+        };
         return {
           mailbox: row.mailbox,
           uid: row.uid,
@@ -1705,7 +1754,11 @@ export class MailService {
         maxPerFolder,
         materialize: true,
       });
-      const own = new Set(ownAddressesOf(account.email, account.identities, account.user).map((item) => item.toLowerCase()));
+      const own = new Set(
+        ownAddressesOf(account.email, account.identities, account.user).map((item) =>
+          item.toLowerCase(),
+        ),
+      );
       const counts = new Map<string, number>();
       let scanned = 0;
       for (const scan of scans) {
@@ -1735,7 +1788,10 @@ export class MailService {
           order,
           sort: [{ field: 'arrival', reverse: order === 'newest-first' }],
           cap: limit,
-          folders: folderPayload(scans).map((folder) => ({ mailbox: folder.mailbox, uidValidity: folder.uidValidity })),
+          folders: folderPayload(scans).map((folder) => ({
+            mailbox: folder.mailbox,
+            uidValidity: folder.uidValidity,
+          })),
         });
       }
       const slice = pageKeys(frozen, limit, cursor?.anchorKey);
@@ -1858,7 +1914,10 @@ export class MailService {
     const account = this.account(input.account);
     const dryRun = input.dryRun !== false;
     const cursor = readPageCursor(input.cursor);
-    const { keys, order } = resolveOrder({ ...(input.sort ? { sort: input.sort } : {}), ...(input.order ? { order: input.order } : {}) });
+    const { keys, order } = resolveOrder({
+      ...(input.sort ? { sort: input.sort } : {}),
+      ...(input.order ? { order: input.order } : {}),
+    });
     const limit = pageLimit(
       cursorLimit(cursor, input.limit, account.limits.pageSize),
       account.limits.pageSize,
@@ -1899,7 +1958,7 @@ export class MailService {
       if (!dryRun) {
         const destination =
           input.action === 'archive'
-            ? input.destination ?? (await this.special(account, session)).archive
+            ? (input.destination ?? (await this.special(account, session)).archive)
             : input.destination;
         if ((input.action === 'move' || input.action === 'archive') && !destination) {
           throw new MailError('NOT_FOUND', 'No destination mailbox could be resolved.');
@@ -1911,7 +1970,11 @@ export class MailService {
           }
           await session.withMailbox(scan.mailbox, 'write', async (box) => {
             if (input.action === 'addFlags' || input.action === 'removeFlags') {
-              await box.setFlags(uids, normalizeFlags(input.flags ?? []), input.action === 'addFlags' ? 'add' : 'remove');
+              await box.setFlags(
+                uids,
+                normalizeFlags(input.flags ?? []),
+                input.action === 'addFlags' ? 'add' : 'remove',
+              );
             } else if (destination) {
               await box.move(uids, destination);
             }
@@ -1960,7 +2023,10 @@ export class MailService {
   ): Promise<Record<string, unknown>> {
     const account = this.account(input.account);
     const cursor = readPageCursor(input.cursor);
-    const { keys, order } = resolveOrder({ ...(input.sort ? { sort: input.sort } : {}), ...(input.order ? { order: input.order } : {}) });
+    const { keys, order } = resolveOrder({
+      ...(input.sort ? { sort: input.sort } : {}),
+      ...(input.order ? { order: input.order } : {}),
+    });
     const limit = pageLimit(
       cursorLimit(cursor, input.limit, account.limits.pageSize),
       account.limits.pageSize,
@@ -1979,13 +2045,17 @@ export class MailService {
         order,
         ...(cursor ? { cursor } : {}),
         maxPerFolder,
-        ...(paths.length === 1 && input.uidValidity ? { singleUidValidity: input.uidValidity } : {}),
+        ...(paths.length === 1 && input.uidValidity
+          ? { singleUidValidity: input.uidValidity }
+          : {}),
       });
       const folders = folderPayload(scans);
       const mailbox = paths[0] ?? 'INBOX';
       const single = scans.length === 1 ? scans[0] : undefined;
       const serverUids = single?.serverUids;
-      const anchorMissing = Boolean(cursor?.anchor && serverUids && !serverUids.includes(cursor.anchor.uid));
+      const anchorMissing = Boolean(
+        cursor?.anchor && serverUids && !serverUids.includes(cursor.anchor.uid),
+      );
       if (serverUids && single && !anchorMissing) {
         const paged = pageServerUids(serverUids, cursor?.anchor?.uid, limit);
         const summaries = await session.withMailbox(single.mailbox, 'read', (box) =>
@@ -2143,7 +2213,8 @@ export class MailService {
     }
     const listed = await session.listMailboxes();
     const special = await this.special(account, session);
-    return resolveFolderPaths(listed.map(listedFolder), special, parseFolderRequest(input.folders)).paths;
+    return resolveFolderPaths(listed.map(listedFolder), special, parseFolderRequest(input.folders))
+      .paths;
   }
 
   private async withSnippets(
@@ -2294,7 +2365,8 @@ export class MailService {
       { header: { name: 'References', value: id } },
       { header: { name: 'In-Reply-To', value: id } },
     ]);
-    const criteria: SearchCriteria = clauses.length === 1 && clauses[0] ? clauses[0] : { or: clauses };
+    const criteria: SearchCriteria =
+      clauses.length === 1 && clauses[0] ? clauses[0] : { or: clauses };
     const compiled = compileSearch(criteria);
     return session.withMailbox(folder, 'read', async (box) => {
       const uids = await box.search(compiled);
@@ -2904,7 +2976,10 @@ function flagResults(
   });
 }
 
-function publicIdentity(choice: IdentityChoice): { identity: { id: string | null; email: string; name?: string }; identityReason: string } {
+function publicIdentity(choice: IdentityChoice): {
+  identity: { id: string | null; email: string; name?: string };
+  identityReason: string;
+} {
   return {
     identity: {
       id: choice.id,
@@ -2937,7 +3012,10 @@ function andFlag(
   };
 }
 
-function topCounts(counts: Map<string, number>, top: number): Array<{ value: string; count: number }> {
+function topCounts(
+  counts: Map<string, number>,
+  top: number,
+): Array<{ value: string; count: number }> {
   return [...counts.entries()]
     .sort((left, right) => {
       if (right[1] !== left[1]) {
@@ -2950,7 +3028,9 @@ function topCounts(counts: Map<string, number>, top: number): Array<{ value: str
 }
 
 function listedFolder(mailbox: MailboxInfo): ListedFolder {
-  return mailbox.specialUse ? { path: mailbox.path, specialUse: mailbox.specialUse } : { path: mailbox.path };
+  return mailbox.specialUse
+    ? { path: mailbox.path, specialUse: mailbox.specialUse }
+    : { path: mailbox.path };
 }
 
 function groupRows(rows: readonly SummaryRow[]): Map<string, SummaryRow[]> {
@@ -2978,16 +3058,20 @@ function threadSummary(
   mailbox: string,
   byUid: Map<string, { summary: MessageSummary; mailbox: string; uidValidity: string }>,
   link: LinkKind,
-): (SummaryRow & {
-  participants: string[];
-  messageCount: number;
-  unreadCount: number;
-  threadKey: string;
-  linked: LinkKind;
-}) | undefined {
+):
+  | (SummaryRow & {
+      participants: string[];
+      messageCount: number;
+      unreadCount: number;
+      threadKey: string;
+      linked: LinkKind;
+    })
+  | undefined {
   const messages = flattenThread([node])
     .map((uid) => byUid.get(`${mailbox}\0${uid}`))
-    .filter((item): item is { summary: MessageSummary; mailbox: string; uidValidity: string } => Boolean(item));
+    .filter((item): item is { summary: MessageSummary; mailbox: string; uidValidity: string } =>
+      Boolean(item),
+    );
   const first = messages[0];
   if (!first) {
     return undefined;

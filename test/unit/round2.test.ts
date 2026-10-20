@@ -323,7 +323,11 @@ describe('per-UID labels, size cap, flags, and cursors', () => {
     const { service } = harness(session, {
       limits: { ...account().limits, maxSortCandidates: 2 },
     });
-    const listed = await service.listMessages({ mailbox: 'INBOX', limit: 10, includeSnippet: false });
+    const listed = await service.listMessages({
+      mailbox: 'INBOX',
+      limit: 10,
+      includeSnippet: false,
+    });
     expect(listed.truncated).toBe(true);
     expect(listed.total).toBe(2);
     const snapshot = listed.snapshot as { folders: Array<{ omitted: number; scanned: number }> };

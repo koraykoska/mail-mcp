@@ -407,11 +407,15 @@ describe('GreenMail folder scope', () => {
     await service.createMailbox(undefined, right);
     await service.append({
       mailbox: left,
-      rawBase64: simpleMessage({ subject: `Alpha ${stamp}`, messageId: `<a-${stamp}@e>` }).toString('base64'),
+      rawBase64: simpleMessage({ subject: `Alpha ${stamp}`, messageId: `<a-${stamp}@e>` }).toString(
+        'base64',
+      ),
     });
     await service.append({
       mailbox: right,
-      rawBase64: simpleMessage({ subject: `Beta ${stamp}`, messageId: `<b-${stamp}@e>` }).toString('base64'),
+      rawBase64: simpleMessage({ subject: `Beta ${stamp}`, messageId: `<b-${stamp}@e>` }).toString(
+        'base64',
+      ),
     });
     const seen = new Set<string>();
     let cursor: string | undefined;

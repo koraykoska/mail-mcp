@@ -287,7 +287,10 @@ const folders = z
       .object({
         all: z.boolean().optional().describe('Every listed mailbox except Trash and Junk.'),
         mailboxes: z.array(z.string()).optional().describe('Explicit mailbox paths.'),
-        specialUse: z.array(z.string()).optional().describe('SPECIAL-USE flags such as "\\\\Sent".'),
+        specialUse: z
+          .array(z.string())
+          .optional()
+          .describe('SPECIAL-USE flags such as "\\\\Sent".'),
         globs: z.array(z.string()).optional().describe('Path globs. * and ? are wildcards.'),
         exclude: z.array(z.string()).optional().describe('Paths or flags to drop from the scope.'),
         includeTrash: z.boolean().optional().describe('Keep Trash when all is set. Default false.'),

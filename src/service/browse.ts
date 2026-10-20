@@ -1,5 +1,10 @@
 import { MailError } from '../errors.js';
-import { andSearchUid, compileSearch, type CompiledSearch, type SearchCriteria } from '../imap/search.js';
+import {
+  andSearchUid,
+  compileSearch,
+  type CompiledSearch,
+  type SearchCriteria,
+} from '../imap/search.js';
 import type { ImapSession, MessageSummary, OpenMailbox } from '../imap/session.js';
 import { headerValue } from '../mime/headers.js';
 import {
@@ -106,7 +111,11 @@ export async function scanFolders(
   let sortSource: 'server' | 'client' = 'client';
   for (const mailbox of paths) {
     const scan = await session.withMailbox(mailbox, 'read', async (box) => {
-      if (options.singleUidValidity && paths.length === 1 && options.singleUidValidity !== box.uidValidity) {
+      if (
+        options.singleUidValidity &&
+        paths.length === 1 &&
+        options.singleUidValidity !== box.uidValidity
+      ) {
         throw new MailError(
           'UIDVALIDITY_CHANGED',
           `UIDVALIDITY is ${box.uidValidity}, not ${options.singleUidValidity}.`,
@@ -205,7 +214,10 @@ export function rowsFromScans(scans: readonly FolderScan[]): SummaryRow[] {
   return rows;
 }
 
-export function rowFromSummary(scan: Pick<FolderScan, 'mailbox' | 'uidValidity'>, summary: MessageSummary): SummaryRow {
+export function rowFromSummary(
+  scan: Pick<FolderScan, 'mailbox' | 'uidValidity'>,
+  summary: MessageSummary,
+): SummaryRow {
   return {
     mailbox: scan.mailbox,
     uid: summary.uid,
@@ -302,7 +314,12 @@ export function listHeaders(raw: Buffer | null): {
   authenticationResults: string | null;
 } {
   if (!raw) {
-    return { listUnsubscribe: null, listId: null, autoSubmitted: null, authenticationResults: null };
+    return {
+      listUnsubscribe: null,
+      listId: null,
+      autoSubmitted: null,
+      authenticationResults: null,
+    };
   }
   const text = raw.toString('utf8');
   return {
@@ -322,7 +339,11 @@ export function scopeFor(
   return `${scopeKey(paths)}\n${JSON.stringify(search ?? {})}\n${maxPerFolder}\n${extra}`;
 }
 
-export function cursorLimit(cursor: SnapshotCursor | undefined, requested: number | undefined, fallback: number): number | undefined {
+export function cursorLimit(
+  cursor: SnapshotCursor | undefined,
+  requested: number | undefined,
+  fallback: number,
+): number | undefined {
   if (requested !== undefined) {
     return requested;
   }

@@ -482,15 +482,23 @@ describe('Dovecot', () => {
     for (const subject of ['One', 'Two', 'Three']) {
       await runtime.service.append({
         mailbox: stamp,
-        rawBase64: simpleMessage({ subject: `${subject} ${stamp}`, messageId: `<${subject}-${stamp}@e>` }).toString(
-          'base64',
-        ),
+        rawBase64: simpleMessage({
+          subject: `${subject} ${stamp}`,
+          messageId: `<${subject}-${stamp}@e>`,
+        }).toString('base64'),
       });
     }
-    const first = await runtime.service.listMessages({ mailbox: stamp, limit: 1, includeSnippet: false });
+    const first = await runtime.service.listMessages({
+      mailbox: stamp,
+      limit: 1,
+      includeSnippet: false,
+    });
     await runtime.service.append({
       mailbox: stamp,
-      rawBase64: simpleMessage({ subject: `Later ${stamp}`, messageId: `<later-${stamp}@e>` }).toString('base64'),
+      rawBase64: simpleMessage({
+        subject: `Later ${stamp}`,
+        messageId: `<later-${stamp}@e>`,
+      }).toString('base64'),
     });
     const seen = new Set<number>();
     let cursor = first.nextCursor ? String(first.nextCursor) : undefined;
@@ -510,7 +518,11 @@ describe('Dovecot', () => {
       cursor = page.nextCursor ? String(page.nextCursor) : undefined;
     }
     expect(seen.size).toBe(3);
-    const fresh = await runtime.service.listMessages({ mailbox: stamp, limit: 10, includeSnippet: false });
+    const fresh = await runtime.service.listMessages({
+      mailbox: stamp,
+      limit: 10,
+      includeSnippet: false,
+    });
     expect(fresh.total).toBe(4);
     await runtime.close();
   });

@@ -129,7 +129,11 @@ function readCursor(parsed: unknown): SnapshotCursor {
   if (record.order !== 'newest-first' && record.order !== 'oldest-first') {
     throw new MailError('INVALID_ARGUMENT', 'The page cursor is not valid.');
   }
-  if (!Array.isArray(record.sort) || typeof record.scope !== 'string' || typeof record.cap !== 'number') {
+  if (
+    !Array.isArray(record.sort) ||
+    typeof record.scope !== 'string' ||
+    typeof record.cap !== 'number'
+  ) {
     throw new MailError('INVALID_ARGUMENT', 'The page cursor is not valid.');
   }
   if (!Array.isArray(record.folders)) {
@@ -252,7 +256,11 @@ export function assertCursorFits(
   }
 }
 
-export function upperUidOf(cursor: SnapshotCursor | undefined, mailbox: string, uidNext: number): number {
+export function upperUidOf(
+  cursor: SnapshotCursor | undefined,
+  mailbox: string,
+  uidNext: number,
+): number {
   const stored = cursor?.folders.find((item) => item.mailbox === mailbox);
   if (stored) {
     return stored.upperUid;
@@ -285,7 +293,9 @@ export function pageRows<T extends PageRow>(
   let start = 0;
   const anchor = options.cursor?.anchor;
   if (anchor) {
-    const index = ordered.findIndex((row) => row.mailbox === anchor.mailbox && row.uid === anchor.uid);
+    const index = ordered.findIndex(
+      (row) => row.mailbox === anchor.mailbox && row.uid === anchor.uid,
+    );
     if (index >= 0) {
       start = index + 1;
     } else {

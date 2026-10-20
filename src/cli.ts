@@ -282,15 +282,11 @@ See docs/CONFIGURATION.md and docs/PROVIDERS.md.
 `;
 }
 
-function applyCliConnect(
-  config: ReturnType<typeof loadConfig>,
-  args: ParsedArgs,
-): void {
+function applyCliConnect(config: ReturnType<typeof loadConfig>, args: ParsedArgs): void {
   if (!args.imapConnect && !args.smtpConnect) {
     return;
   }
-  const id =
-    args.account && config.accounts[args.account] ? args.account : config.defaultAccount;
+  const id = args.account && config.accounts[args.account] ? args.account : config.defaultAccount;
   const account = config.accounts[id];
   if (!account) {
     throw new MailError('CONFIG_ERROR', `Account "${id}" is not configured.`);

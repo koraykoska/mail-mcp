@@ -168,7 +168,9 @@ function accountFromEnv(env: NodeJS.ProcessEnv): RawAccount | undefined {
     account.password = env.MAIL_PASSWORD;
   }
   if (hasImap || env.MAIL_IMAP_PORT || env.MAIL_IMAP_SECURE || env.MAIL_IMAP_CONNECT) {
-    const imapConnect = env.MAIL_IMAP_CONNECT ? parseConnectAddress(env.MAIL_IMAP_CONNECT) : undefined;
+    const imapConnect = env.MAIL_IMAP_CONNECT
+      ? parseConnectAddress(env.MAIL_IMAP_CONNECT)
+      : undefined;
     account.imap = {
       host: env.MAIL_IMAP_HOST,
       port: env.MAIL_IMAP_PORT ? Number(env.MAIL_IMAP_PORT) : undefined,
@@ -184,7 +186,9 @@ function accountFromEnv(env: NodeJS.ProcessEnv): RawAccount | undefined {
     };
   }
   if (hasSmtp || env.MAIL_SMTP_PORT || env.MAIL_SMTP_SECURE || env.MAIL_SMTP_CONNECT) {
-    const smtpConnect = env.MAIL_SMTP_CONNECT ? parseConnectAddress(env.MAIL_SMTP_CONNECT) : undefined;
+    const smtpConnect = env.MAIL_SMTP_CONNECT
+      ? parseConnectAddress(env.MAIL_SMTP_CONNECT)
+      : undefined;
     account.smtp = {
       host: env.MAIL_SMTP_HOST,
       port: env.MAIL_SMTP_PORT ? Number(env.MAIL_SMTP_PORT) : undefined,

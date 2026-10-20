@@ -1,7 +1,13 @@
 import { z } from 'zod';
 import type { MailService } from '../service/mail-service.js';
 import type { MutationKind } from '../safety.js';
-import { cursorLimit, pageKeyList, pageLimit, readPageCursor, resolveOrder } from '../service/browse.js';
+import {
+  cursorLimit,
+  pageKeyList,
+  pageLimit,
+  readPageCursor,
+  resolveOrder,
+} from '../service/browse.js';
 import type { PageOrder } from '../page/snapshot.js';
 import { fields, strictOutput } from './schema.js';
 
@@ -37,14 +43,13 @@ const pageFields = {
     .describe(
       'This page. The same cursor model is used for every paged tool: pass nextCursor back as cursor. A new call without a cursor starts a new snapshot and includes mail that arrived after the previous one.',
     ),
-  nextCursor: z
-    .string()
-    .nullable()
-    .describe('Cursor for the next page, or null on the last page.'),
+  nextCursor: z.string().nullable().describe('Cursor for the next page, or null on the last page.'),
   total: z.number().describe('Rows inside the snapshot, before this page is sliced.'),
   truncated: z
     .boolean()
-    .describe('True when a cap omitted matches. omitted and scanned on snapshot.folders say which folder.'),
+    .describe(
+      'True when a cap omitted matches. omitted and scanned on snapshot.folders say which folder.',
+    ),
   snapshot: z
     .record(z.string(), z.unknown())
     .describe(
@@ -454,7 +459,12 @@ export const TOOLS: ToolDefinition[] = [
     paged: true,
     examples: ['{}'],
     async run(args, service) {
-      const input = args as { account?: string; limit?: number; cursor?: string; order?: PageOrder };
+      const input = args as {
+        account?: string;
+        limit?: number;
+        cursor?: string;
+        order?: PageOrder;
+      };
       return service.listMailboxes(input.account, true, {
         ...(input.limit !== undefined ? { limit: input.limit } : {}),
         ...(input.cursor ? { cursor: input.cursor } : {}),
@@ -488,7 +498,9 @@ export const TOOLS: ToolDefinition[] = [
       'Page message summaries in a mailbox. Default mailbox is INBOX. Default sort is arrival descending (newest first) via the SORT extension, with a client-side fallback. A folder larger than limits.maxSortCandidates is truncated: snapshot.folders reports omitted and scanned, and paging continues inside that window. Each summary has uid, flags, size (octets), date, from, to, subject, hasAttachments, and a snippet of about snippetChars characters (default 160). Pass nextCursor back as cursor. Mail that arrives after the first page needs a new call without a cursor. For criteria use mail_search_messages; a search object is also accepted here. Optional uidValidity detects a recreated mailbox.',
     input: z.object({
       account: fields.account,
-      mailbox: fields.mailbox.optional().describe('Mailbox path. Default INBOX. Ignored when folders is set.'),
+      mailbox: fields.mailbox
+        .optional()
+        .describe('Mailbox path. Default INBOX. Ignored when folders is set.'),
       folders: fields.folders,
       maxPerFolder: fields.maxPerFolder,
       search: fields.search.optional(),
@@ -874,7 +886,9 @@ export const TOOLS: ToolDefinition[] = [
       algorithm: z
         .enum(['REFERENCES', 'ORDEREDSUBJECT'])
         .optional()
-        .describe('Default REFERENCES. ORDEREDSUBJECT is the subject heuristic and labels rows as subject.'),
+        .describe(
+          'Default REFERENCES. ORDEREDSUBJECT is the subject heuristic and labels rows as subject.',
+        ),
       folders: fields.folders,
       maxPerFolder: fields.maxPerFolder,
       limit: fields.limit,
@@ -1509,7 +1523,9 @@ export const TOOLS: ToolDefinition[] = [
       mailbox: fields.mailbox,
       uid: fields.uid,
       uidValidity: fields.uidValidity,
-      from: fields.address.optional().describe('From identity. Same selection rules as mail_reply_message.'),
+      from: fields.address
+        .optional()
+        .describe('From identity. Same selection rules as mail_reply_message.'),
       replyTo: fields.addressList.optional(),
       to: fields.addressList.min(1),
       cc: fields.addressList.optional(),
@@ -1570,7 +1586,9 @@ export const TOOLS: ToolDefinition[] = [
       mailbox: fields.mailbox.describe('Mailbox that holds the draft, usually Drafts.'),
       uid: fields.uid,
       uidValidity: fields.uidValidity,
-      from: fields.address.optional().describe('Replace the draft From. Must be an identity or an allowFromDomains address.'),
+      from: fields.address
+        .optional()
+        .describe('Replace the draft From. Must be an identity or an allowFromDomains address.'),
       replyTo: fields.addressList.optional().describe('Replace Reply-To.'),
       appendSent: z
         .boolean()
@@ -1666,14 +1684,31 @@ export const TOOLS: ToolDefinition[] = [
       uidValidity: fields.uidValidity,
       messageId: z.string().optional().describe('Find the seed by Message-ID instead of uid.'),
       folders: fields.folders,
-      includeBodies: z.boolean().optional().describe('Include capped plain text. Default false. Page size max 20.'),
+      includeBodies: z
+        .boolean()
+        .optional()
+        .describe('Include capped plain text. Default false. Page size max 20.'),
       onlyUnread: z.boolean().optional().describe('Keep only messages without \\Seen.'),
       subjectHeuristic: z
         .boolean()
         .optional()
-        .describe('Also link messages that share a normalized subject and a participant. Default false. Those items are linked "subject".'),
-      maxMessages: z.number().int().positive().max(500).optional().describe('Stop after this many messages. Default 100, max 500.'),
-      maxRounds: z.number().int().positive().max(8).optional().describe('Header-search rounds. Default 4, max 8.'),
+        .describe(
+          'Also link messages that share a normalized subject and a participant. Default false. Those items are linked "subject".',
+        ),
+      maxMessages: z
+        .number()
+        .int()
+        .positive()
+        .max(500)
+        .optional()
+        .describe('Stop after this many messages. Default 100, max 500.'),
+      maxRounds: z
+        .number()
+        .int()
+        .positive()
+        .max(8)
+        .optional()
+        .describe('Header-search rounds. Default 4, max 8.'),
     }),
     output: strictOutput({
       ...baseOut,
@@ -1784,7 +1819,13 @@ export const TOOLS: ToolDefinition[] = [
       folders: fields.folders,
       search: fields.search.optional(),
       maxPerFolder: fields.maxPerFolder,
-      top: z.number().int().positive().max(100).optional().describe('Sender and domain rows. Default 10, max 100.'),
+      top: z
+        .number()
+        .int()
+        .positive()
+        .max(100)
+        .optional()
+        .describe('Sender and domain rows. Default 10, max 100.'),
     }),
     output: strictOutput({
       ...baseOut,
@@ -1820,9 +1861,14 @@ export const TOOLS: ToolDefinition[] = [
       search: fields.search,
       action: z
         .enum(['addFlags', 'removeFlags', 'move', 'archive'])
-        .describe('addFlags and removeFlags use flags. move uses destination. archive moves to the Archive mailbox.'),
+        .describe(
+          'addFlags and removeFlags use flags. move uses destination. archive moves to the Archive mailbox.',
+        ),
       flags: z.array(z.string()).optional().describe('Flags for addFlags or removeFlags.'),
-      destination: z.string().optional().describe('Target mailbox for move. Archive uses this or the resolved Archive mailbox.'),
+      destination: z
+        .string()
+        .optional()
+        .describe('Target mailbox for move. Archive uses this or the resolved Archive mailbox.'),
       dryRun: z.boolean().optional().describe('Default true. false applies the action.'),
       maxPerFolder: fields.maxPerFolder,
     }),

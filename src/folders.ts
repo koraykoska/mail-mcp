@@ -34,7 +34,10 @@ export function parseFolderRequest(value: unknown): FolderRequest {
   }
   if (Array.isArray(value)) {
     if (!value.every((item) => typeof item === 'string' && item.length > 0)) {
-      throw new MailError('INVALID_ARGUMENT', 'folders must be mailbox names or special-use flags.');
+      throw new MailError(
+        'INVALID_ARGUMENT',
+        'folders must be mailbox names or special-use flags.',
+      );
     }
     return fromTokens(value, {});
   }
@@ -96,7 +99,10 @@ function stringList(value: unknown, label: string): string[] {
   if (value === undefined) {
     return [];
   }
-  if (!Array.isArray(value) || !value.every((item) => typeof item === 'string' && item.length > 0)) {
+  if (
+    !Array.isArray(value) ||
+    !value.every((item) => typeof item === 'string' && item.length > 0)
+  ) {
     throw new MailError('INVALID_ARGUMENT', `${label} must be a list of strings.`);
   }
   return value;
@@ -177,7 +183,9 @@ export function resolveFolderPaths(
     const role = byPath.get(path)?.specialUse?.toLowerCase();
     const isTrash = path === trash || role === '\\trash';
     const isJunk = path === junk || role === '\\junk';
-    const named = request.mailboxes.includes(path) || request.specialUse.some((token) => expandToken(token, listed, special).includes(path));
+    const named =
+      request.mailboxes.includes(path) ||
+      request.specialUse.some((token) => expandToken(token, listed, special).includes(path));
     if (isTrash && !request.includeTrash && !named) {
       continue;
     }
@@ -210,7 +218,10 @@ function expandToken(
 }
 
 export function globMatch(pattern: string, path: string): boolean {
-  const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.');
+  const escaped = pattern
+    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+    .replace(/\*/g, '.*')
+    .replace(/\?/g, '.');
   return new RegExp(`^${escaped}$`).test(path);
 }
 

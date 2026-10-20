@@ -48,7 +48,9 @@ export function messageKey(message: Pick<ConversationMessage, 'mailbox' | 'uid'>
   return `${message.mailbox}\0${message.uid}`;
 }
 
-export function threadKeyFor(root: Pick<ConversationMessage, 'messageId' | 'mailbox' | 'uid' | 'uidValidity'>): string {
+export function threadKeyFor(
+  root: Pick<ConversationMessage, 'messageId' | 'mailbox' | 'uid' | 'uidValidity'>,
+): string {
   const id = normalizeMessageId(root.messageId);
   if (id) {
     return `mid:${createHash('sha256').update(id).digest('hex').slice(0, 32)}`;
@@ -304,7 +306,10 @@ function parentOf(
   return undefined;
 }
 
-export function chronological(messages: readonly ConversationMessage[], newestFirst: boolean): ConversationMessage[] {
+export function chronological(
+  messages: readonly ConversationMessage[],
+  newestFirst: boolean,
+): ConversationMessage[] {
   const ordered = [...messages].sort((left, right) => {
     const leftDate = left.date || left.internalDate || '';
     const rightDate = right.date || right.internalDate || '';

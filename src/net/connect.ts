@@ -29,7 +29,11 @@ const PORT_MAX = 65535;
 export function parseConnectAddress(value: string): ConnectAddress {
   const trimmed = value.trim();
   if (!trimmed) {
-    throw new MailError('CONFIG_ERROR', 'A connect address is empty.', 'Use host:port, for example 127.0.0.1:1993.');
+    throw new MailError(
+      'CONFIG_ERROR',
+      'A connect address is empty.',
+      'Use host:port, for example 127.0.0.1:1993.',
+    );
   }
   if (trimmed.startsWith('[')) {
     const end = trimmed.indexOf(']');
@@ -42,7 +46,10 @@ export function parseConnectAddress(value: string): ConnectAddress {
     }
     const host = trimmed.slice(1, end);
     if (!host || host.includes('%')) {
-      throw new MailError('CONFIG_ERROR', `Connect address "${trimmed}" has an invalid IPv6 literal.`);
+      throw new MailError(
+        'CONFIG_ERROR',
+        `Connect address "${trimmed}" has an invalid IPv6 literal.`,
+      );
     }
     return { host, port: parsePort(trimmed.slice(end + 2), trimmed) };
   }
@@ -71,13 +78,18 @@ function parsePort(value: string, original: string): number {
   }
   const port = Number(value);
   if (port < PORT_MIN || port > PORT_MAX) {
-    throw new MailError('CONFIG_ERROR', `Connect address "${original}" has a port outside 1-65535.`);
+    throw new MailError(
+      'CONFIG_ERROR',
+      `Connect address "${original}" has a port outside 1-65535.`,
+    );
   }
   return port;
 }
 
 /** TCP target plus the hostname used for SNI and certificate verification. */
-export function dialTarget(endpoint: Pick<EndpointSettings, 'host' | 'port' | 'connectHost' | 'connectPort' | 'tls'>): DialTarget {
+export function dialTarget(
+  endpoint: Pick<EndpointSettings, 'host' | 'port' | 'connectHost' | 'connectPort' | 'tls'>,
+): DialTarget {
   const logicalHost = endpoint.host;
   const logicalPort = endpoint.port;
   const host = endpoint.connectHost ?? logicalHost;

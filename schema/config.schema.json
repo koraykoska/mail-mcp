@@ -13,15 +13,7 @@
     },
     "logLevel": {
       "type": "string",
-      "enum": [
-        "trace",
-        "debug",
-        "info",
-        "warn",
-        "error",
-        "fatal",
-        "silent"
-      ]
+      "enum": ["trace", "debug", "info", "warn", "error", "fatal", "silent"]
     },
     "poolSize": {
       "type": "integer",
@@ -119,11 +111,7 @@
             "properties": {
               "type": {
                 "type": "string",
-                "enum": [
-                  "password",
-                  "xoauth2",
-                  "oauth2"
-                ]
+                "enum": ["password", "xoauth2", "oauth2"]
               },
               "password": {
                 "type": "string",
@@ -186,11 +174,7 @@
               "starttls": {
                 "description": "required (default when secure is false), optional, or disabled. disabled is cleartext and must be explicit.",
                 "type": "string",
-                "enum": [
-                  "required",
-                  "optional",
-                  "disabled"
-                ]
+                "enum": ["required", "optional", "disabled"]
               },
               "timeoutMs": {
                 "type": "integer",
@@ -216,9 +200,7 @@
                     "minLength": 1
                   }
                 },
-                "required": [
-                  "rejectUnauthorized"
-                ],
+                "required": ["rejectUnauthorized"],
                 "additionalProperties": false
               }
             },
@@ -254,11 +236,7 @@
               "starttls": {
                 "description": "required (default when secure is false), optional, or disabled. disabled is cleartext and must be explicit.",
                 "type": "string",
-                "enum": [
-                  "required",
-                  "optional",
-                  "disabled"
-                ]
+                "enum": ["required", "optional", "disabled"]
               },
               "timeoutMs": {
                 "type": "integer",
@@ -284,9 +262,7 @@
                     "minLength": 1
                   }
                 },
-                "required": [
-                  "rejectUnauthorized"
-                ],
+                "required": ["rejectUnauthorized"],
                 "additionalProperties": false
               }
             },
@@ -316,9 +292,7 @@
                   "type": "boolean"
                 }
               },
-              "required": [
-                "email"
-              ],
+              "required": ["email"],
               "additionalProperties": false
             }
           },
@@ -363,10 +337,7 @@
                 "maximum": 9007199254740991
               }
             },
-            "required": [
-              "max",
-              "windowMs"
-            ],
+            "required": ["max", "windowMs"],
             "additionalProperties": false
           },
           "appendSent": {

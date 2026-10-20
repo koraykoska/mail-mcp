@@ -96,7 +96,8 @@ export function selectIdentity(input: {
     ? input.identities
     : [{ id: 'default', email: input.accountEmail, default: true }];
   if (input.requested) {
-    const parsed = typeof input.requested === 'string' ? parseAddress(input.requested) : input.requested;
+    const parsed =
+      typeof input.requested === 'string' ? parseAddress(input.requested) : input.requested;
     const match = identities.find(
       (item) => normalizeMailbox(item.email) === normalizeMailbox(parsed.address),
     );
@@ -104,7 +105,11 @@ export function selectIdentity(input: {
       !match &&
       (input.allowFromDomains?.length ?? 0) > 0 &&
       domainAllowed(parsed.address, input.allowFromDomains ?? []);
-    if (!match && !domainOk && normalizeMailbox(parsed.address) !== normalizeMailbox(input.accountEmail)) {
+    if (
+      !match &&
+      !domainOk &&
+      normalizeMailbox(parsed.address) !== normalizeMailbox(input.accountEmail)
+    ) {
       throw new MailError(
         'PERMISSION_DENIED',
         `From address ${parsed.address} is not a configured identity.`,

@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import prettier from 'prettier';
 import { describe, expect, it } from 'vitest';
 import { loadConfig } from '../../src/config/load.js';
 import { renderConfigSchema } from '../../src/config/json-schema.js';
@@ -262,9 +263,13 @@ describe('catalog paging contract', () => {
 });
 
 describe('config schema', () => {
-  it('matches schema/config.schema.json', () => {
-    const file = readFileSync(new URL('../../schema/config.schema.json', import.meta.url), 'utf8');
-    expect(file).toBe(renderConfigSchema());
+  it('matches schema/config.schema.json', async () => {
+    const schemaUrl = new URL('../../schema/config.schema.json', import.meta.url);
+    const file = readFileSync(schemaUrl, 'utf8');
+    const rendered = await prettier.format(renderConfigSchema(), {
+      filepath: fileURLToPath(schemaUrl),
+    });
+    expect(file).toBe(rendered);
   });
 
   it('loads the documented multi-account example', () => {
