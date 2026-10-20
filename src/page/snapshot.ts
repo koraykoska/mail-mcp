@@ -229,7 +229,7 @@ export function assertCursorFits(
     cursor.scope !== expected.scope ||
     cursor.order !== expected.order ||
     cursor.cap !== expected.cap ||
-    JSON.stringify(cursor.sort) !== JSON.stringify(expected.sort)
+    sortSignature(cursor.sort) !== sortSignature(expected.sort)
   ) {
     throw new MailError(
       'CURSOR_INVALIDATED',
@@ -315,6 +315,12 @@ export function pageRows<T extends PageRow>(
         )
       : null;
   return { items, nextCursor, total: ordered.length, offset: start };
+}
+
+function sortSignature(keys: readonly SortKey[]): string {
+  return JSON.stringify(
+    keys.map((key) => ({ field: key.field, ...(key.reverse ? { reverse: true } : {}) })),
+  );
 }
 
 function canonical(row: PageRow, field: SortKey['field']): string {
