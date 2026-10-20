@@ -8,6 +8,7 @@ export const IDENTITY_REASONS = [
   'single-match',
   'default-no-match',
   'default-ambiguous',
+  'stored-draft',
 ] as const;
 
 export type IdentityReason = (typeof IDENTITY_REASONS)[number];

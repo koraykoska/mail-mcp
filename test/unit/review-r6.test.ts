@@ -383,16 +383,16 @@ describe('threads', () => {
     await session.append(
       'Later',
       simpleMessage({
-        subject: 'Re: Root',
-        messageId: '<reply@ex>',
-        inReplyTo: '<root@ex>',
-        references: '<root@ex>',
-        text: 'reply',
+        subject: 'Root copy',
+        messageId: '<root@ex>',
+        text: 'same message',
       }),
       [],
     );
     const thread = await service.getThread({ messageId: '<root@ex>' });
-    const folders = (thread.items as Array<{ mailbox: string }>).map((item) => item.mailbox);
+    const folders = (
+      thread.items as Array<{ mailbox: string; alsoIn?: Array<{ mailbox: string }> }>
+    ).flatMap((item) => [item.mailbox, ...(item.alsoIn ?? []).map((copy) => copy.mailbox)]);
     expect(folders).toEqual(expect.arrayContaining(['AAA', 'Later']));
   });
 

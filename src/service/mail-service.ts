@@ -34,6 +34,7 @@ import {
 import {
   parseFolderRequest,
   resolveFolderPaths,
+  comparePath,
   defaultThreadFolders,
   mailboxSelectable,
   uniquePaths,
@@ -92,10 +93,10 @@ import { hasHighOctets, stripBcc } from '../mime/transfer.js';
 import { headerValue, messageIds } from '../mime/headers.js';
 import {
   allowlistedHeaderEntries,
-  assertStoredSenderHeaders,
+  assertDraftHeaders,
   guardOutboundHeaders,
+  readRawHeaderFields,
   replyAddresses,
-  sameReplyList,
 } from '../mime/outbound-headers.js';
 import { buildReferences, forwardSubject, replySubject } from '../mime/subject.js';
 import {
@@ -1327,27 +1328,26 @@ export class MailService {
     if (!source) {
       throw new MailError('NOT_FOUND', `Draft UID ${input.uid} was not found.`);
     }
-    const parsed = await parseRawMessage(source);
-    assertStoredSenderHeaders(parsed.headers, (address, label) =>
+    const stored = assertDraftHeaders(readRawHeaderFields(source), (address, label) =>
       assertAllowedSender(account, address, label),
     );
+    const parsed = await parseRawMessage(source);
     const recipients = [...asMail(parsed.to), ...asMail(parsed.cc), ...asMail(parsed.bcc)];
     assertRecipients(account, recipients);
-    const draftedFrom = asMail(parsed.from)[0]?.address ?? account.email;
-    const identity = selectIdentity({
+    const selected = selectIdentity({
       identities: account.identities,
       accountEmail: account.email,
       allowFromDomains: account.allowFromDomains,
-      requested: input.from ?? draftedFrom,
+      requested: input.from ?? stored.from[0] ?? account.email,
     });
+    const identity = input.from ? selected : { ...selected, reason: 'stored-draft' as const };
     const from = identity.address.address;
-    const storedReply = asMail(parsed.replyTo);
     const callerReply = input.replyTo ? normalizeRecipients(input.replyTo) : [];
     const chosenReply = replyAddresses(
       callerReply.length > 0
         ? callerReply
-        : storedReply.length > 0
-          ? storedReply
+        : stored.replyTo.length > 0
+          ? stored.replyTo
           : configuredReplyTo(account, identity.email),
     );
     for (const item of chosenReply) {
@@ -1359,45 +1359,50 @@ export class MailService {
     if (account.sendRateLimit) {
       this.limiter.consume(account.id, account.sendRateLimit.max, account.sendRateLimit.windowMs);
     }
-    const rebuild =
-      Boolean(input.from) || Boolean(input.replyTo) || !sameReplyList(storedReply, chosenReply);
-    let wire = stripBcc(source);
-    if (rebuild) {
-      const built = await this.outboundFromParts(account, {
-        from: identity.address,
-        to: asMail(parsed.to),
-        cc: asMail(parsed.cc),
-        bcc: asMail(parsed.bcc),
-        ...(chosenReply.length > 0 ? { replyTo: chosenReply } : {}),
-        subject: parsed.subject,
-        ...(parsed.text !== undefined ? { text: parsed.text } : {}),
-        ...(parsed.html !== undefined ? { html: parsed.html } : {}),
-        attachments: parsed.attachments
-          .filter((item) => item.content)
-          .map((item) => ({
-            ...(item.filename ? { filename: item.filename } : {}),
-            contentType: item.contentType,
-            contentBase64: item.content?.toString('base64') ?? '',
-            ...(item.cid ? { cid: item.cid } : {}),
-            ...(item.inline ? { inline: true } : {}),
-          })),
-      });
-      built.message.from = identity.address;
-      if (parsed.messageId) {
-        built.message.messageId = parsed.messageId;
-      }
-      if (parsed.inReplyTo) {
-        built.message.inReplyTo = parsed.inReplyTo;
-      }
-      if (parsed.references.length > 0) {
-        built.message.references = parsed.references.join(' ');
-      }
-      const kept = allowlistedHeaderEntries(parsed.headers);
-      if (Object.keys(kept).length > 0) {
-        built.message.headers = { ...(built.message.headers ?? {}), ...kept };
-      }
-      wire = stripBcc(await buildRawMessage(built.message));
+    const fromHeader =
+      input.from || stored.from.length === 0
+        ? [identity.address]
+        : stored.from.map((item, index) =>
+            index === 0 && !item.name && identity.name ? identity.address : item,
+          );
+    const built = await this.outboundFromParts(account, {
+      from: identity.address,
+      to: asMail(parsed.to),
+      cc: asMail(parsed.cc),
+      bcc: asMail(parsed.bcc),
+      ...(chosenReply.length > 0 ? { replyTo: chosenReply } : {}),
+      subject: parsed.subject,
+      ...(parsed.text !== undefined ? { text: parsed.text } : {}),
+      ...(parsed.html !== undefined ? { html: parsed.html } : {}),
+      attachments: parsed.attachments
+        .filter((item) => item.content)
+        .map((item) => ({
+          ...(item.filename ? { filename: item.filename } : {}),
+          contentType: item.contentType,
+          contentBase64: item.content?.toString('base64') ?? '',
+          ...(item.cid ? { cid: item.cid } : {}),
+          ...(item.inline ? { inline: true } : {}),
+        })),
+    });
+    built.message.from = identity.address;
+    built.message.fromHeader = fromHeader;
+    if (stored.sender.length > 0) {
+      built.message.sender = stored.sender;
     }
+    if (parsed.messageId) {
+      built.message.messageId = parsed.messageId;
+    }
+    if (parsed.inReplyTo) {
+      built.message.inReplyTo = parsed.inReplyTo;
+    }
+    if (parsed.references.length > 0) {
+      built.message.references = parsed.references.join(' ');
+    }
+    const kept = { ...allowlistedHeaderEntries(parsed.headers), ...stored.kept };
+    if (Object.keys(kept).length > 0) {
+      built.message.headers = { ...(built.message.headers ?? {}), ...kept };
+    }
+    const wire = stripBcc(await buildRawMessage(built.message));
     const sender = await this.smtpFactory(account);
     try {
       const result = await sender.send({
@@ -1500,7 +1505,7 @@ export class MailService {
           : uniquePaths([
               ...seeded.matchedMailboxes,
               ...defaultThreadFolders(seed.mailbox, special),
-              ...(input.uid !== undefined ? [special.inbox ?? 'INBOX'] : []),
+              special.inbox ?? 'INBOX',
             ]);
       let messages: ConversationMessage[];
       let rounds = 0;
@@ -1679,6 +1684,10 @@ export class MailService {
           ...(input.includeBodies ? { text, textTruncated } : {}),
         });
       }
+      const inScope = new Set(paths);
+      const excludedMatches = seeded.folderHits
+        .filter((hit) => hit.count > 0 && !inScope.has(hit.mailbox))
+        .sort((left, right) => comparePath(left.mailbox, right.mailbox));
       return {
         ok: true as const,
         account: account.id,
@@ -1693,6 +1702,7 @@ export class MailService {
         truncated: truncated || folders.some((folder) => folder.truncated),
         order,
         snapshot: { folders },
+        excludedMatches,
       };
     });
   }
@@ -2486,41 +2496,62 @@ export class MailService {
       messageId?: string;
       folders?: unknown;
     },
-  ): Promise<{ seed: ConversationMessage; matchedMailboxes: string[] }> {
+  ): Promise<{
+    seed: ConversationMessage;
+    matchedMailboxes: string[];
+    folderHits: Array<{ mailbox: string; count: number }>;
+  }> {
     if (input.uid !== undefined && input.mailbox) {
       const seed = await session.withMailbox(input.mailbox, 'read', async (box) => {
         this.assertUid(box, input.uidValidity);
         const summary = await this.requireSummary(box, input.uid ?? 0);
         return this.conversationFrom(box, summary, input.mailbox ?? 'INBOX', 'header');
       });
-      return { seed, matchedMailboxes: [seed.mailbox] };
+      return { seed, matchedMailboxes: [seed.mailbox], folderHits: [] };
     }
     const id = normalizeMessageId(input.messageId);
     if (!id) {
       throw new MailError('INVALID_ARGUMENT', 'messageId is empty.');
     }
     const listed = await session.listMailboxes();
+    const special = await this.special(account, session);
+    const excluded = new Set(
+      input.folders === undefined
+        ? [special.trash, special.junk].filter((item): item is string => Boolean(item))
+        : [],
+    );
     const candidates =
       input.folders !== undefined
         ? await this.folderPaths(account, session, input)
         : listed.filter((item) => mailboxSelectable(item)).map((item) => item.path);
-    const hits: ConversationMessage[] = [];
+    const openHits: ConversationMessage[] = [];
+    const excludedHits: ConversationMessage[] = [];
     const matchedMailboxes: string[] = [];
+    const folderHits: Array<{ mailbox: string; count: number }> = [];
     for (const mailbox of candidates) {
       const found = await this.searchHeaderIds(session, mailbox, [id]);
-      if (found.length > 0) {
-        matchedMailboxes.push(mailbox);
+      if (found.length === 0) {
+        continue;
       }
-      hits.push(
-        ...found
-          .filter((item) => normalizeMessageId(item.messageId) === id)
-          .map((item) => ({
-            ...item,
-            linked: 'header' as const,
-          })),
-      );
+      folderHits.push({ mailbox, count: found.length });
+      const exact = found
+        .filter((item) => normalizeMessageId(item.messageId) === id)
+        .map((item) => ({
+          ...item,
+          linked: 'header' as const,
+        }));
+      if (exact.length === 0) {
+        continue;
+      }
+      if (excluded.has(mailbox)) {
+        excludedHits.push(...exact);
+        continue;
+      }
+      matchedMailboxes.push(mailbox);
+      openHits.push(...exact);
     }
-    const seed = [...hits].sort((left, right) => {
+    const pool = openHits.length > 0 ? openHits : excludedHits;
+    const seed = [...pool].sort((left, right) => {
       const pref =
         (left.mailbox.toUpperCase() === 'INBOX' ? 0 : 1) -
         (right.mailbox.toUpperCase() === 'INBOX' ? 0 : 1);
@@ -2538,9 +2569,13 @@ export class MailService {
     if (!seed) {
       throw new MailError('NOT_FOUND', `No message with Message-ID ${input.messageId} was found.`);
     }
+    if (openHits.length === 0) {
+      matchedMailboxes.push(seed.mailbox);
+    }
     return {
       seed,
       matchedMailboxes: uniquePaths(matchedMailboxes),
+      folderHits,
     };
   }
 

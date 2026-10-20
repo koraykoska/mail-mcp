@@ -14,6 +14,9 @@ export interface OutboundAttachment {
 
 export interface OutboundMessage {
   from: MailAddress;
+  /** Header From when it differs from the envelope identity. One field, sanitized addresses. */
+  fromHeader?: MailAddress[];
+  sender?: MailAddress[];
   to: MailAddress[];
   cc?: MailAddress[];
   bcc?: MailAddress[];
@@ -42,6 +45,7 @@ interface ComposerAttachment {
 
 interface ComposerMail {
   from: string;
+  sender?: string;
   to: string;
   cc?: string;
   bcc?: string;
@@ -75,12 +79,17 @@ export async function buildRawMessage(
   if (message.readReceipt) {
     headers['Disposition-Notification-To'] = formatAddress(message.from);
   }
+  const fromList =
+    message.fromHeader && message.fromHeader.length > 0 ? message.fromHeader : [message.from];
   const mail: ComposerMail = {
-    from: formatAddress(asciiAddress(message.from)),
+    from: fromList.map((item) => formatAddress(asciiAddress(item))).join(', '),
     to: message.to.map((item) => formatAddress(asciiAddress(item))).join(', '),
     subject: message.subject,
     headers,
   };
+  if (message.sender && message.sender.length > 0) {
+    mail.sender = message.sender.map((item) => formatAddress(asciiAddress(item))).join(', ');
+  }
   if (message.cc && message.cc.length > 0) {
     mail.cc = message.cc.map((item) => formatAddress(asciiAddress(item))).join(', ');
   }

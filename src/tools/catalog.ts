@@ -1369,7 +1369,7 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_send_message',
     title: 'Send a message',
     description:
-      'Submit a message over SMTP (RFC 5321 / RFC 6409). Supports text, HTML (multipart/alternative when both are set), attachments from base64 or a local path, inline cid images, extra headers, priority (high, normal, low), a read receipt (Disposition-Notification-To set from the From identity), and DSN options when the server advertises DSN. from and replyTo must be configured identities, or allowFromDomains must list the domain. When replyTo is omitted, the selected identity replyTo is used. headers is an allow-list: X-* plus List-Unsubscribe, List-Unsubscribe-Post, Auto-Submitted, Precedence, Importance, Keywords, and Comments. From, Sender, Reply-To, To, Cc, Bcc, Message-ID, Return-Path, Resent-*, and receipt or legacy reply headers are rejected; use the structured from, replyTo, to, cc, and bcc fields. Names that contain spaces, controls, or a colon are rejected. recipientDomainAllowList and sendRateLimit are enforced. After a successful send, the message is appended to Sent unless the provider is Gmail (which stores Sent itself) or appendSent is false or the account sets appendSent false. envelopeFrom and envelopeTo override the SMTP envelope without changing headers. Blocked when allowSend is false or readOnly.',
+      'Submit a message over SMTP (RFC 5321 / RFC 6409). Supports text, HTML (multipart/alternative when both are set), attachments from base64 or a local path, inline cid images, extra headers, priority (high, normal, low), a read receipt (Disposition-Notification-To set from the From identity), and DSN options when the server advertises DSN. from and replyTo must be configured identities, or allowFromDomains must list the domain. When replyTo is omitted, the selected identity replyTo is used. headers is an allow-list: X-* plus List-Unsubscribe, List-Unsubscribe-Post, Auto-Submitted, Precedence, Importance, Keywords, and Comments. Routing aliases are not allowed: X-Reply-To, X-Confirm-Reading-To, X-Sender, X-Envelope-From, X-Envelope-Sender, X-Envelope-To, X-Original-From, X-Original-Sender, X-Original-To, X-Original-Recipient, X-Apparently-From, X-Apparently-To, and X-Rcpt-To. From, Sender, Reply-To, To, Cc, Bcc, Message-ID, Return-Path, Resent-*, and receipt or legacy reply headers are rejected; use the structured from, replyTo, to, cc, and bcc fields. Names that contain spaces, controls, or a colon are rejected. recipientDomainAllowList and sendRateLimit are enforced. After a successful send, the message is appended to Sent unless the provider is Gmail (which stores Sent itself) or appendSent is false or the account sets appendSent false. envelopeFrom and envelopeTo override the SMTP envelope without changing headers. Blocked when allowSend is false or readOnly.',
     input: z.object({
       account: fields.account,
       from: fields.address
@@ -1393,7 +1393,7 @@ export const TOOLS: ToolDefinition[] = [
         .record(z.string(), z.string())
         .optional()
         .describe(
-          'Allow-listed headers only: X-* plus List-Unsubscribe, List-Unsubscribe-Post, Auto-Submitted, Precedence, Importance, Keywords, and Comments. Address headers are rejected; use from, replyTo, to, cc, and bcc.',
+          'Allow-listed headers only: X-* except routing aliases (X-Reply-To, X-Confirm-Reading-To, X-Sender, X-Envelope-From, X-Original-From, and the other names in the tool description), plus List-Unsubscribe, List-Unsubscribe-Post, Auto-Submitted, Precedence, Importance, Keywords, and Comments. Address headers are rejected; use from, replyTo, to, cc, and bcc.',
         ),
       priority: z
         .enum(['high', 'normal', 'low'])
@@ -1590,7 +1590,7 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_send_draft',
     title: 'Send a saved draft',
     description:
-      'Submit a saved draft over SMTP. The stored message is parsed on every send. From, Sender, Reply-To, every Resent-* address, and receipt or legacy reply headers must be configured identities, and recipientDomainAllowList and sendRateLimit apply. A stored Reply-To that is not an identity is PERMISSION_DENIED. When the draft has no Reply-To, the selected identity replyTo is applied. mailbox defaults to wherever the draft lives; pass the Drafts path and the draft UID. Does not delete the draft; call mail_delete_draft afterwards if you want it gone.',
+      'Submit a saved draft over SMTP. The stored message is parsed on every send and the submitted bytes are rebuilt. From, Sender, and Reply-To are written once from the checked addr-specs; a display name containing @ or <> is dropped after encoded-word decoding, and comments are removed. A second From, Sender, or Reply-To, or a field name that is not an RFC 5322 field name (whitespace before the colon), is PERMISSION_DENIED. Every address on From, Sender, Reply-To, Resent-*, and the receipt or legacy reply headers must be a configured identity. recipientDomainAllowList and sendRateLimit apply. When the draft has no Reply-To, the selected identity replyTo is applied. identityReason is stored-draft when from is omitted, and explicit when from is passed. mailbox defaults to wherever the draft lives; pass the Drafts path and the draft UID. Does not delete the draft; call mail_delete_draft afterwards if you want it gone.',
     input: z.object({
       account: fields.account,
       mailbox: fields.mailbox.describe('Mailbox that holds the draft, usually Drafts.'),
@@ -1617,7 +1617,11 @@ export const TOOLS: ToolDefinition[] = [
       identity: z
         .object({ id: z.string().nullable(), email: z.string(), name: z.string().optional() })
         .strict(),
-      identityReason: z.enum(['explicit', 'single-match', 'default-no-match', 'default-ambiguous']),
+      identityReason: z
+        .enum(['explicit', 'single-match', 'default-no-match', 'default-ambiguous', 'stored-draft'])
+        .describe(
+          'stored-draft when from is omitted and From comes from the draft. explicit when from is passed.',
+        ),
     }),
     annotations: {
       readOnlyHint: false,
@@ -1690,7 +1694,7 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_get_thread',
     title: 'Get a conversation',
     description:
-      'Return one conversation, earlier and later messages, across folders. Pass mailbox and uid, or a messageId. A Message-ID that exists in several folders uses every matching selectable folder plus Sent, Archive, and All. A mailbox and uid seed also searches the referenced Message-IDs in that default scope plus INBOX, so a Sent reply includes its INBOX parent and the same threadKey. folders is applied before the Message-ID lookup. \\Noselect and \\NonExistent paths are skipped; naming one returns MAILBOX_NOT_SELECTABLE. Junk and Trash are off unless you name them. Messages are linked by exact Message-ID, In-Reply-To, and References tokens. Gmail X-GM-THRID is used when X-GM-EXT-1 is present, otherwise OBJECTID THREADID. Each item says how it was linked: header, gmail-thrid, objectid, or subject. subject is opt-in via subjectHeuristic. Copies that share a Message-ID collapse; messages with no Message-ID stay separate. alsoIn lists the other folders. The envelope threadKey and every item threadKey are the earliest message with no parent in the set. The first page freezes mailbox and UID keys. Later pages re-fetch those keys, including a child whose linking parent was expunged, and a UIDVALIDITY change returns CURSOR_INVALIDATED. includeBodies caps the page at 20. Identities are listed by mail_list_accounts.',
+      'Return one conversation, earlier and later messages, across folders. Pass mailbox and uid, or a messageId. With no folders, a Message-ID seed uses the same scope as a mailbox and uid seed: the seed mailbox, INBOX, Sent, Archive, and All. Junk and Trash stay out unless named, and so does every other folder that is not in that scope. excludedMatches lists those folders when they still hold a matching message, with a count, so the caller can pass folders to include them. Copies of the same Message-ID outside Junk and Trash are included. folders is applied before the Message-ID lookup. \\Noselect and \\NonExistent paths are skipped; naming one returns MAILBOX_NOT_SELECTABLE. Messages are linked by exact Message-ID, In-Reply-To, and References tokens. Gmail X-GM-THRID is used when X-GM-EXT-1 is present, otherwise OBJECTID THREADID. Each item says how it was linked: header, gmail-thrid, objectid, or subject. subject is opt-in via subjectHeuristic. Copies that share a Message-ID collapse; messages with no Message-ID stay separate. alsoIn lists the other folders. The envelope threadKey and every item threadKey are the earliest message with no parent in the set. The first page freezes mailbox and UID keys. Later pages re-fetch those keys, including a child whose linking parent was expunged, and a UIDVALIDITY change returns CURSOR_INVALIDATED. includeBodies caps the page at 20. Identities are listed by mail_list_accounts.',
     input: z.object({
       account: fields.account,
       mailbox: fields.mailbox.optional().describe('Required with uid.'),
@@ -1731,6 +1735,18 @@ export const TOOLS: ToolDefinition[] = [
       rounds: z.number(),
       messages: z.array(z.record(z.string(), z.unknown())),
       offset: z.number(),
+      excludedMatches: z
+        .array(
+          z
+            .object({
+              mailbox: z.string(),
+              count: z.number().int(),
+            })
+            .strict(),
+        )
+        .describe(
+          'Folders outside this scope that still hold a matching message. Each entry is the mailbox and how many matches were found. Empty when every match is in scope. Pass folders to include one.',
+        ),
     }),
     annotations: {
       readOnlyHint: true,

@@ -113,7 +113,7 @@ Account `limits` override the root object per key. Summary pages cannot exceed t
 
 ## Folder scope
 
-Folder scope is a tool argument, not a config key. List and search tools default to one mailbox (`INBOX` when `mailbox` is omitted). `mail_get_thread` defaults to the seed mailbox plus Sent, Archive, and All, and leaves Junk and Trash out. `folders: "all"` skips Trash and Junk unless they are named or `includeTrash` / `includeJunk` is set.
+Folder scope is a tool argument, not a config key. List and search tools default to one mailbox (`INBOX` when `mailbox` is omitted). `mail_get_thread` with no `folders` uses the seed mailbox, INBOX, Sent, Archive, and All, and leaves Junk and Trash out. A Message-ID seed and a mailbox plus uid seed of the same message use that same scope. `excludedMatches` names folders outside the scope that still hold a match. `folders: "all"` skips Trash and Junk unless they are named or `includeTrash` / `includeJunk` is set.
 
 ## Single-account environment
 

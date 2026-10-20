@@ -20,6 +20,9 @@
 - Custom `headers` are an allow-list after the composer's header-name canonicalization. `mail_send_draft` checks the stored From, Sender, Reply-To, Resent-* addresses, and receipt headers on every send. Reply-To is emitted from the parsed address list. `Resent-Bcc` is stripped with `Bcc`.
 - A later `mail_get_thread` page re-fetches the frozen mailbox and UID keys and returns `CURSOR_INVALIDATED` when UIDVALIDITY changes. A mailbox and uid seed also searches INBOX.
 - A single-folder server SORT honors `maxSortCandidates` / `maxPerFolder` and reports `truncated`.
+- `mail_send_draft` always rebuilds `From`, `Sender`, and `Reply-To` from the checked addresses. A display name that contains another address is dropped, comments are removed, and a second copy or a field name with whitespace before the colon is `PERMISSION_DENIED`. `identityReason` is `stored-draft` when `from` is omitted.
+- Routing aliases `X-Reply-To`, `X-Confirm-Reading-To`, `X-Sender`, `X-Envelope-From`, `X-Envelope-Sender`, `X-Envelope-To`, `X-Original-From`, `X-Original-Sender`, `X-Original-To`, `X-Original-Recipient`, `X-Apparently-From`, `X-Apparently-To`, and `X-Rcpt-To` are rejected. Other `X-*` headers stay allowed.
+- A Message-ID seed with no `folders` uses the same scope as a mailbox and uid seed: the seed mailbox, INBOX, Sent, Archive, and All. Junk and Trash stay out. `excludedMatches` lists folders outside that scope that still hold a match.
 
 ## 0.1.0
 

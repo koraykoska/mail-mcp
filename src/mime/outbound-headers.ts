@@ -15,7 +15,13 @@ const HEADER_NAME_JUNK = new RegExp(
 const HEADER_TOKEN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
 
 /**
- * Custom `headers` may set these names, plus any X-* field.
+ * RFC 5322 field-name: printable ASCII except colon (ftext).
+ * Whitespace before the colon is not part of a field name.
+ */
+const FIELD_NAME = /^[!-9;-~]+$/;
+
+/**
+ * Custom `headers` may set these names, plus any X-* field that is not a routing alias.
  * In-Reply-To and References are set only by the reply path.
  */
 export const HEADER_ALLOWLIST = new Set([
@@ -27,6 +33,28 @@ export const HEADER_ALLOWLIST = new Set([
   'keywords',
   'comments',
 ]);
+
+/**
+ * X- names that are aliases of routing or receipt headers. Other X-* fields stay allowed.
+ * Documented in README and docs/SECURITY.md.
+ */
+export const DENIED_X_HEADERS = [
+  'X-Reply-To',
+  'X-Confirm-Reading-To',
+  'X-Sender',
+  'X-Envelope-From',
+  'X-Envelope-Sender',
+  'X-Envelope-To',
+  'X-Original-From',
+  'X-Original-Sender',
+  'X-Original-To',
+  'X-Original-Recipient',
+  'X-Apparently-From',
+  'X-Apparently-To',
+  'X-Rcpt-To',
+] as const;
+
+const DENIED_X_HEADER_SET = new Set<string>(DENIED_X_HEADERS.map((name) => name.toLowerCase()));
 
 const STRUCTURED_FIELD: Record<string, string> = {
   from: 'from',
@@ -73,7 +101,7 @@ const STORED_ADDRESS_HEADER_LIST = [
 const STORED_ADDRESS_HEADERS = new Set<string>(STORED_ADDRESS_HEADER_LIST);
 
 /** Present on a stored draft, these are refused rather than forwarded. */
-const STORED_REJECTED_HEADERS = ['return-path', 'resent-message-id', 'resent-date'] as const;
+const STORED_REJECTED_HEADERS = new Set(['return-path', 'resent-message-id', 'resent-date']);
 
 export function canonicalHeaderName(name: string): string {
   return name.replace(HEADER_NAME_JUNK, '').toLowerCase();
@@ -88,11 +116,25 @@ export function isHeaderToken(canonical: string): boolean {
 }
 
 function headerHint(canonical: string): string {
+  if (DENIED_X_HEADER_SET.has(canonical)) {
+    return `The ${canonical} header is an alias of a routing or receipt field. Use from, replyTo, to, cc, or bcc. Other X-* headers are allowed. Denied: ${DENIED_X_HEADERS.join(', ')}.`;
+  }
   const field = STRUCTURED_FIELD[canonical];
   if (field) {
     return `Use the structured ${field} field. from, replyTo, to, cc, and bcc are the address fields.`;
   }
-  return 'Use the structured fields from, replyTo, to, cc, and bcc. Custom headers are limited to X-* and List-Unsubscribe, List-Unsubscribe-Post, Auto-Submitted, Precedence, Importance, Keywords, and Comments.';
+  return 'Use the structured fields from, replyTo, to, cc, and bcc. Custom headers are limited to X-* (except routing aliases) and List-Unsubscribe, List-Unsubscribe-Post, Auto-Submitted, Precedence, Importance, Keywords, and Comments.';
+}
+
+export function isFieldName(name: string): boolean {
+  return FIELD_NAME.test(name);
+}
+
+function headerAllowed(canonical: string): boolean {
+  if (DENIED_X_HEADER_SET.has(canonical)) {
+    return false;
+  }
+  return canonical.startsWith('x-') || HEADER_ALLOWLIST.has(canonical);
 }
 
 function rejectHeader(name: string, canonical: string): never {
@@ -118,7 +160,7 @@ export function guardOutboundHeaders(headers: Record<string, string>): Record<st
         'A header name is a token. Spaces, controls, and a colon are rejected rather than stripped.',
       );
     }
-    if (!canonical.startsWith('x-') && !HEADER_ALLOWLIST.has(canonical)) {
+    if (!headerAllowed(canonical)) {
       rejectHeader(name, canonical);
     }
     out[canonical] = value;
@@ -134,64 +176,189 @@ export function allowlistedHeaderEntries(headers: Record<string, string>): Recor
     if (!canonical || headerNameChanged(name) || !isHeaderToken(canonical)) {
       continue;
     }
-    if (canonical.startsWith('x-') || HEADER_ALLOWLIST.has(canonical)) {
+    if (headerAllowed(canonical)) {
       out[canonical] = value;
     }
   }
   return out;
 }
 
+export interface RawHeaderField {
+  name: string;
+  value: string;
+}
+
+export interface DraftAddressHeaders {
+  from: MailAddress[];
+  sender: MailAddress[];
+  replyTo: MailAddress[];
+  /** Address headers other than From, Sender, Reply-To, Bcc, and Resent-Bcc, already sanitized. */
+  kept: Record<string, string>;
+}
+
+const SINGLETON_HEADERS = ['from', 'sender', 'reply-to'] as const;
+
 /**
- * A stored draft is checked on every send. From, Sender, Reply-To, every Resent-*
- * address, and the receipt and legacy reply headers must be configured identities.
+ * Unfold the header block and require every field name to be an RFC 5322 field-name.
+ * `From :` is rejected here: the space is not part of a field name.
  */
-export function assertStoredSenderHeaders(
-  headers: Record<string, string>,
-  assertAddress: (address: string, label: string) => void,
-): void {
-  for (const name of STORED_REJECTED_HEADERS) {
-    if (headers[name]) {
-      throw new MailError(
-        'PERMISSION_DENIED',
-        `The ${name} header cannot be sent from a draft.`,
-        headerHint(name),
-      );
-    }
-  }
-  for (const name of Object.keys(headers)) {
-    if (name.startsWith('resent-') && !STORED_ADDRESS_HEADERS.has(name)) {
-      throw new MailError(
-        'PERMISSION_DENIED',
-        `The ${name} header cannot be sent from a draft.`,
-        headerHint(name),
-      );
-    }
-  }
-  for (const name of STORED_ADDRESS_HEADER_LIST) {
-    const value = headers[name];
-    if (!value) {
+export function readRawHeaderFields(source: Buffer | string): RawHeaderField[] {
+  const text = typeof source === 'string' ? source : source.toString('utf8');
+  const splitAt = text.search(/\r?\n\r?\n/);
+  const block = splitAt >= 0 ? text.slice(0, splitAt) : text;
+  const unfolded: string[] = [];
+  for (const line of block.split(/\r?\n/)) {
+    if (line.length === 0) {
       continue;
     }
-    let addresses: MailAddress[];
-    try {
-      addresses = parseAddressList(value);
-    } catch (error) {
-      if (error instanceof MailError) {
-        throw new MailError(
-          'PERMISSION_DENIED',
-          `The ${name} header is not a list of addresses.`,
-          error.hint,
-        );
+    if ((line.startsWith(' ') || line.startsWith('\t')) && unfolded.length > 0) {
+      const previous = unfolded[unfolded.length - 1] ?? '';
+      unfolded[unfolded.length - 1] = `${previous} ${line.trim()}`;
+      continue;
+    }
+    unfolded.push(line);
+  }
+  const fields: RawHeaderField[] = [];
+  for (const line of unfolded) {
+    const colon = line.indexOf(':');
+    if (colon <= 0) {
+      throw new MailError(
+        'PERMISSION_DENIED',
+        'The draft has a header line without a field name.',
+        'Each header is a field name, a colon, and a value.',
+      );
+    }
+    const name = line.slice(0, colon);
+    if (!isFieldName(name)) {
+      throw new MailError(
+        'PERMISSION_DENIED',
+        `Header name "${name.trim() || name}" is not a valid field name.`,
+        'A field name is printable ASCII without whitespace or a colon.',
+      );
+    }
+    fields.push({ name, value: line.slice(colon + 1).trim() });
+  }
+  return fields;
+}
+
+/** Remove RFC 5322 comments. Parentheses inside a quoted display name stay. */
+export function stripAddressComments(value: string): string {
+  let out = '';
+  let quote = false;
+  let depth = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const char = value[index] ?? '';
+    if (depth > 0) {
+      if (char === '\\') {
+        index += 1;
+        continue;
       }
-      throw error;
+      if (char === '(') {
+        depth += 1;
+      } else if (char === ')') {
+        depth -= 1;
+      }
+      continue;
     }
-    if (addresses.length === 0) {
-      throw new MailError('PERMISSION_DENIED', `The ${name} header is not a list of addresses.`);
+    if (char === '"') {
+      quote = !quote;
+      out += char;
+      continue;
     }
-    for (const item of addresses) {
-      assertAddress(item.address, name);
+    if (char === '(' && !quote) {
+      depth = 1;
+      continue;
+    }
+    out += char;
+  }
+  return out.replace(/[ \t]{2,}/g, ' ').trim();
+}
+
+function parseStoredAddresses(name: string, value: string): MailAddress[] {
+  let addresses: MailAddress[];
+  try {
+    addresses = parseAddressList(stripAddressComments(value));
+  } catch (error) {
+    if (error instanceof MailError) {
+      throw new MailError(
+        'PERMISSION_DENIED',
+        `The ${name} header is not a list of addresses.`,
+        error.hint,
+      );
+    }
+    throw error;
+  }
+  const sanitized = replyAddresses(addresses);
+  if (sanitized.length === 0) {
+    throw new MailError('PERMISSION_DENIED', `The ${name} header is not a list of addresses.`);
+  }
+  return sanitized;
+}
+
+/**
+ * Walk every raw header, including a second copy of From, Sender, or Reply-To.
+ * Address checks use the unfolded value with comments removed. Display names that
+ * hide another address are dropped, the same way a composed Reply-To is emitted.
+ */
+export function assertDraftHeaders(
+  fields: readonly RawHeaderField[],
+  assertAddress: (address: string, label: string) => void,
+): DraftAddressHeaders {
+  const counts = new Map<string, number>();
+  const from: MailAddress[] = [];
+  const sender: MailAddress[] = [];
+  const replyTo: MailAddress[] = [];
+  const keptLists = new Map<string, MailAddress[]>();
+  for (const field of fields) {
+    const canonical = field.name.toLowerCase();
+    counts.set(canonical, (counts.get(canonical) ?? 0) + 1);
+    if (DENIED_X_HEADER_SET.has(canonical) || STORED_REJECTED_HEADERS.has(canonical)) {
+      throw new MailError(
+        'PERMISSION_DENIED',
+        `The ${field.name} header cannot be sent from a draft.`,
+        headerHint(canonical),
+      );
+    }
+    if (canonical.startsWith('resent-') && !STORED_ADDRESS_HEADERS.has(canonical)) {
+      throw new MailError(
+        'PERMISSION_DENIED',
+        `The ${field.name} header cannot be sent from a draft.`,
+        headerHint(canonical),
+      );
+    }
+    if (!STORED_ADDRESS_HEADERS.has(canonical)) {
+      continue;
+    }
+    const sanitized = parseStoredAddresses(field.name, field.value);
+    for (const item of sanitized) {
+      assertAddress(item.address, field.name);
+    }
+    if (canonical === 'from') {
+      from.push(...sanitized);
+    } else if (canonical === 'sender') {
+      sender.push(...sanitized);
+    } else if (canonical === 'reply-to') {
+      replyTo.push(...sanitized);
+    } else if (canonical !== 'bcc' && canonical !== 'resent-bcc') {
+      const list = keptLists.get(canonical) ?? [];
+      list.push(...sanitized);
+      keptLists.set(canonical, list);
     }
   }
+  for (const name of SINGLETON_HEADERS) {
+    if ((counts.get(name) ?? 0) > 1) {
+      throw new MailError(
+        'PERMISSION_DENIED',
+        `The ${name} header appears more than once.`,
+        'A draft may contain one From, one Sender, and one Reply-To.',
+      );
+    }
+  }
+  const kept: Record<string, string> = {};
+  for (const [name, list] of keptLists) {
+    kept[name] = formatAddressList(list);
+  }
+  return { from, sender, replyTo, kept };
 }
 
 /** Emit Reply-To from the parsed addresses. A display name that hides another address is dropped. */
@@ -203,13 +370,6 @@ export function replyAddresses(addresses: readonly MailAddress[]): MailAddress[]
     }
     return { name: visible, address: item.address };
   });
-}
-
-export function sameReplyList(
-  left: readonly MailAddress[],
-  right: readonly MailAddress[],
-): boolean {
-  return formatAddressList(replyAddresses(left)) === formatAddressList(replyAddresses(right));
 }
 
 function decodeEncodedWords(value: string): string {
