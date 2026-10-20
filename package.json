@@ -1,0 +1,83 @@
+{
+  "name": "mail-mcp",
+  "version": "0.1.0",
+  "description": "IMAP and SMTP mail client exposed as a Model Context Protocol server",
+  "type": "module",
+  "license": "MIT",
+  "author": "Koray Koska <koray@koska.family>",
+  "homepage": "https://github.com/koraykoska/mail-mcp#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/koraykoska/mail-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/koraykoska/mail-mcp/issues"
+  },
+  "keywords": [
+    "imap",
+    "smtp",
+    "email",
+    "mail",
+    "mcp",
+    "model-context-protocol"
+  ],
+  "bin": {
+    "mail-mcp": "./dist/cli.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "docs"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "vitest run --project unit --project integration",
+    "test:unit": "vitest run --project unit",
+    "test:integration": "vitest run --project integration",
+    "test:e2e": "vitest run --project e2e",
+    "test:coverage": "vitest run --project unit --project integration --coverage",
+    "docs:tools": "tsx scripts/generate-tools-md.ts",
+    "docs:check": "tsx scripts/generate-tools-md.ts --check",
+    "smoke:pack": "node scripts/pack-smoke.mjs",
+    "check": "npm run format:check && npm run lint && npm run typecheck && npm run docs:check && npm run test:coverage && npm run build && npm run test:e2e && npm run smoke:pack",
+    "release": "node scripts/release.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "html-to-text": "^9.0.5",
+    "iconv-lite": "^0.6.3",
+    "imapflow": "^2.5.8",
+    "mailparser": "^3.7.4",
+    "nodemailer": "^7.0.6",
+    "zod": "^4.1.11"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.36.0",
+    "@types/mailparser": "^3.4.6",
+    "@types/node": "^22.18.6",
+    "@types/nodemailer": "^6.4.17",
+    "@vitest/coverage-v8": "^3.2.4",
+    "eslint": "^9.36.0",
+    "prettier": "^3.6.2",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2",
+    "typescript-eslint": "^8.44.1",
+    "vitest": "^3.2.4"
+  }
+}
