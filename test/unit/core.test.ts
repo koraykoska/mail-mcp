@@ -123,7 +123,7 @@ describe('pagination', () => {
     expect(() => decodeCursor(Buffer.from('1').toString('base64url'))).toThrow(MailError);
     expect(() => decodeCursor(encodeCursor({ v: 1, offset: -1 }))).toThrow(MailError);
     expect(() => decodeCursor(encodeCursor({ v: 2, afterUid: 0 }))).toThrow(MailError);
-    expect(pageAfterUid([4, 3, 2, 1], 2).nextCursor).toEqual(expect.any(String));
+    expect(pageAfterUid([4, 3, 2, 1], 2, undefined).nextCursor).toEqual(expect.any(String));
     expect(paginate([1], 0, 2).nextCursor).toBeUndefined();
   });
 });
