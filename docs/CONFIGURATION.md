@@ -78,7 +78,7 @@ A top-level `password` is shorthand for password auth.
 
 ## Identities
 
-`identities` is a list of `{ id?, name?, email, replyTo?, default? }` for one mailbox. The account email is added when it is missing. Exactly one identity is default; if none is marked, the first becomes the default. Send and draft tools take `from`. An unknown address is rejected unless `allowFromDomains` lists its domain. Replies pick an identity only when exactly one configured address appears verbatim in To or Cc. `MAIL_IDENTITIES` sets the list for the env account (`Name <addr@example.com>`, commas inside `<>` are not separators).
+`identities` is a list of `{ id?, name?, email, replyTo?, default? }` for one mailbox. The account email is added when it is missing. Exactly one identity is default; if none is marked, the first becomes the default. Send and draft tools take `from` and `replyTo`. An unknown address is rejected unless `allowFromDomains` lists its domain. The same check applies to `Reply-To` and the other address headers in `headers`. When `replyTo` is omitted, the identity's `replyTo` is used. Replies pick an identity only when exactly one configured address appears verbatim in To or Cc. `MAIL_IDENTITIES` sets the list for the env account (`Name <addr@example.com>`, commas inside `<>` are not separators).
 
 ## Safety
 

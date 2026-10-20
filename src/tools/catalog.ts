@@ -90,7 +90,7 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_list_accounts',
     title: 'List configured accounts',
     description:
-      'List every account this server can use, without secrets. Use it first when more than one account is configured, then pass the id as `account` on later calls. The default account is marked. Read-only metadata: provider, safety switches, whether SMTP is configured, and From identities. Does not open a network connection.',
+      'List every account this server can use, without secrets. Use it first when more than one account is configured, then pass the id as `account` on later calls. The default account is marked. Read-only metadata: provider, safety switches, whether SMTP is configured, and From identities including each identity replyTo. Does not open a network connection.',
     input: z.object({}).describe('No arguments.'),
     output: strictOutput({
       ok: fields.ok,
@@ -878,7 +878,7 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_list_threads',
     title: 'List threads',
     description:
-      'Group messages into threads in one mailbox unless folders is set. Uses the THREAD extension (REFERENCES by default, or ORDEREDSUBJECT) when the server advertises it and the search is "all"; otherwise threads are built from References and In-Reply-To. ORDEREDSUBJECT is the opt-in subject heuristic. The result is a tree plus a paged flat list. Gmail thread ids, when present on summaries, are a separate field from this tree. A folder larger than maxSortCandidates is truncated and reports omitted and scanned.',
+      'Group messages into threads in one mailbox unless folders is set. source is server only when a single folder uses the server THREAD tree. Several folders are built on the client from References and In-Reply-To, and each node is mailbox plus UID. ORDEREDSUBJECT is the opt-in subject heuristic. Every item carries the same threadKey for that conversation: the earliest message with no parent in the set. A folder larger than maxSortCandidates is truncated and reports omitted and scanned. Later pages stay inside the first page UID bound.',
     input: z.object({
       account: fields.account,
       mailbox: fields.mailbox.optional(),
@@ -1676,7 +1676,7 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_get_thread',
     title: 'Get a conversation',
     description:
-      'Return one conversation, earlier and later messages, across folders. Pass mailbox and uid, or a messageId. Default folders are the seed mailbox plus Sent, Archive, and All. Junk and Trash are off unless you name them. Messages are linked by Message-ID, In-Reply-To, and References. Gmail X-GM-THRID is used when X-GM-EXT-1 is present, otherwise OBJECTID THREADID. Each item says how it was linked: header, gmail-thrid, objectid, or subject. subject is opt-in via subjectHeuristic. Copies that share a Message-ID collapse; messages with no Message-ID stay separate. alsoIn lists the other folders. The page is a snapshot: mail that arrives later needs a new call without a cursor. includeBodies caps the page at 20. Identities are listed by mail_list_accounts.',
+      'Return one conversation, earlier and later messages, across folders. Pass mailbox and uid, or a messageId. A Message-ID that exists in several folders uses every matching folder plus Sent, Archive, and All. Junk and Trash are off unless you name them. Messages are linked by exact Message-ID, In-Reply-To, and References tokens. Gmail X-GM-THRID is used when X-GM-EXT-1 is present, otherwise OBJECTID THREADID. Each item says how it was linked: header, gmail-thrid, objectid, or subject. subject is opt-in via subjectHeuristic. Copies that share a Message-ID collapse; messages with no Message-ID stay separate. alsoIn lists the other folders. The envelope threadKey and every item threadKey are the earliest message with no parent in the set, and the first page freezes that UID set. includeBodies caps the page at 20. Identities are listed by mail_list_accounts.',
     input: z.object({
       account: fields.account,
       mailbox: fields.mailbox.optional().describe('Required with uid.'),
@@ -1760,7 +1760,7 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_list_attachments',
     title: 'List attachment metadata',
     description:
-      'Page attachment metadata across a folder scope: filename, contentType, size, and partId. No bytes. Messages past the per-folder cap are omitted and truncated is true. Use mail_download_attachment for the bytes of one part.',
+      'Page attachment metadata across a folder scope: filename, contentType, size, and partId. No bytes. Each row is one part, so a message with several attachments takes several rows. The cursor keeps mailbox, UIDVALIDITY, UID, and partId, and later pages stay inside the first page UID bound. Messages past the per-folder cap are omitted and truncated is true. Use mail_download_attachment for the bytes of one part.',
     input: z.object({
       account: fields.account,
       mailbox: fields.mailbox.optional(),
@@ -1786,7 +1786,7 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_list_correspondents',
     title: 'List correspondents',
     description:
-      'Count exact normalized From addresses over a folder scope and optional search. Own identities are excluded. Ties break by address. scanned is how many messages were read. truncated is true when a folder hit its cap, and then the counts cover only the scanned subset. Discover identities with mail_list_accounts.',
+      'Count exact normalized From addresses over a folder scope and optional search. Own identities are excluded. Ties break by address. Every matching UID is read in batches, up to 10000 messages per folder. Above that cap truncated and partial are true and the counts cover only that prefix, not the whole mailbox. Later pages reuse the first page UID bound. Discover identities with mail_list_accounts.',
     input: z.object({
       account: fields.account,
       mailbox: fields.mailbox.optional(),
@@ -1794,7 +1794,16 @@ export const TOOLS: ToolDefinition[] = [
       search: fields.search.optional(),
       maxPerFolder: fields.maxPerFolder,
     }),
-    output: strictOutput({ ...baseOut, offset: z.number(), scanned: z.number() }),
+    output: strictOutput({
+      ...baseOut,
+      offset: z.number(),
+      scanned: z.number(),
+      partial: z
+        .boolean()
+        .describe(
+          'True when the counts cover only the scanned prefix of a folder over 10000 matches.',
+        ),
+    }),
     annotations: {
       readOnlyHint: true,
       destructiveHint: false,
@@ -1812,7 +1821,7 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_search_facets',
     title: 'Count a search',
     description:
-      'Exact counts for a folder scope and optional search: matches, unread, flagged, and answered per folder, plus a has-attachments count and the top sender addresses and domains. top defaults to 10 and maxes at 100. Ties break alphabetically. Flag counts come from SEARCH and stay exact. Sender and attachment counts cover the scanned subset when a folder is truncated. This tool does not page.',
+      'Counts for a folder scope and optional search: matches, unread, flagged, and answered per folder, plus a has-attachments count and the top sender addresses and domains. top defaults to 10 and maxes at 100. Ties break alphabetically. Flag counts come from SEARCH and stay exact. Sender and attachment counts read every matching UID in batches, up to 10000 per folder. Above that cap truncated and partial are true and those two counts cover only the scanned prefix. This tool does not page.',
     input: z.object({
       account: fields.account,
       mailbox: fields.mailbox.optional(),
@@ -1835,6 +1844,11 @@ export const TOOLS: ToolDefinition[] = [
       domains: z.array(z.object({ value: z.string(), count: z.number() }).strict()),
       scanned: z.number(),
       truncated: z.boolean(),
+      partial: z
+        .boolean()
+        .describe(
+          'True when sender and attachment counts cover only the first 10000 matches in a folder.',
+        ),
       top: z.number(),
     }),
     annotations: {
@@ -1853,7 +1867,7 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_modify_by_search',
     title: 'Modify messages that match a search',
     description:
-      'Apply addFlags, removeFlags, move, or archive to every message in a folder scope that matches search. dryRun defaults to true and only pages a preview. A real run is refused with SIZE_LIMIT when the match count exceeds limits.maxBulk. move and archive require allowDelete. Adding or removing \\Deleted does too. There is no permanent delete here. The preview uses the shared snapshot cursor.',
+      'Apply addFlags, removeFlags, move, or archive to every message in a folder scope that matches search. dryRun defaults to true and only pages a preview. A real run is refused with SIZE_LIMIT, and changes nothing, when the match count exceeds limits.maxBulk or any folder is truncated or not fully loaded. move and archive require allowDelete. Adding or removing \\Deleted does too. There is no permanent delete here. The preview uses the shared snapshot cursor. The tool is a write: a readOnly account does not advertise it.',
     input: z.object({
       account: fields.account,
       mailbox: fields.mailbox.optional(),
@@ -1885,7 +1899,7 @@ export const TOOLS: ToolDefinition[] = [
       idempotentHint: false,
       openWorldHint: true,
     },
-    kind: 'read',
+    kind: 'message-write',
     paged: true,
     examples: ['{"mailbox":"INBOX","search":{"seen":true},"action":"archive","dryRun":true}'],
     async run(args, service) {

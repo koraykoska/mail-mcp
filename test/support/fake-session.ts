@@ -54,6 +54,8 @@ export class FakeSession implements ImapSession {
   changes: MailboxChange[] = [];
   structure: BodyNode | null = null;
   sourceMissing = false;
+  /** UIDs that SEARCH and SORT still return, but FETCH omits. */
+  ghostUids = new Set<number>();
   partBodies = new Map<string, { content: Buffer; contentType: string; filename?: string }>();
 
   constructor(
@@ -329,9 +331,12 @@ class FakeBox implements OpenMailbox {
   ): Promise<MessageSummary[]> {
     return uids.flatMap((uid) => {
       const message = this.box.messages.find((item) => item.uid === uid);
-      if (!message) {
+      if (!message || this.session.ghostUids.has(uid)) {
         return [];
       }
+      const messageId = headerIds(message.raw, 'message-id')[0];
+      const inReplyTo = headerIds(message.raw, 'in-reply-to')[0];
+      const references = headerIds(message.raw, 'references');
       const summary: MessageSummary = {
         uid: message.uid,
         flags: [...message.flags],
@@ -343,6 +348,9 @@ class FakeBox implements OpenMailbox {
         cc: [],
         replyTo: [],
         hasAttachments: message.raw.includes(Buffer.from('Content-Disposition: attachment')),
+        ...(messageId ? { messageId } : {}),
+        ...(inReplyTo ? { inReplyTo } : {}),
+        ...(references.length > 0 ? { references } : {}),
       };
       if (message.subject) {
         summary.subject = message.subject;
@@ -606,6 +614,14 @@ function uidInSet(uid: number, set: string): boolean {
 function header(raw: Buffer, name: string): string | undefined {
   const match = new RegExp(`^${name}:\\s*(.+)$`, 'im').exec(raw.toString('utf8'));
   return match?.[1]?.trim();
+}
+
+function headerIds(raw: Buffer, name: string): string[] {
+  const value = header(raw, name);
+  if (!value) {
+    return [];
+  }
+  return [...value.matchAll(/<[^<>]+>/g)].map((item) => item[0]);
 }
 
 export class FakePool {

@@ -48,6 +48,57 @@ export function messageKey(message: Pick<ConversationMessage, 'mailbox' | 'uid'>
   return `${message.mailbox}\0${message.uid}`;
 }
 
+/**
+ * One key for the whole conversation. It is the earliest message that has no
+ * parent in the set: its Message-ID when it has one, otherwise mailbox, UIDVALIDITY, and UID.
+ * A later reply does not change it, and neither does newest-first versus oldest-first.
+ */
+export function conversationThreadKey(
+  messages: readonly Pick<
+    ConversationMessage,
+    | 'messageId'
+    | 'inReplyTo'
+    | 'references'
+    | 'date'
+    | 'internalDate'
+    | 'mailbox'
+    | 'uid'
+    | 'uidValidity'
+  >[],
+): string {
+  const present = new Set(
+    messages.map((item) => normalizeMessageId(item.messageId)).filter((item) => item.length > 0),
+  );
+  const roots = messages.filter((message) => {
+    const parents = [message.inReplyTo, ...message.references]
+      .map((item) => normalizeMessageId(item))
+      .filter((item) => item.length > 0 && item !== normalizeMessageId(message.messageId));
+    return !parents.some((item) => present.has(item));
+  });
+  const pool = roots.length > 0 ? roots : [...messages];
+  const earliest = [...pool].sort((left, right) => {
+    const leftDate = left.date || left.internalDate || '';
+    const rightDate = right.date || right.internalDate || '';
+    if (leftDate < rightDate) {
+      return -1;
+    }
+    if (leftDate > rightDate) {
+      return 1;
+    }
+    if (left.mailbox < right.mailbox) {
+      return -1;
+    }
+    if (left.mailbox > right.mailbox) {
+      return 1;
+    }
+    return left.uid - right.uid;
+  })[0];
+  if (!earliest) {
+    return 'uid:::0';
+  }
+  return threadKeyFor(earliest);
+}
+
 export function threadKeyFor(
   root: Pick<ConversationMessage, 'messageId' | 'mailbox' | 'uid' | 'uidValidity'>,
 ): string {
@@ -157,16 +208,22 @@ export async function closeByHeaders(options: {
   const byKey = new Map<string, ConversationMessage>();
   const known = new Set<string>();
   const searched = new Set<string>();
+  const counted = new Set<string>();
   let truncated = false;
   const remember = (message: ConversationMessage): void => {
     const key = messageKey(message);
     if (byKey.has(key)) {
       return;
     }
-    if (byKey.size >= options.maxMessages) {
+    // Copies of one Message-ID are one message. The cap is applied after that,
+    // so a second folder does not consume a slot and hide a different message.
+    const id = normalizeMessageId(message.messageId);
+    const capKey = id || key;
+    if (!counted.has(capKey) && counted.size >= options.maxMessages) {
       truncated = true;
       return;
     }
+    counted.add(capKey);
     byKey.set(key, { ...message, linked: message.linked || 'header' });
     for (const id of idsOf(message)) {
       known.add(id);

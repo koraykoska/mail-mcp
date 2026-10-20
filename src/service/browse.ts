@@ -33,6 +33,10 @@ export interface PageRequest {
   order?: PageOrder;
 }
 
+/** Hard cap for exact correspondent and facet scans. Above this the counts are partial. */
+export const MAX_EXACT_SCAN = 10_000;
+const FETCH_BATCH = 200;
+
 export interface FolderScan {
   mailbox: string;
   uidValidity: string;
@@ -104,6 +108,11 @@ export async function scanFolders(
     singleUidValidity?: string;
     /** When true, summaries are loaded even if a server UID list is enough to page. */
     materialize?: boolean;
+    /**
+     * Read every matching UID, in batches, up to this cap. Used for counts that must
+     * cover the whole snapshot. A longer match is truncated and the counts are partial.
+     */
+    exactCap?: number;
   },
 ): Promise<{ scans: FolderScan[]; sortSource: 'server' | 'client' }> {
   const scans: FolderScan[] = [];
@@ -164,7 +173,14 @@ export async function scanFolders(
       let scannedIds = serverUids ?? matched;
       let omitted = 0;
       let truncated = false;
-      if (scannedIds.length > options.maxPerFolder && !serverUids) {
+      if (options.exactCap !== undefined) {
+        const ordered = [...matched].sort((left, right) => left - right);
+        const window = ordered.slice(0, options.exactCap);
+        omitted = ordered.length - window.length;
+        scannedIds = window;
+        truncated = omitted > 0;
+        serverUids = undefined;
+      } else if (scannedIds.length > options.maxPerFolder && !serverUids) {
         const ordered = [...scannedIds].sort((left, right) => left - right);
         const window =
           options.order === 'oldest-first'
@@ -181,7 +197,7 @@ export async function scanFolders(
         serverUids = scannedIds;
       }
       const fetchIds = !options.materialize && paths.length === 1 && serverUids ? [] : scannedIds;
-      const summaries = await box.fetchSummaries(fetchIds, {
+      const summaries = await fetchSummariesBatched(box, fetchIds, {
         snippet: false,
         snippetChars: 0,
       });
@@ -207,6 +223,22 @@ export async function scanFolders(
     sortSource = 'server';
   }
   return { scans, sortSource };
+}
+
+export async function fetchSummariesBatched(
+  box: OpenMailbox,
+  uids: readonly number[],
+  options: { snippet: boolean; snippetChars: number },
+): Promise<MessageSummary[]> {
+  const summaries: MessageSummary[] = [];
+  for (let index = 0; index < uids.length; index += FETCH_BATCH) {
+    const batch = uids.slice(index, index + FETCH_BATCH);
+    if (batch.length === 0) {
+      continue;
+    }
+    summaries.push(...(await box.fetchSummaries(batch, options)));
+  }
+  return summaries;
 }
 
 function emptyScan(mailbox: string, box: OpenMailbox, upperUid: number): FolderScan {

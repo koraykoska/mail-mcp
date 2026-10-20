@@ -83,7 +83,7 @@ describe('IMAP session branches', () => {
     await server.close();
   });
 
-  it('falls back when display sort is rejected and refuses a sort the server rejects', async () => {
+  it('falls back when display sort is rejected and returns null when SORT is refused', async () => {
     const server = new ScriptedImap({
       capabilities: ['IMAP4rev1', 'SORT', 'SORT=DISPLAY', 'ESORT', 'UIDPLUS'],
       badSortIncluding: 'DISPLAY',
@@ -112,7 +112,7 @@ describe('IMAP session branches', () => {
       second.withMailbox('INBOX', 'read', (box) =>
         box.serverSort({ query: { all: true }, requires: [] }, [{ field: 'date', reverse: true }]),
       ),
-    ).rejects.toBeInstanceOf(MailError);
+    ).resolves.toBeNull();
     expect(
       await second.withMailbox('INBOX', 'read', (box) =>
         box.serverThread('REFERENCES', { query: { all: true }, requires: [] }),

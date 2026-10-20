@@ -79,7 +79,7 @@ describe('threading', () => {
       },
       { uid: 3, messageId: '<c@x>', subject: 'Other' },
     ]);
-    expect(flattenThread(tree)).toEqual([1, 2, 3]);
+    expect(flattenThread(tree).map((item) => item.uid)).toEqual([1, 2, 3]);
     const bySubject = threadMessages(
       [
         { uid: 1, subject: 'Hello' },
@@ -87,7 +87,7 @@ describe('threading', () => {
       ],
       true,
     );
-    expect(flattenThread(bySubject)).toEqual([1, 2]);
+    expect(flattenThread(bySubject).map((item) => item.uid)).toEqual([1, 2]);
   });
 });
 

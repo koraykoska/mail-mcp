@@ -197,7 +197,7 @@ describe('mail service against the in-memory session', () => {
       to: ['ada@example.com'],
       cc: ['bea@example.com'],
       bcc: ['cy@example.com'],
-      replyTo: ['reply@example.com'],
+      replyTo: ['user@example.com'],
       subject: 'Full',
       text: 't',
       html: '<p>h</p>',

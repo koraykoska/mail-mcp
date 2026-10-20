@@ -18,7 +18,8 @@ Implicit TLS is the default for the usual IMAP and submission ports. Cleartext i
 
 - `readOnly` accounts cannot create folders, change flags, append, delete, or send. If every account is read-only, mutating tools are not registered.
 - `allowPermanentDelete` defaults to false. Delete moves to Trash. Expunge and permanent UID delete stay off until the flag is set.
-- `recipientDomainAllowList` is applied to the SMTP envelope (`envelopeTo` when set, otherwise To, Cc, and Bcc). `envelopeFrom` and a draft's From must be a configured identity, unless `allowFromDomains` lists that address's domain. An empty allow-list means identities only.
+- `recipientDomainAllowList` is applied to the SMTP envelope (`envelopeTo` when set, otherwise To, Cc, and Bcc). `envelopeFrom`, `from`, and `replyTo` must be a configured identity, unless `allowFromDomains` lists that address's domain. An empty allow-list means identities only. `headers` may not set `Message-ID` or `Return-Path`. `From`, `Sender`, `Reply-To`, `To`, `Cc`, and `Bcc` in `headers` have to pass the same identity check. When `replyTo` is omitted, the selected identity's reply-to address is applied.
+- `mail_modify_by_search` is a write. A read-only account does not advertise it. A real run that truncated a folder, or that did not load every match, fails with `SIZE_LIMIT` and changes nothing.
 - `sendRateLimit` caps submissions per account inside this process. It is not a cluster-wide limit.
 - `attachmentsDir` is required for `savePath` writes and for attachment `path` reads. Both are resolved with `realpath` and must stay inside that directory. A `readOnly` account cannot write `savePath`. The byte cap is applied before the file is read or returned.
 

@@ -9,6 +9,12 @@
 - Manual connect address (`connectHost` / `connectPort`, `MAIL_IMAP_CONNECT`, `MAIL_SMTP_CONNECT`, `--imap-connect`, `--smtp-connect`) so a tunnel can carry TCP while TLS still verifies the real hostname.
 - `MAIL_ACCOUNT` names the account when there is no config file. The CLI requires Node.js 22, and prints how to run `bunx --bun` on an older Node.
 - JSON Schema for the config file at `schema/config.schema.json`.
+- Snapshot paging keeps a unique row (mailbox, UIDVALIDITY, UID, and part id for attachments). An empty fetch or an expunged anchor continues at the next frozen UID instead of ending the walk. `mail_get_thread` freezes its UID set on the first page.
+- Thread nodes are keyed by mailbox and UID. `source` is `server` only when a single folder uses the server THREAD tree. One `threadKey`, from the earliest message with no parent in the set, is returned on the envelope and on every item.
+- Header threading keeps a search hit only when the Message-ID, In-Reply-To, or References token matches exactly. A Message-ID seed uses every folder that contains it, plus Sent, Archive, and All.
+- `mail_list_correspondents` and the sender and attachment counts of `mail_search_facets` read every match, in batches, up to 10000 messages per folder. Above that cap `truncated` and `partial` are true.
+- `mail_modify_by_search` is a write. A non-dry-run that did not load every match fails with `SIZE_LIMIT` and changes nothing.
+- `replyTo`, and `From`, `Sender`, `Reply-To`, `To`, `Cc`, and `Bcc` inside `headers`, are checked like `from`. `Message-ID` and `Return-Path` in `headers` are rejected. An identity's `replyTo` is listed and used when the caller does not pass one. A draft send appends the bytes that were sent, without Bcc.
 
 ## 0.1.0
 

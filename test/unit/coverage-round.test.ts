@@ -406,7 +406,8 @@ describe('new tools against a fake server', () => {
       { folders: ['INBOX', 'Sent'], top: 2, maxPerFolder: 1 },
       service,
     );
-    expect(facets.truncated).toBe(true);
+    expect(facets.truncated).toBe(false);
+    expect(facets.partial).toBe(false);
     expect((facets.senders as unknown[]).length).toBeGreaterThan(0);
 
     const preview = await toolByName('mail_modify_by_search')!.run(
@@ -541,7 +542,7 @@ describe('remaining branch edges', () => {
     expect(glob.paths).toEqual(expect.arrayContaining(['Projects/2026', 'Sent']));
     expect(glob.missing).toEqual([]);
 
-    dedupeMessages(
+    const merged = dedupeMessages(
       [
         msg({ mailbox: 'INBOX', uid: 2, messageId: '<same@ex>' }),
         msg({ mailbox: 'INBOX', uid: 1, messageId: '<same@ex>' }),
@@ -549,7 +550,13 @@ describe('remaining branch edges', () => {
       ],
       ['Sent'],
     );
-    chronological(
+    expect(merged).toHaveLength(1);
+    expect(merged[0]).toMatchObject({ mailbox: 'INBOX', uid: 1 });
+    expect(merged[0]?.alsoIn).toEqual([
+      { mailbox: 'INBOX', uid: 2, uidValidity: '1' },
+      { mailbox: 'archive', uid: 3, uidValidity: '1' },
+    ]);
+    const newest = chronological(
       [
         msg({ uid: 1, mailbox: 'INBOX', date: '', internalDate: '2026-01-02' }),
         msg({ uid: 2, mailbox: 'INBOX', date: '', internalDate: '2026-01-01' }),
@@ -557,6 +564,7 @@ describe('remaining branch edges', () => {
       ],
       true,
     );
+    expect(newest.map((item) => item.uid)).toEqual([1, 3, 2]);
     expect(
       selectIdentity({
         identities: [{ id: 'a', email: 'a@ex', default: true }],
@@ -635,11 +643,13 @@ describe('remaining branch edges', () => {
     expect(
       sortKeysFor('newest-first', [{ field: 'subject', reverse: false }])[0]?.reverse,
     ).toBeUndefined();
-    comparePageRows(
-      { mailbox: 'A', uid: 1, date: '2026-01-01', arrival: '2026-01-01' },
-      { mailbox: 'B', uid: 2, date: '2026-01-01', arrival: '2026-01-01' },
-      [],
-    );
+    expect(
+      comparePageRows(
+        { mailbox: 'A', uid: 1, date: '2026-01-01', arrival: '2026-01-01' },
+        { mailbox: 'B', uid: 2, date: '2026-01-01', arrival: '2026-01-01' },
+        [],
+      ),
+    ).toBeLessThan(0);
     const keyed = pageKeyList(['b', 'a'], {
       limit: 1,
       order: 'oldest-first',
@@ -664,21 +674,39 @@ describe('remaining branch edges', () => {
       }),
     ).toThrow(/not valid/);
 
-    chronological(
+    const sameDay = chronological(
       [
         msg({ uid: 2, mailbox: 'INBOX', date: '2026-01-01' }),
         msg({ uid: 1, mailbox: 'INBOX', date: '2026-01-01' }),
       ],
       false,
     );
-    applySubjectHeuristic(
-      [msg({ uid: 1, subject: 'Hello', from: [{ address: 'a@ex' }] })],
+    expect(sameDay.map((item) => item.uid)).toEqual([1, 2]);
+    const subject = applySubjectHeuristic(
+      [msg({ uid: 1, messageId: '<one@ex>', subject: 'Hello', from: [{ address: 'a@ex' }] })],
       [
-        msg({ uid: 2, mailbox: 'Sent', subject: 'Hello', from: [{ address: 'b@ex' }] }),
-        msg({ uid: 3, mailbox: 'Archive', subject: 'Hello', from: [{ address: 'a@ex' }] }),
+        msg({
+          uid: 2,
+          mailbox: 'Sent',
+          messageId: '<two@ex>',
+          subject: 'Hello',
+          from: [{ address: 'b@ex' }],
+          to: [],
+          cc: [],
+        }),
+        msg({
+          uid: 3,
+          mailbox: 'Archive',
+          messageId: '<three@ex>',
+          subject: 'Hello',
+          from: [{ address: 'a@ex' }],
+        }),
       ],
       10,
     );
+    expect(subject.messages.map((item) => item.uid)).toEqual([1, 3]);
+    expect(subject.messages[1]?.linked).toBe('subject');
+    expect(subject.truncated).toBe(false);
     const undated = pageRows(
       [
         { mailbox: 'A', uid: 1 },

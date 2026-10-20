@@ -1115,7 +1115,7 @@ class FlowMailbox implements OpenMailbox {
     if (!this.session.hasCapability('SORT') || keys.length === 0) {
       return null;
     }
-    const searchKey = searchAttributes(this.client, compiled);
+    const searchParts = sortSearchParts(this.client, compiled);
     const displayable = keys.some(
       (key) => key.field === 'from' || key.field === 'to' || key.field === 'subject',
     );
@@ -1133,7 +1133,7 @@ class FlowMailbox implements OpenMailbox {
           criteria.push({ type: 'ATOM', value: imap });
         }
       }
-      const plain = [criteria, { type: 'ATOM', value: 'UTF-8' }, searchKey];
+      const plain = [criteria, { type: 'ATOM', value: 'UTF-8' }, ...searchParts];
       const attempts: Array<{ args: unknown[]; partial: boolean }> = [];
       if (this.session.hasCapability('ESORT') && window && !display) {
         const end = window.start + window.count - 1;
@@ -1196,7 +1196,30 @@ class FlowMailbox implements OpenMailbox {
         }
       }
     }
-    throw mapTransportError(lastError);
+    // A tagged NO on a live socket can fall back to a client scan. A socket that
+    // died inside SORT must not be read again: that read comes back empty.
+    await new Promise((resolve) => setImmediate(resolve));
+    if (this.sortSocketDead(lastError)) {
+      const cause = lastError instanceof Error ? lastError.message : 'SORT failed';
+      throw new MailError(
+        'CONNECTION_FAILED',
+        `Server SORT failed and the IMAP session is no longer connected. ${cause}`,
+        'Retry the call. The page was not returned from a dead socket.',
+      );
+    }
+    return null;
+  }
+
+  private sortSocketDead(error: unknown): boolean {
+    if (!this.client.usable) {
+      return true;
+    }
+    const raw = this.client as unknown as { socket?: { destroyed?: boolean } | false };
+    if (raw.socket && typeof raw.socket === 'object' && raw.socket.destroyed) {
+      return true;
+    }
+    const message = error instanceof Error ? error.message : '';
+    return /no connection|socket|ECONNRESET|EPIPE|ETIMEOUT|timed out|closed/i.test(message);
   }
 
   async serverThread(
@@ -1560,6 +1583,21 @@ function uidMapToRecord(map: Map<number, number> | undefined): Record<string, nu
     out[String(from)] = to;
   }
   return out;
+}
+
+/**
+ * Search keys for UID SORT. `1:*` is every message, and GreenMail hangs on the
+ * parenthesized form `(UID 1:*)`. Send ALL for that range, and spread every
+ * other key so a one-key search is not wrapped in an extra pair of parentheses.
+ */
+function sortSearchParts(client: ImapFlow, compiled: CompiledSearch): unknown[] {
+  const keys = Object.keys(compiled.query);
+  const normalized =
+    keys.length === 1 && compiled.query.uid === '1:*'
+      ? { query: { all: true }, requires: compiled.requires }
+      : compiled;
+  const key = searchAttributes(client, normalized);
+  return Array.isArray(key) ? key : [key];
 }
 
 function searchAttributes(client: ImapFlow, compiled: CompiledSearch): unknown {

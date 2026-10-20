@@ -16,6 +16,10 @@ export type PageOrder = 'newest-first' | 'oldest-first';
 export interface PageAnchor {
   mailbox: string;
   uid: number;
+  /** Distinguishes the same UID after a UIDVALIDITY change inside one cursor. */
+  uidValidity?: string;
+  /** Attachment rows share a UID. The part id makes the row unique. */
+  partId?: string;
   date: string;
   field: SortKey['field'];
   reverse: boolean;
@@ -49,6 +53,8 @@ export interface SnapshotCursor {
 export interface PageRow extends SortableMessage {
   mailbox: string;
   uid: number;
+  uidValidity?: string;
+  partId?: string;
   date?: string;
 }
 
@@ -88,7 +94,18 @@ export function comparePageRows(left: PageRow, right: PageRow, keys: readonly So
   if (left.mailbox > right.mailbox) {
     return 1;
   }
-  return left.uid - right.uid;
+  if (left.uid !== right.uid) {
+    return left.uid - right.uid;
+  }
+  const leftPart = left.partId ?? '';
+  const rightPart = right.partId ?? '';
+  if (leftPart < rightPart) {
+    return -1;
+  }
+  if (leftPart > rightPart) {
+    return 1;
+  }
+  return 0;
 }
 
 export function orderRows<T extends PageRow>(rows: readonly T[], keys: readonly SortKey[]): T[] {
@@ -197,7 +214,7 @@ function readAnchor(value: unknown): PageAnchor {
   ) {
     throw new MailError('INVALID_ARGUMENT', 'The page cursor is not valid.');
   }
-  return {
+  const anchor: PageAnchor = {
     mailbox: record.mailbox,
     uid: record.uid,
     date: record.date,
@@ -205,6 +222,13 @@ function readAnchor(value: unknown): PageAnchor {
     reverse: record.reverse,
     value: record.value,
   };
+  if (typeof record.uidValidity === 'string') {
+    anchor.uidValidity = record.uidValidity;
+  }
+  if (typeof record.partId === 'string') {
+    anchor.partId = record.partId;
+  }
+  return anchor;
 }
 
 export function scopeKey(paths: readonly string[]): string {
@@ -281,9 +305,7 @@ export function pageRows<T extends PageRow>(
   let start = 0;
   const anchor = options.cursor?.anchor;
   if (anchor) {
-    const index = ordered.findIndex(
-      (row) => row.mailbox === anchor.mailbox && row.uid === anchor.uid,
-    );
+    const index = ordered.findIndex((row) => samePageRow(row, anchor));
     if (index >= 0) {
       start = index + 1;
     } else {
@@ -307,6 +329,8 @@ export function pageRows<T extends PageRow>(
           options.buildCursor({
             mailbox: last.mailbox,
             uid: last.uid,
+            ...(last.uidValidity ? { uidValidity: last.uidValidity } : {}),
+            ...(last.partId !== undefined ? { partId: last.partId } : {}),
             date: last.date ?? last.arrival ?? '',
             field: primary.field,
             reverse: Boolean(primary.reverse),
@@ -315,6 +339,19 @@ export function pageRows<T extends PageRow>(
         )
       : null;
   return { items, nextCursor, total: ordered.length, offset: start };
+}
+
+function samePageRow(row: PageRow, anchor: PageAnchor): boolean {
+  if (row.mailbox !== anchor.mailbox || row.uid !== anchor.uid) {
+    return false;
+  }
+  if ((row.partId ?? '') !== (anchor.partId ?? '')) {
+    return false;
+  }
+  if (anchor.uidValidity && row.uidValidity && anchor.uidValidity !== row.uidValidity) {
+    return false;
+  }
+  return true;
 }
 
 function sortSignature(keys: readonly SortKey[]): string {

@@ -21,6 +21,8 @@ export interface ScriptedOptions {
   refuseSearch?: boolean;
   /** BAD any UID SORT whose arguments include this substring. */
   badSortIncluding?: string;
+  /** Close the socket instead of answering a UID SORT that includes this substring. */
+  dropOnSortIncluding?: string;
   refuseStore?: boolean;
   /** Answer UID SORT RETURN with an ESEARCH untagged line. */
   esearchSort?: boolean;
@@ -404,6 +406,13 @@ export class ScriptedImap {
     }
     if (command === 'UID' && args.toUpperCase().startsWith('SORT')) {
       if (
+        this.options.dropOnSortIncluding &&
+        args.toUpperCase().includes(this.options.dropOnSortIncluding.toUpperCase())
+      ) {
+        socket.destroy();
+        return;
+      }
+      if (
         this.options.badSortIncluding &&
         args.toUpperCase().includes(this.options.badSortIncluding.toUpperCase())
       ) {
@@ -569,17 +578,21 @@ function imapQuote(value: string): string {
 
 function searchUids(args: string, messages: ScriptedMessage[]): number[] {
   const match = /(?:^|\s)UID\s+([0-9:,*]+)/i.exec(args);
-  if (!match?.[1] || match[1] === '*') {
+  if (!match?.[1] || match[1] === '*' || match[1] === '1:*') {
     return messages.map((message) => message.uid);
   }
   const wanted = new Set<number>();
   for (const part of match[1].split(',')) {
-    const range = /^(\d+):(\d+)$/.exec(part);
+    const range = /^(\d+|\*):(\d+|\*)$/.exec(part);
     if (range?.[1] && range[2]) {
-      const low = Math.min(Number(range[1]), Number(range[2]));
-      const high = Math.max(Number(range[1]), Number(range[2]));
-      for (let uid = low; uid <= high; uid += 1) {
-        wanted.add(uid);
+      const low = range[1] === '*' ? 1 : Number(range[1]);
+      const high = range[2] === '*' ? Number.POSITIVE_INFINITY : Number(range[2]);
+      const start = Math.min(low, high);
+      const end = Math.max(low, high);
+      for (const message of messages) {
+        if (message.uid >= start && message.uid <= end) {
+          wanted.add(message.uid);
+        }
       }
       continue;
     }
