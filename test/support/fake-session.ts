@@ -550,6 +550,30 @@ function matches(message: StoredMessage, query: Record<string, unknown>): boolea
   if (typeof query.uid === 'string' && !uidInSet(message.uid, query.uid)) {
     return false;
   }
+  if (query.flagged === true && !message.flags.includes('\\Flagged')) {
+    return false;
+  }
+  if (query.flagged === false && message.flags.includes('\\Flagged')) {
+    return false;
+  }
+  if (query.answered === true && !message.flags.includes('\\Answered')) {
+    return false;
+  }
+  if (query.answered === false && message.flags.includes('\\Answered')) {
+    return false;
+  }
+  if (query.header && typeof query.header === 'object') {
+    const entry = Object.entries(query.header as Record<string, unknown>)[0];
+    if (entry) {
+      const raw = header(message.raw, entry[0]);
+      if (!raw) {
+        return false;
+      }
+      if (typeof entry[1] === 'string' && !raw.toLowerCase().includes(entry[1].toLowerCase())) {
+        return false;
+      }
+    }
+  }
   if (typeof query.from === 'string' && !(message.from ?? '').includes(String(query.from))) {
     return false;
   }

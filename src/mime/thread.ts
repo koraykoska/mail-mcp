@@ -93,7 +93,8 @@ function normalizeId(id: string): string {
   return id.trim().replace(/^<|>$/g, '').toLowerCase();
 }
 
-function subjectKey(subject: string | undefined): string {
+/** Subject with reply and forward prefixes removed, for an explicit subject heuristic. */
+export function normalizedSubject(subject: string | undefined): string {
   return (subject ?? '')
     .replace(/^(re|fwd|fw|aw|sv)\s*(\[\d+\])?\s*:\s*/gi, '')
     .trim()
@@ -106,7 +107,7 @@ function groupRootsBySubject(roots: ThreadNode[], messages: ThreadableMessage[])
   const ordered: ThreadNode[] = [];
   for (const root of roots) {
     const message = root.uid !== undefined ? byUid.get(root.uid) : undefined;
-    const key = subjectKey(message?.subject);
+    const key = normalizedSubject(message?.subject);
     if (!key) {
       ordered.push(root);
       continue;

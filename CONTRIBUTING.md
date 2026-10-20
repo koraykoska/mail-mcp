@@ -1,5 +1,18 @@
 # Contributing
 
+## Principles
+
+Losing a mail is worse than showing one twice.
+
+A message that has no Message-ID is never merged with another message. Pagination never skips a message: if the last row of a page was expunged, the next page continues at the first row that sorts after it, even when that means a later reader can see a row twice. When identity is uncertain, return more and say so.
+
+Related rules:
+
+- Results are deterministic. They depend only on the server state and the arguments of the call.
+- There is no stateful "changed since" tracking.
+- Heuristics such as subject threading are off unless the caller opts in, and every result says how it was linked.
+- TLS certificate verification is never disabled to make a connection succeed. A tunnel changes the TCP address, not the name that is verified.
+
 ## Setup
 
 Node.js 22 or newer, npm, and Docker (only for integration tests). Bun is optional and is used in CI and in `scripts/pack-smoke.mjs bun`.
@@ -27,4 +40,4 @@ See `docs/RELEASING.md`. Short version:
 
 ## Docs
 
-`docs/TOOLS.md` is generated. After changing a tool, run `npm run docs:tools`.
+`docs/TOOLS.md` is generated. After changing a tool, run `npm run docs:tools`. `schema/config.schema.json` is generated from the zod config schema. After changing that schema, run `npx tsx scripts/generate-config-schema.ts`. The unit suite checks that the file matches.

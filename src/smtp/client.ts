@@ -5,6 +5,7 @@ import type SMTPTransport from 'nodemailer/lib/smtp-transport/index.js';
 import { MailError, mapTransportError } from '../errors.js';
 import type { EndpointSettings, ResolvedAccount } from '../config/schema.js';
 import { addressToAscii } from '../mime/address.js';
+import { dialTarget } from '../net/connect.js';
 
 export interface DsnOptions {
   /** Envelope id (ENVID). */
@@ -97,25 +98,25 @@ function transportOptions(
   endpoint: EndpointSettings,
   accessToken: string | undefined,
 ): SMTPTransport.Options {
+  const dial = dialTarget(endpoint);
   const tls: SMTPTransport.Options['tls'] = {
     rejectUnauthorized: endpoint.tls.rejectUnauthorized,
+    servername: dial.servername,
   };
-  if (endpoint.tls.servername) {
-    tls.servername = endpoint.tls.servername;
-  }
   if (endpoint.tls.caFile) {
     tls.ca = readFileSync(endpoint.tls.caFile);
   }
-  const options: SMTPTransport.Options = {
-    host: endpoint.host,
-    port: endpoint.port,
+  const options = {
+    host: dial.host,
+    port: dial.port,
     secure: endpoint.secure,
     tls,
     connectionTimeout: endpoint.timeoutMs,
     greetingTimeout: endpoint.timeoutMs,
     socketTimeout: endpoint.timeoutMs,
     name: 'mail-mcp',
-  };
+    servername: dial.servername,
+  } as SMTPTransport.Options;
   if (!endpoint.secure && endpoint.starttls === 'required') {
     options.requireTLS = true;
   }

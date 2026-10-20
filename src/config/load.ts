@@ -17,6 +17,8 @@ import type {
 import { providerById, type ProviderId } from './providers.js';
 import { parseJsonc } from './jsonc.js';
 import { substituteDeep } from './substitute.js';
+import { parseIdentityList } from '../identities.js';
+import { parseConnectAddress } from '../net/connect.js';
 
 export interface LoadConfigOptions {
   configPath?: string;
@@ -53,7 +55,8 @@ export function loadConfig(options: LoadConfigOptions = {}): AppConfig {
   const accountsInput: Record<string, RawAccount> = { ...(parsedFile.accounts ?? {}) };
   const envAccount = !filePath || env.MAIL_IMAP_HOST ? accountFromEnv(env) : undefined;
   if (envAccount) {
-    accountsInput.default = mergeAccount(accountsInput.default, envAccount);
+    const envId = !filePath ? env.MAIL_ACCOUNT?.trim() || 'default' : 'default';
+    accountsInput[envId] = mergeAccount(accountsInput[envId], envAccount);
   }
   const ids = Object.keys(accountsInput);
   if (ids.length === 0) {
@@ -84,6 +87,10 @@ export function loadConfig(options: LoadConfigOptions = {}): AppConfig {
       `Set defaultAccount to one of: ${ids.join(', ')}.`,
     );
   }
+  const selected = accounts[defaultAccount];
+  if (selected) {
+    applyConnectOverride(selected, env);
+  }
   return {
     defaultAccount,
     logLevel: parsedFile.logLevel ?? parseEnvLogLevel(env.MAIL_LOG_LEVEL) ?? 'info',
@@ -93,6 +100,19 @@ export function loadConfig(options: LoadConfigOptions = {}): AppConfig {
     ...(parsedFile.attachmentsDir ? { attachmentsDir: parsedFile.attachmentsDir } : {}),
     secrets,
   };
+}
+
+function applyConnectOverride(account: ResolvedAccount, env: NodeJS.ProcessEnv): void {
+  if (env.MAIL_IMAP_CONNECT) {
+    const parsed = parseConnectAddress(env.MAIL_IMAP_CONNECT);
+    account.imap.connectHost = parsed.host;
+    account.imap.connectPort = parsed.port;
+  }
+  if (env.MAIL_SMTP_CONNECT && account.smtp) {
+    const parsed = parseConnectAddress(env.MAIL_SMTP_CONNECT);
+    account.smtp.connectHost = parsed.host;
+    account.smtp.connectPort = parsed.port;
+  }
 }
 
 function mergeAccount(base: RawAccount | undefined, extra: RawAccount): RawAccount {
@@ -133,16 +153,26 @@ function accountFromEnv(env: NodeJS.ProcessEnv): RawAccount | undefined {
   if (env.MAIL_FROM || env.MAIL_EMAIL) {
     account.email = env.MAIL_FROM || env.MAIL_EMAIL;
   }
+  if (env.MAIL_IDENTITIES) {
+    account.identities = parseIdentityList(env.MAIL_IDENTITIES).map((item, index) => ({
+      id: `identity-${index + 1}`,
+      email: item.email,
+      ...(item.name ? { name: item.name } : {}),
+      default: index === 0,
+    }));
+  }
   if (env.MAIL_USER) {
     account.user = env.MAIL_USER;
   }
   if (env.MAIL_PASSWORD) {
     account.password = env.MAIL_PASSWORD;
   }
-  if (hasImap || env.MAIL_IMAP_PORT || env.MAIL_IMAP_SECURE) {
+  if (hasImap || env.MAIL_IMAP_PORT || env.MAIL_IMAP_SECURE || env.MAIL_IMAP_CONNECT) {
+    const imapConnect = env.MAIL_IMAP_CONNECT ? parseConnectAddress(env.MAIL_IMAP_CONNECT) : undefined;
     account.imap = {
       host: env.MAIL_IMAP_HOST,
       port: env.MAIL_IMAP_PORT ? Number(env.MAIL_IMAP_PORT) : undefined,
+      ...(imapConnect ? { connectHost: imapConnect.host, connectPort: imapConnect.port } : {}),
       secure: envFlag(env.MAIL_IMAP_SECURE),
       starttls: env.MAIL_IMAP_STARTTLS as RawAccount['imap'] extends infer T
         ? T extends { starttls?: infer S }
@@ -153,10 +183,12 @@ function accountFromEnv(env: NodeJS.ProcessEnv): RawAccount | undefined {
       tls: tlsFromEnv(env),
     };
   }
-  if (hasSmtp || env.MAIL_SMTP_PORT || env.MAIL_SMTP_SECURE) {
+  if (hasSmtp || env.MAIL_SMTP_PORT || env.MAIL_SMTP_SECURE || env.MAIL_SMTP_CONNECT) {
+    const smtpConnect = env.MAIL_SMTP_CONNECT ? parseConnectAddress(env.MAIL_SMTP_CONNECT) : undefined;
     account.smtp = {
       host: env.MAIL_SMTP_HOST,
       port: env.MAIL_SMTP_PORT ? Number(env.MAIL_SMTP_PORT) : undefined,
+      ...(smtpConnect ? { connectHost: smtpConnect.host, connectPort: smtpConnect.port } : {}),
       secure: envFlag(env.MAIL_SMTP_SECURE),
       starttls: env.MAIL_SMTP_STARTTLS as 'required' | 'optional' | 'disabled' | undefined,
       timeoutMs: env.MAIL_SMTP_TIMEOUT_MS ? Number(env.MAIL_SMTP_TIMEOUT_MS) : undefined,
@@ -194,6 +226,11 @@ function accountFromEnv(env: NodeJS.ProcessEnv): RawAccount | undefined {
   }
   if (env.MAIL_RECIPIENT_DOMAINS) {
     account.recipientDomainAllowList = env.MAIL_RECIPIENT_DOMAINS.split(',')
+      .map((item) => item.trim())
+      .filter(Boolean);
+  }
+  if (env.MAIL_ALLOW_FROM_DOMAINS) {
+    account.allowFromDomains = env.MAIL_ALLOW_FROM_DOMAINS.split(',')
       .map((item) => item.trim())
       .filter(Boolean);
   }
@@ -283,6 +320,9 @@ function resolveAccount(
     allowDelete: raw.allowDelete ?? true,
     allowPermanentDelete: raw.allowPermanentDelete ?? false,
     recipientDomainAllowList: (raw.recipientDomainAllowList ?? []).map((domain) =>
+      domain.toLowerCase().replace(/^@/, ''),
+    ),
+    allowFromDomains: (raw.allowFromDomains ?? []).map((domain) =>
       domain.toLowerCase().replace(/^@/, ''),
     ),
     appendSent: raw.appendSent ?? 'auto',
@@ -402,7 +442,7 @@ function resolveEndpoint(
   if (!host) {
     throw new MailError('CONFIG_ERROR', `Account "${id}" is missing ${kind}.host.`);
   }
-  return {
+  const endpoint: EndpointSettings = {
     host,
     port,
     secure,
@@ -410,13 +450,25 @@ function resolveEndpoint(
     timeoutMs: raw?.timeoutMs ?? 30_000,
     tls,
   };
+  if (raw?.connectHost) {
+    endpoint.connectHost = raw.connectHost;
+  }
+  if (raw?.connectPort) {
+    endpoint.connectPort = raw.connectPort;
+  }
+  return endpoint;
 }
 
 function resolveIdentities(id: string, raw: RawAccount['identities'], email: string): Identity[] {
-  if (!raw || raw.length === 0) {
+  const listed = raw ?? [];
+  const withAccount =
+    email && !listed.some((item) => item.email.toLowerCase() === email.toLowerCase())
+      ? [...listed, { email, default: listed.length === 0 }]
+      : listed;
+  if (withAccount.length === 0) {
     return [{ id: 'default', email, default: true }];
   }
-  const identities: Identity[] = raw.map((item, index) => {
+  const identities: Identity[] = withAccount.map((item, index) => {
     const identity: Identity = {
       id: item.id ?? `identity-${index + 1}`,
       email: item.email,

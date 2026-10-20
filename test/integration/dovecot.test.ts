@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import net from 'node:net';
 import { describe, expect, it, beforeAll } from 'vitest';
 import { ImapFlow } from 'imapflow';
 import { ImapFlowSession } from '../../src/imap/flow-session.js';
@@ -413,4 +414,174 @@ describe('Dovecot', () => {
     expect(client.secureConnection).toBe(true);
     await client.logout();
   });
+
+  it('returns a conversation across Inbox, Sent, and Archive', async () => {
+    const runtime = runtimeFor(dovecot.imapPort);
+    const stamp = `thr-${Date.now()}`;
+    const sent = `Sent-${stamp}`;
+    const archive = `Archive-${stamp}`;
+    await runtime.service.createMailbox(undefined, sent);
+    await runtime.service.createMailbox(undefined, archive);
+    await runtime.service.append({
+      mailbox: archive,
+      rawBase64: simpleMessage({
+        subject: `Thread ${stamp}`,
+        messageId: `<early-${stamp}@example.com>`,
+        date: 'Mon, 01 Jan 2024 00:00:00 +0000',
+        text: 'earlier',
+      }).toString('base64'),
+    });
+    await runtime.service.append({
+      mailbox: 'INBOX',
+      rawBase64: simpleMessage({
+        subject: `Re: Thread ${stamp}`,
+        messageId: `<mid-${stamp}@example.com>`,
+        inReplyTo: `<early-${stamp}@example.com>`,
+        references: `<early-${stamp}@example.com>`,
+        date: 'Tue, 02 Jan 2024 00:00:00 +0000',
+        text: 'inbox',
+      }).toString('base64'),
+    });
+    await runtime.service.append({
+      mailbox: sent,
+      rawBase64: simpleMessage({
+        subject: `Re: Thread ${stamp}`,
+        messageId: `<late-${stamp}@example.com>`,
+        inReplyTo: `<mid-${stamp}@example.com>`,
+        references: `<early-${stamp}@example.com> <mid-${stamp}@example.com>`,
+        date: 'Wed, 03 Jan 2024 00:00:00 +0000',
+        text: 'sent',
+      }).toString('base64'),
+    });
+    const found = await runtime.service.searchMessages({
+      mailbox: 'INBOX',
+      search: { header: { name: 'Message-ID', value: `mid-${stamp}@example.com` } },
+      limit: 5,
+      includeSnippet: false,
+    });
+    const uid = Number((found.messages as Array<{ uid: number }>)[0]?.uid);
+    const thread = await runtime.service.getThread({
+      mailbox: 'INBOX',
+      uid,
+      folders: ['INBOX', sent, archive],
+      order: 'oldest-first',
+    });
+    const ids = (thread.items as Array<{ messageId: string | null }>).map((item) => item.messageId);
+    expect(ids).toEqual([
+      `<early-${stamp}@example.com>`,
+      `<mid-${stamp}@example.com>`,
+      `<late-${stamp}@example.com>`,
+    ]);
+    await runtime.close();
+  });
+
+  it('does not skip or duplicate when mail arrives between pages', async () => {
+    const runtime = runtimeFor(dovecot.imapPort);
+    const stamp = `page-${Date.now()}`;
+    await runtime.service.createMailbox(undefined, stamp);
+    for (const subject of ['One', 'Two', 'Three']) {
+      await runtime.service.append({
+        mailbox: stamp,
+        rawBase64: simpleMessage({ subject: `${subject} ${stamp}`, messageId: `<${subject}-${stamp}@e>` }).toString(
+          'base64',
+        ),
+      });
+    }
+    const first = await runtime.service.listMessages({ mailbox: stamp, limit: 1, includeSnippet: false });
+    await runtime.service.append({
+      mailbox: stamp,
+      rawBase64: simpleMessage({ subject: `Later ${stamp}`, messageId: `<later-${stamp}@e>` }).toString('base64'),
+    });
+    const seen = new Set<number>();
+    let cursor = first.nextCursor ? String(first.nextCursor) : undefined;
+    const firstUid = Number((first.messages as Array<{ uid: number }>)[0]?.uid);
+    seen.add(firstUid);
+    while (cursor) {
+      const page = await runtime.service.listMessages({
+        mailbox: stamp,
+        limit: 1,
+        includeSnippet: false,
+        cursor,
+      });
+      for (const row of page.messages as Array<{ uid: number }>) {
+        expect(seen.has(row.uid)).toBe(false);
+        seen.add(row.uid);
+      }
+      cursor = page.nextCursor ? String(page.nextCursor) : undefined;
+    }
+    expect(seen.size).toBe(3);
+    const fresh = await runtime.service.listMessages({ mailbox: stamp, limit: 10, includeSnippet: false });
+    expect(fresh.total).toBe(4);
+    await runtime.close();
+  });
+
+  it('keeps certificate verification when dialing a forwarded address', async () => {
+    const bridge = await listenForward(dovecot.imapsPort);
+    const runtime = runtimeFor(0, {
+      imap: {
+        host: 'localhost',
+        port: 993,
+        connectHost: '127.0.0.1',
+        connectPort: bridge.port,
+        secure: true,
+        starttls: 'disabled',
+        timeoutMs: 15_000,
+        tls: { rejectUnauthorized: true, caFile: dovecot.caFile },
+      },
+    });
+    const checked = await runtime.service.verify(undefined, { imap: true, smtp: false });
+    expect(checked.ok).toBe(true);
+    expect(checked.imap).toMatchObject({
+      host: 'localhost',
+      connectHost: '127.0.0.1',
+      connectPort: bridge.port,
+      servername: 'localhost',
+    });
+    await runtime.close();
+    const mismatch = runtimeFor(0, {
+      imap: {
+        host: 'wrong.example',
+        port: 993,
+        connectHost: '127.0.0.1',
+        connectPort: bridge.port,
+        secure: true,
+        starttls: 'disabled',
+        timeoutMs: 15_000,
+        tls: { rejectUnauthorized: true, caFile: dovecot.caFile },
+      },
+    });
+    const failed = await mismatch.service.verify(undefined, { imap: true, smtp: false });
+    expect(failed.ok).toBe(false);
+    expect(failed.imap).toMatchObject({ code: 'TLS_FAILED' });
+    await mismatch.close();
+    await bridge.close();
+  });
 });
+
+function listenForward(targetPort: number): Promise<{ port: number; close: () => Promise<void> }> {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer((socket) => {
+      const upstream = net.connect(targetPort, '127.0.0.1');
+      socket.pipe(upstream);
+      upstream.pipe(socket);
+      const drop = (): void => {
+        socket.destroy();
+        upstream.destroy();
+      };
+      socket.on('error', drop);
+      upstream.on('error', drop);
+    });
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address();
+      const port = typeof address === 'object' && address ? address.port : 0;
+      resolve({
+        port,
+        close: () =>
+          new Promise((done) => {
+            server.close(() => done());
+          }),
+      });
+    });
+  });
+}

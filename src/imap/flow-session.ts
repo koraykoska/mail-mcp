@@ -13,6 +13,7 @@ import { capabilityMatches, hasExactCapability as exactCapability } from './capa
 import { decodeTransfer, parseSequenceSet } from '../mime/transfer.js';
 import { VERSION } from '../version.js';
 import type { ResolvedAccount } from '../config/schema.js';
+import { dialTarget } from '../net/connect.js';
 import type { Logger } from '../log.js';
 import { decodeBody } from '../charset.js';
 import { findTextPart } from '../mime/parse.js';
@@ -627,18 +628,18 @@ export class ImapFlowSession implements ImapSession {
       previous.close();
     }
     const endpoint = this.account.imap;
+    const dial = dialTarget(endpoint);
     const tls: ImapFlowOptions['tls'] = {
       rejectUnauthorized: endpoint.tls.rejectUnauthorized,
+      servername: dial.servername,
     };
-    if (endpoint.tls.servername) {
-      tls.servername = endpoint.tls.servername;
-    }
     if (endpoint.tls.caFile) {
       tls.ca = readFileSync(endpoint.tls.caFile);
     }
     const options: ImapFlowOptions = {
-      host: endpoint.host,
-      port: endpoint.port,
+      host: dial.host,
+      port: dial.port,
+      servername: dial.servername,
       secure: endpoint.secure,
       tls,
       logger: false,

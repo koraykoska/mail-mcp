@@ -33,7 +33,7 @@ export function sortMessages<T extends SortableMessage>(
   const decorated = messages.map((message, index) => ({ message, index }));
   decorated.sort((left, right) => {
     for (const key of keys) {
-      const compared = compareField(left.message, right.message, key.field);
+      const compared = compareSortable(left.message, right.message, key.field);
       if (compared !== 0) {
         return key.reverse ? -compared : compared;
       }
@@ -43,7 +43,7 @@ export function sortMessages<T extends SortableMessage>(
   return decorated.map((item) => item.message);
 }
 
-function compareField(
+export function compareSortable(
   left: SortableMessage,
   right: SortableMessage,
   field: SortKey['field'],
@@ -111,7 +111,7 @@ export function canonicalSortValue(message: SortableMessage, field: SortKey['fie
 
 /** True when `message` sorts strictly after `anchor` in the anchor's direction. */
 export function isStrictlyAfter(message: SortableMessage, anchor: SortAnchor): boolean {
-  const compared = compareField(message, messageFromAnchor(anchor), anchor.field);
+  const compared = compareSortable(message, messageFromAnchor(anchor), anchor.field);
   return (anchor.reverse ? -compared : compared) > 0;
 }
 

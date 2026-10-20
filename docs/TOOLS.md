@@ -3,11 +3,11 @@
 Generated from the tool definitions in `src/tools/catalog.ts`. Do not edit by hand.
 Run `npm run docs:tools` after changing a tool and commit the result. `npm run docs:check` fails when this file is stale.
 
-The server registers 41 tools. A tool that mutates mail or sends it is omitted only when every configured account forbids that class of operation. Calls are still checked against the selected account.
+The server registers 47 tools. A tool that mutates mail or sends it is omitted only when every configured account forbids that class of operation. Calls are still checked against the selected account.
 
 Results are JSON in `structuredContent` plus a text rendering. Errors use `isError: true` and text only, shaped as `CODE: message` with an optional `Hint:` line. There is no structured error object. Codes:
 
-`AUTH_FAILED`, `TLS_FAILED`, `NOT_FOUND`, `UIDVALIDITY_CHANGED`, `CAPABILITY_UNSUPPORTED`, `PERMISSION_DENIED`, `SIZE_LIMIT`, `TIMEOUT`, `RATE_LIMITED`, `CONFIG_ERROR`, `PROTOCOL_ERROR`, `CONNECTION_FAILED`, `INVALID_ARGUMENT`.
+`AUTH_FAILED`, `TLS_FAILED`, `NOT_FOUND`, `UIDVALIDITY_CHANGED`, `CURSOR_INVALIDATED`, `CAPABILITY_UNSUPPORTED`, `PERMISSION_DENIED`, `SIZE_LIMIT`, `TIMEOUT`, `RATE_LIMITED`, `CONFIG_ERROR`, `PROTOCOL_ERROR`, `CONNECTION_FAILED`, `INVALID_ARGUMENT`.
 
 ## mail_list_accounts
 
@@ -19,7 +19,9 @@ Annotations: readOnlyHint=true, destructiveHint=false, idempotentHint=true, open
 
 ### Arguments
 
-- None.
+- `limit` (optional): Page size. Default 25. Summaries are capped at 200 or limits.maxPageSize, whichever is lower. Calls that include message bodies are capped at 20. The cursor stores the limit from the first page; repeat it, or omit it and the stored limit is used. Mail that arrives after the first page is outside this snapshot: call again without a cursor to see it.
+- `cursor` (optional): Opaque cursor from the previous page. It freezes the folder scope, sort, page size, and a snapshot upper UID (uidNext - 1 at the first page) so later arrivals do not shift the walk. The next page starts strictly after the last row in the total order (sort keys, then date, folder, UID). If that row was expunged, the page continues at the first row that sorts after it, so a deletion does not skip the following message. A uidValidity change returns CURSOR_INVALIDATED. An older cursor returns INVALID_ARGUMENT. Omit to start a new snapshot.
+- `order` (optional): Page order when sort is omitted. Default newest-first (arrival descending). oldest-first is arrival ascending. When sort is set, order must agree with the first key. Pass the same order on every page.
 
 ### Examples
 
@@ -132,6 +134,9 @@ Annotations: readOnlyHint=true, destructiveHint=false, idempotentHint=true, open
 
 - `account` (optional): Account id from mail_list_accounts. Omit to use the configured default account. Example: "work".
 - `subscribedOnly` (optional): When true, only subscribed mailboxes. Default false (all listed).
+- `limit` (optional): Page size. Default 25. Summaries are capped at 200 or limits.maxPageSize, whichever is lower. Calls that include message bodies are capped at 20. The cursor stores the limit from the first page; repeat it, or omit it and the stored limit is used. Mail that arrives after the first page is outside this snapshot: call again without a cursor to see it.
+- `cursor` (optional): Opaque cursor from the previous page. It freezes the folder scope, sort, page size, and a snapshot upper UID (uidNext - 1 at the first page) so later arrivals do not shift the walk. The next page starts strictly after the last row in the total order (sort keys, then date, folder, UID). If that row was expunged, the page continues at the first row that sorts after it, so a deletion does not skip the following message. A uidValidity change returns CURSOR_INVALIDATED. An older cursor returns INVALID_ARGUMENT. Omit to start a new snapshot.
+- `order` (optional): Page order when sort is omitted. Default newest-first (arrival descending). oldest-first is arrival ascending. When sort is set, order must agree with the first key. Pass the same order on every page.
 
 ### Examples
 
@@ -283,6 +288,9 @@ Annotations: readOnlyHint=true, destructiveHint=false, idempotentHint=true, open
 ### Arguments
 
 - `account` (optional): Account id from mail_list_accounts. Omit to use the configured default account. Example: "work".
+- `limit` (optional): Page size. Default 25. Summaries are capped at 200 or limits.maxPageSize, whichever is lower. Calls that include message bodies are capped at 20. The cursor stores the limit from the first page; repeat it, or omit it and the stored limit is used. Mail that arrives after the first page is outside this snapshot: call again without a cursor to see it.
+- `cursor` (optional): Opaque cursor from the previous page. It freezes the folder scope, sort, page size, and a snapshot upper UID (uidNext - 1 at the first page) so later arrivals do not shift the walk. The next page starts strictly after the last row in the total order (sort keys, then date, folder, UID). If that row was expunged, the page continues at the first row that sorts after it, so a deletion does not skip the following message. A uidValidity change returns CURSOR_INVALIDATED. An older cursor returns INVALID_ARGUMENT. Omit to start a new snapshot.
+- `order` (optional): Page order when sort is omitted. Default newest-first (arrival descending). oldest-first is arrival ascending. When sort is set, order must agree with the first key. Pass the same order on every page.
 
 ### Examples
 
@@ -312,14 +320,16 @@ Annotations: readOnlyHint=true, destructiveHint=false, idempotentHint=true, open
 
 List message summaries
 
-Page message summaries in a mailbox. Default mailbox is INBOX. Default sort is arrival descending (newest first) via the SORT extension, with a client-side fallback that refuses mailboxes larger than limits.maxSortCandidates when the server cannot sort. Each summary has uid, flags, size (octets), date, from, to, subject, hasAttachments, and a snippet of about snippetChars characters (default 160). Pass nextCursor back as cursor. Never returns an unbounded mailbox. For criteria use mail_search_messages; a search object is also accepted here. Optional uidValidity detects a recreated mailbox.
+Page message summaries in a mailbox. Default mailbox is INBOX. Default sort is arrival descending (newest first) via the SORT extension, with a client-side fallback. A folder larger than limits.maxSortCandidates is truncated: snapshot.folders reports omitted and scanned, and paging continues inside that window. Each summary has uid, flags, size (octets), date, from, to, subject, hasAttachments, and a snippet of about snippetChars characters (default 160). Pass nextCursor back as cursor. Mail that arrives after the first page needs a new call without a cursor. For criteria use mail_search_messages; a search object is also accepted here. Optional uidValidity detects a recreated mailbox.
 
 Annotations: readOnlyHint=true, destructiveHint=false, idempotentHint=true, openWorldHint=true.
 
 ### Arguments
 
 - `account` (optional): Account id from mail_list_accounts. Omit to use the configured default account. Example: "work".
-- `mailbox` (optional): Mailbox path. Default INBOX.
+- `mailbox` (optional): Mailbox path. Default INBOX. Ignored when folders is set.
+- `folders` (optional): Folder scope. Replaces mailbox when set. Default for a list or search is the single mailbox (INBOX when mailbox is omitted). "all" skips Trash and Junk unless they are named or includeTrash/includeJunk is true.
+- `maxPerFolder` (optional): Most messages scanned in one folder when the server cannot sort the whole snapshot. Default and maximum are limits.maxSortCandidates (5000). A higher value is rejected. Truncated folders report omitted and scanned.
 - `search` (optional): Structured IMAP SEARCH. Fields are ANDed. Dates are calendar days in UTC. Use mail_search_messages rather than mail_list_messages when you have criteria. Gmail-only fields fail with CAPABILITY_UNSUPPORTED on other servers.
   - `all` (optional): Match every message. Usually omit this and set a real criterion.
   - `from` (optional): Substring match on the From header. Example: "ada@example.com".
@@ -363,11 +373,12 @@ Annotations: readOnlyHint=true, destructiveHint=false, idempotentHint=true, open
 - `sort` (optional): Sort keys, most significant first. Default: arrival descending.
   - `field`: arrival is the internal received date. date is the Date header.
   - `reverse` (optional): true sorts descending. Default false (ascending). Newest-first is arrival + reverse.
-- `limit` (optional): Page size. Default is limits.pageSize (25). The schema allows up to 10000; the server rejects values above the configured limits.maxPageSize (default 100).
-- `cursor` (optional): Opaque cursor from the previous page's nextCursor. It stores the last returned UID, that message's position, the primary sort key, and the mailbox uidValidity. The next page continues after that UID in a freshly sorted result. If the UID was expunged, the page continues at the first message that sorts strictly after the stored key, so deleting an earlier message does not skip the next one. Messages that compare equal to that key may be repeated or skipped. When the cursor has no sort key, the stored position is used, and adding or removing earlier messages can skip or repeat one. A cursor whose uidValidity no longer matches fails with UIDVALIDITY_CHANGED. Pass the same sort as the call that issued the cursor. Omit to start at the first page.
+- `limit` (optional): Page size. Default 25. Summaries are capped at 200 or limits.maxPageSize, whichever is lower. Calls that include message bodies are capped at 20. The cursor stores the limit from the first page; repeat it, or omit it and the stored limit is used. Mail that arrives after the first page is outside this snapshot: call again without a cursor to see it.
+- `cursor` (optional): Opaque cursor from the previous page. It freezes the folder scope, sort, page size, and a snapshot upper UID (uidNext - 1 at the first page) so later arrivals do not shift the walk. The next page starts strictly after the last row in the total order (sort keys, then date, folder, UID). If that row was expunged, the page continues at the first row that sorts after it, so a deletion does not skip the following message. A uidValidity change returns CURSOR_INVALIDATED. An older cursor returns INVALID_ARGUMENT. Omit to start a new snapshot.
 - `uidValidity` (optional): Expected UIDVALIDITY decimal string from mail_get_mailbox_status or a previous list. When set, the call fails with UIDVALIDITY_CHANGED if the mailbox was recreated.
 - `includeSnippet` (optional): Include a text snippet. Default true. Set false for a faster list.
 - `snippetChars` (optional): Maximum snippet length. Default 160.
+- `order` (optional): Page order when sort is omitted. Default newest-first (arrival descending). oldest-first is arrival ascending. When sort is set, order must agree with the first key. Pass the same order on every page.
 
 ### Examples
 
@@ -387,6 +398,8 @@ Annotations: readOnlyHint=true, destructiveHint=false, idempotentHint=true, open
 
 - `account` (optional): Account id from mail_list_accounts. Omit to use the configured default account. Example: "work".
 - `mailbox` (optional): Mailbox path as returned by mail_list_mailboxes, in Unicode (not modified UTF-7). Nested folders use the server delimiter, often "/" or ".". Examples: "INBOX", "Projects/2026", "Entwürfe".
+- `folders` (optional): Folder scope. Replaces mailbox when set. Default for a list or search is the single mailbox (INBOX when mailbox is omitted). "all" skips Trash and Junk unless they are named or includeTrash/includeJunk is true.
+- `maxPerFolder` (optional): Most messages scanned in one folder when the server cannot sort the whole snapshot. Default and maximum are limits.maxSortCandidates (5000). A higher value is rejected. Truncated folders report omitted and scanned.
 - `search`: Structured IMAP SEARCH. Fields are ANDed. Dates are calendar days in UTC. Use mail_search_messages rather than mail_list_messages when you have criteria. Gmail-only fields fail with CAPABILITY_UNSUPPORTED on other servers.
   - `all` (optional): Match every message. Usually omit this and set a real criterion.
   - `from` (optional): Substring match on the From header. Example: "ada@example.com".
@@ -430,11 +443,12 @@ Annotations: readOnlyHint=true, destructiveHint=false, idempotentHint=true, open
 - `sort` (optional): 
   - `field`: arrival is the internal received date. date is the Date header.
   - `reverse` (optional): true sorts descending. Default false (ascending). Newest-first is arrival + reverse.
-- `limit` (optional): Page size. Default is limits.pageSize (25). The schema allows up to 10000; the server rejects values above the configured limits.maxPageSize (default 100).
-- `cursor` (optional): Opaque cursor from the previous page's nextCursor. It stores the last returned UID, that message's position, the primary sort key, and the mailbox uidValidity. The next page continues after that UID in a freshly sorted result. If the UID was expunged, the page continues at the first message that sorts strictly after the stored key, so deleting an earlier message does not skip the next one. Messages that compare equal to that key may be repeated or skipped. When the cursor has no sort key, the stored position is used, and adding or removing earlier messages can skip or repeat one. A cursor whose uidValidity no longer matches fails with UIDVALIDITY_CHANGED. Pass the same sort as the call that issued the cursor. Omit to start at the first page.
+- `limit` (optional): Page size. Default 25. Summaries are capped at 200 or limits.maxPageSize, whichever is lower. Calls that include message bodies are capped at 20. The cursor stores the limit from the first page; repeat it, or omit it and the stored limit is used. Mail that arrives after the first page is outside this snapshot: call again without a cursor to see it.
+- `cursor` (optional): Opaque cursor from the previous page. It freezes the folder scope, sort, page size, and a snapshot upper UID (uidNext - 1 at the first page) so later arrivals do not shift the walk. The next page starts strictly after the last row in the total order (sort keys, then date, folder, UID). If that row was expunged, the page continues at the first row that sorts after it, so a deletion does not skip the following message. A uidValidity change returns CURSOR_INVALIDATED. An older cursor returns INVALID_ARGUMENT. Omit to start a new snapshot.
 - `uidValidity` (optional): Expected UIDVALIDITY decimal string from mail_get_mailbox_status or a previous list. When set, the call fails with UIDVALIDITY_CHANGED if the mailbox was recreated.
 - `includeSnippet` (optional): Include a text snippet. Default true. Set false for a faster search.
 - `snippetChars` (optional): Maximum snippet length in characters. Default 160.
+- `order` (optional): Page order when sort is omitted. Default newest-first (arrival descending). oldest-first is arrival ascending. When sort is set, order must agree with the first key. Pass the same order on every page.
 
 ### Examples
 
@@ -560,7 +574,7 @@ Annotations: readOnlyHint=false, destructiveHint=true, idempotentHint=false, ope
 
 List threads
 
-Group messages into threads. Uses the THREAD extension (REFERENCES by default, or ORDEREDSUBJECT) when the server advertises it and the search is "all"; otherwise threads are built from References and In-Reply-To, with a subject fallback for ORDEREDSUBJECT. The result is a tree plus a paged flat UID list (parent before children). Gmail thread ids, when present on summaries, are a separate field from this tree. Large mailboxes are capped at maxSortCandidates for the client-side path.
+Group messages into threads in one mailbox unless folders is set. Uses the THREAD extension (REFERENCES by default, or ORDEREDSUBJECT) when the server advertises it and the search is "all"; otherwise threads are built from References and In-Reply-To. ORDEREDSUBJECT is the opt-in subject heuristic. The result is a tree plus a paged flat list. Gmail thread ids, when present on summaries, are a separate field from this tree. A folder larger than maxSortCandidates is truncated and reports omitted and scanned.
 
 Annotations: readOnlyHint=true, destructiveHint=false, idempotentHint=true, openWorldHint=true.
 
@@ -608,10 +622,13 @@ Annotations: readOnlyHint=true, destructiveHint=false, idempotentHint=true, open
   - `not` (optional): Negate a nested search object.
   - `or` (optional): Match if any nested object matches. Provide at least two clauses. IMAP OR is binary; longer lists are folded.
   - `and` (optional): Match if every nested object matches. Top-level fields are already ANDed; use this for grouped clauses.
-- `algorithm` (optional): Default REFERENCES.
-- `limit` (optional): Page size. Default is limits.pageSize (25). The schema allows up to 10000; the server rejects values above the configured limits.maxPageSize (default 100).
-- `cursor` (optional): Opaque cursor from the previous page's nextCursor. It stores the last returned UID, that message's position, the primary sort key, and the mailbox uidValidity. The next page continues after that UID in a freshly sorted result. If the UID was expunged, the page continues at the first message that sorts strictly after the stored key, so deleting an earlier message does not skip the next one. Messages that compare equal to that key may be repeated or skipped. When the cursor has no sort key, the stored position is used, and adding or removing earlier messages can skip or repeat one. A cursor whose uidValidity no longer matches fails with UIDVALIDITY_CHANGED. Pass the same sort as the call that issued the cursor. Omit to start at the first page.
+- `algorithm` (optional): Default REFERENCES. ORDEREDSUBJECT is the subject heuristic and labels rows as subject.
+- `folders` (optional): Folder scope. Replaces mailbox when set. Default for a list or search is the single mailbox (INBOX when mailbox is omitted). "all" skips Trash and Junk unless they are named or includeTrash/includeJunk is true.
+- `maxPerFolder` (optional): Most messages scanned in one folder when the server cannot sort the whole snapshot. Default and maximum are limits.maxSortCandidates (5000). A higher value is rejected. Truncated folders report omitted and scanned.
+- `limit` (optional): Page size. Default 25. Summaries are capped at 200 or limits.maxPageSize, whichever is lower. Calls that include message bodies are capped at 20. The cursor stores the limit from the first page; repeat it, or omit it and the stored limit is used. Mail that arrives after the first page is outside this snapshot: call again without a cursor to see it.
+- `cursor` (optional): Opaque cursor from the previous page. It freezes the folder scope, sort, page size, and a snapshot upper UID (uidNext - 1 at the first page) so later arrivals do not shift the walk. The next page starts strictly after the last row in the total order (sort keys, then date, folder, UID). If that row was expunged, the page continues at the first row that sorts after it, so a deletion does not skip the following message. A uidValidity change returns CURSOR_INVALIDATED. An older cursor returns INVALID_ARGUMENT. Omit to start a new snapshot.
 - `uidValidity` (optional): Expected UIDVALIDITY decimal string from mail_get_mailbox_status or a previous list. When set, the call fails with UIDVALIDITY_CHANGED if the mailbox was recreated.
+- `order` (optional): Page order when sort is omitted. Default newest-first (arrival descending). oldest-first is arrival ascending. When sort is set, order must agree with the first key. Pass the same order on every page.
 
 ### Examples
 
@@ -870,6 +887,7 @@ Annotations: readOnlyHint=false, destructiveHint=false, idempotentHint=false, op
 - `to` (optional): One or more addresses. A single string may also contain a comma-separated list.
 - `cc` (optional): One or more addresses. A single string may also contain a comma-separated list.
 - `bcc` (optional): One or more addresses. A single string may also contain a comma-separated list.
+- `replyTo` (optional): One or more addresses. A single string may also contain a comma-separated list.
 - `subject` (optional): Replacement subject.
 - `text` (optional): Replacement plain text body.
 - `html` (optional): Replacement HTML body.
@@ -966,6 +984,8 @@ Annotations: readOnlyHint=false, destructiveHint=false, idempotentHint=false, op
 - `uid`: IMAP UID of one message. UIDs are only meaningful together with the mailbox uidValidity.
 - `uidValidity` (optional): Expected UIDVALIDITY decimal string from mail_get_mailbox_status or a previous list. When set, the call fails with UIDVALIDITY_CHANGED if the mailbox was recreated.
 - `replyAll` (optional): true replies to all recipients. Default false replies only to From or Reply-To.
+- `from` (optional): From identity. When omitted, an identity is selected only if exactly one configured address is in the original To or Cc.
+- `replyTo` (optional): Reply-To header. Omit to leave it unset.
 - `text` (optional): Your reply, placed above the quoted original.
 - `html` (optional): Optional HTML for your reply. Quoting is still done in the text part.
 - `subject` (optional): Override the subject. Default is Re: plus the original subject.
@@ -998,6 +1018,8 @@ Annotations: readOnlyHint=false, destructiveHint=false, idempotentHint=false, op
 - `mailbox`: Mailbox path as returned by mail_list_mailboxes, in Unicode (not modified UTF-7). Nested folders use the server delimiter, often "/" or ".". Examples: "INBOX", "Projects/2026", "Entwürfe".
 - `uid`: IMAP UID of one message. UIDs are only meaningful together with the mailbox uidValidity.
 - `uidValidity` (optional): Expected UIDVALIDITY decimal string from mail_get_mailbox_status or a previous list. When set, the call fails with UIDVALIDITY_CHANGED if the mailbox was recreated.
+- `from` (optional): From identity. Same selection rules as mail_reply_message.
+- `replyTo` (optional): One or more addresses. A single string may also contain a comma-separated list.
 - `to`: One or more addresses. A single string may also contain a comma-separated list.
 - `cc` (optional): One or more addresses. A single string may also contain a comma-separated list.
 - `text` (optional): Note placed above the forwarded body.
@@ -1033,6 +1055,8 @@ Annotations: readOnlyHint=false, destructiveHint=false, idempotentHint=false, op
 - `mailbox`: Mailbox that holds the draft, usually Drafts.
 - `uid`: IMAP UID of one message. UIDs are only meaningful together with the mailbox uidValidity.
 - `uidValidity` (optional): Expected UIDVALIDITY decimal string from mail_get_mailbox_status or a previous list. When set, the call fails with UIDVALIDITY_CHANGED if the mailbox was recreated.
+- `from` (optional): Replace the draft From. Must be an identity or an allowFromDomains address.
+- `replyTo` (optional): Replace Reply-To.
 - `appendSent` (optional): Force or skip the Sent APPEND. Default follows the account setting.
 
 ### Examples
@@ -1077,5 +1101,357 @@ Annotations: readOnlyHint=true, destructiveHint=false, idempotentHint=false, ope
 
 ```json
 {"mailbox":"INBOX","timeoutMs":15000}
+```
+
+## mail_get_thread
+
+Get a conversation
+
+Return one conversation, earlier and later messages, across folders. Pass mailbox and uid, or a messageId. Default folders are the seed mailbox plus Sent, Archive, and All. Junk and Trash are off unless you name them. Messages are linked by Message-ID, In-Reply-To, and References. Gmail X-GM-THRID is used when X-GM-EXT-1 is present, otherwise OBJECTID THREADID. Each item says how it was linked: header, gmail-thrid, objectid, or subject. subject is opt-in via subjectHeuristic. Copies that share a Message-ID collapse; messages with no Message-ID stay separate. alsoIn lists the other folders. The page is a snapshot: mail that arrives later needs a new call without a cursor. includeBodies caps the page at 20. Identities are listed by mail_list_accounts.
+
+Annotations: readOnlyHint=true, destructiveHint=false, idempotentHint=true, openWorldHint=true.
+
+### Arguments
+
+- `account` (optional): Account id from mail_list_accounts. Omit to use the configured default account. Example: "work".
+- `mailbox` (optional): Required with uid.
+- `uid` (optional): IMAP UID of one message. UIDs are only meaningful together with the mailbox uidValidity.
+- `uidValidity` (optional): Expected UIDVALIDITY decimal string from mail_get_mailbox_status or a previous list. When set, the call fails with UIDVALIDITY_CHANGED if the mailbox was recreated.
+- `messageId` (optional): Find the seed by Message-ID instead of uid.
+- `folders` (optional): Folder scope. Replaces mailbox when set. Default for a list or search is the single mailbox (INBOX when mailbox is omitted). "all" skips Trash and Junk unless they are named or includeTrash/includeJunk is true.
+- `includeBodies` (optional): Include capped plain text. Default false. Page size max 20.
+- `onlyUnread` (optional): Keep only messages without \Seen.
+- `subjectHeuristic` (optional): Also link messages that share a normalized subject and a participant. Default false. Those items are linked "subject".
+- `maxMessages` (optional): Stop after this many messages. Default 100, max 500.
+- `maxRounds` (optional): Header-search rounds. Default 4, max 8.
+- `limit` (optional): Page size. Default 25. Summaries are capped at 200 or limits.maxPageSize, whichever is lower. Calls that include message bodies are capped at 20. The cursor stores the limit from the first page; repeat it, or omit it and the stored limit is used. Mail that arrives after the first page is outside this snapshot: call again without a cursor to see it.
+- `cursor` (optional): Opaque cursor from the previous page. It freezes the folder scope, sort, page size, and a snapshot upper UID (uidNext - 1 at the first page) so later arrivals do not shift the walk. The next page starts strictly after the last row in the total order (sort keys, then date, folder, UID). If that row was expunged, the page continues at the first row that sorts after it, so a deletion does not skip the following message. A uidValidity change returns CURSOR_INVALIDATED. An older cursor returns INVALID_ARGUMENT. Omit to start a new snapshot.
+- `order` (optional): Page order when sort is omitted. Default newest-first (arrival descending). oldest-first is arrival ascending. When sort is set, order must agree with the first key. Pass the same order on every page.
+
+### Examples
+
+```json
+{"mailbox":"INBOX","uid":41}
+```
+
+## mail_count
+
+Count messages per folder
+
+STATUS counts for each folder in the scope: messages, unseen, recent, uidNext, and uidValidity. When search is set, matches is the SEARCH count for that folder. The folder list is paged. Counts are exact for the folders on this page. A new call without a cursor sees folders created after the snapshot.
+
+Annotations: readOnlyHint=true, destructiveHint=false, idempotentHint=true, openWorldHint=true.
+
+### Arguments
+
+- `account` (optional): Account id from mail_list_accounts. Omit to use the configured default account. Example: "work".
+- `mailbox` (optional): Mailbox path as returned by mail_list_mailboxes, in Unicode (not modified UTF-7). Nested folders use the server delimiter, often "/" or ".". Examples: "INBOX", "Projects/2026", "Entwürfe".
+- `folders` (optional): Folder scope. Replaces mailbox when set. Default for a list or search is the single mailbox (INBOX when mailbox is omitted). "all" skips Trash and Junk unless they are named or includeTrash/includeJunk is true.
+- `search` (optional): Structured IMAP SEARCH. Fields are ANDed. Dates are calendar days in UTC. Use mail_search_messages rather than mail_list_messages when you have criteria. Gmail-only fields fail with CAPABILITY_UNSUPPORTED on other servers.
+  - `all` (optional): Match every message. Usually omit this and set a real criterion.
+  - `from` (optional): Substring match on the From header. Example: "ada@example.com".
+  - `to` (optional): Substring match on To.
+  - `cc` (optional): Substring match on Cc.
+  - `bcc` (optional): Substring match on Bcc. Many servers do not store Bcc.
+  - `subject` (optional): Substring match on Subject.
+  - `body` (optional): Substring match on the body, not headers.
+  - `text` (optional): Substring match on headers and body.
+  - `header` (optional): Match one header field.
+    - `name`: Header field name, for example "List-Id" or "Message-ID".
+    - `value` (optional): Substring the header must contain. Omit to test only that the header is present.
+  - `since` (optional): Internal date on or after this day. YYYY-MM-DD or ISO timestamp. Time of day is ignored.
+  - `before` (optional): Internal date before this day (exclusive of the day in IMAP). YYYY-MM-DD.
+  - `on` (optional): Internal date on this calendar day. YYYY-MM-DD.
+  - `sentSince` (optional): Date header on or after this day. YYYY-MM-DD.
+  - `sentBefore` (optional): Date header before this day. YYYY-MM-DD.
+  - `sentOn` (optional): Date header on this day. YYYY-MM-DD.
+  - `larger` (optional): Message size strictly greater than this many octets.
+  - `smaller` (optional): Message size strictly less than this many octets.
+  - `seen` (optional): true requires \Seen, false requires the flag to be absent.
+  - `answered` (optional): true requires \Answered, false requires it absent.
+  - `flagged` (optional): true requires \Flagged, false requires it absent.
+  - `deleted` (optional): true requires \Deleted, false requires it absent.
+  - `draft` (optional): true requires \Draft, false requires it absent.
+  - `recent` (optional): true requires \Recent. Recent is session-specific and often useless after the first look.
+  - `keyword` (optional): Custom keyword that must be set, without a leading backslash. Example: "$Forwarded".
+  - `unkeyword` (optional): Custom keyword that must be absent.
+  - `uid` (optional): UID set. Examples: "10", "10:20", "1,5,9:*".
+  - `seq` (optional): Sequence-number set, not UIDs. Prefer uid. Example: "1:10".
+  - `modseq` (optional): Decimal MODSEQ. Requires CONDSTORE. Matches messages changed after this value.
+  - `emailId` (optional): OBJECTID EMAILID or Gmail X-GM-MSGID. Requires OBJECTID or X-GM-EXT-1.
+  - `threadId` (optional): OBJECTID THREADID or Gmail X-GM-THRID.
+  - `gmraw` (optional): Gmail X-GM-RAW query, the same language as the Gmail search box. Example: "has:attachment newer_than:7d".
+  - `labels` (optional): Gmail label filter. Requires X-GM-EXT-1.
+    - `has` (optional): Gmail labels the message must have.
+    - `not` (optional): Gmail labels the message must not have.
+  - `not` (optional): Negate a nested search object.
+  - `or` (optional): Match if any nested object matches. Provide at least two clauses. IMAP OR is binary; longer lists are folded.
+  - `and` (optional): Match if every nested object matches. Top-level fields are already ANDed; use this for grouped clauses.
+- `limit` (optional): Page size. Default 25. Summaries are capped at 200 or limits.maxPageSize, whichever is lower. Calls that include message bodies are capped at 20. The cursor stores the limit from the first page; repeat it, or omit it and the stored limit is used. Mail that arrives after the first page is outside this snapshot: call again without a cursor to see it.
+- `cursor` (optional): Opaque cursor from the previous page. It freezes the folder scope, sort, page size, and a snapshot upper UID (uidNext - 1 at the first page) so later arrivals do not shift the walk. The next page starts strictly after the last row in the total order (sort keys, then date, folder, UID). If that row was expunged, the page continues at the first row that sorts after it, so a deletion does not skip the following message. A uidValidity change returns CURSOR_INVALIDATED. An older cursor returns INVALID_ARGUMENT. Omit to start a new snapshot.
+- `order` (optional): Page order when sort is omitted. Default newest-first (arrival descending). oldest-first is arrival ascending. When sort is set, order must agree with the first key. Pass the same order on every page.
+
+### Examples
+
+```json
+{"folders":"all"}
+```
+
+## mail_list_attachments
+
+List attachment metadata
+
+Page attachment metadata across a folder scope: filename, contentType, size, and partId. No bytes. Messages past the per-folder cap are omitted and truncated is true. Use mail_download_attachment for the bytes of one part.
+
+Annotations: readOnlyHint=true, destructiveHint=false, idempotentHint=true, openWorldHint=true.
+
+### Arguments
+
+- `account` (optional): Account id from mail_list_accounts. Omit to use the configured default account. Example: "work".
+- `mailbox` (optional): Mailbox path as returned by mail_list_mailboxes, in Unicode (not modified UTF-7). Nested folders use the server delimiter, often "/" or ".". Examples: "INBOX", "Projects/2026", "Entwürfe".
+- `folders` (optional): Folder scope. Replaces mailbox when set. Default for a list or search is the single mailbox (INBOX when mailbox is omitted). "all" skips Trash and Junk unless they are named or includeTrash/includeJunk is true.
+- `search` (optional): Structured IMAP SEARCH. Fields are ANDed. Dates are calendar days in UTC. Use mail_search_messages rather than mail_list_messages when you have criteria. Gmail-only fields fail with CAPABILITY_UNSUPPORTED on other servers.
+  - `all` (optional): Match every message. Usually omit this and set a real criterion.
+  - `from` (optional): Substring match on the From header. Example: "ada@example.com".
+  - `to` (optional): Substring match on To.
+  - `cc` (optional): Substring match on Cc.
+  - `bcc` (optional): Substring match on Bcc. Many servers do not store Bcc.
+  - `subject` (optional): Substring match on Subject.
+  - `body` (optional): Substring match on the body, not headers.
+  - `text` (optional): Substring match on headers and body.
+  - `header` (optional): Match one header field.
+    - `name`: Header field name, for example "List-Id" or "Message-ID".
+    - `value` (optional): Substring the header must contain. Omit to test only that the header is present.
+  - `since` (optional): Internal date on or after this day. YYYY-MM-DD or ISO timestamp. Time of day is ignored.
+  - `before` (optional): Internal date before this day (exclusive of the day in IMAP). YYYY-MM-DD.
+  - `on` (optional): Internal date on this calendar day. YYYY-MM-DD.
+  - `sentSince` (optional): Date header on or after this day. YYYY-MM-DD.
+  - `sentBefore` (optional): Date header before this day. YYYY-MM-DD.
+  - `sentOn` (optional): Date header on this day. YYYY-MM-DD.
+  - `larger` (optional): Message size strictly greater than this many octets.
+  - `smaller` (optional): Message size strictly less than this many octets.
+  - `seen` (optional): true requires \Seen, false requires the flag to be absent.
+  - `answered` (optional): true requires \Answered, false requires it absent.
+  - `flagged` (optional): true requires \Flagged, false requires it absent.
+  - `deleted` (optional): true requires \Deleted, false requires it absent.
+  - `draft` (optional): true requires \Draft, false requires it absent.
+  - `recent` (optional): true requires \Recent. Recent is session-specific and often useless after the first look.
+  - `keyword` (optional): Custom keyword that must be set, without a leading backslash. Example: "$Forwarded".
+  - `unkeyword` (optional): Custom keyword that must be absent.
+  - `uid` (optional): UID set. Examples: "10", "10:20", "1,5,9:*".
+  - `seq` (optional): Sequence-number set, not UIDs. Prefer uid. Example: "1:10".
+  - `modseq` (optional): Decimal MODSEQ. Requires CONDSTORE. Matches messages changed after this value.
+  - `emailId` (optional): OBJECTID EMAILID or Gmail X-GM-MSGID. Requires OBJECTID or X-GM-EXT-1.
+  - `threadId` (optional): OBJECTID THREADID or Gmail X-GM-THRID.
+  - `gmraw` (optional): Gmail X-GM-RAW query, the same language as the Gmail search box. Example: "has:attachment newer_than:7d".
+  - `labels` (optional): Gmail label filter. Requires X-GM-EXT-1.
+    - `has` (optional): Gmail labels the message must have.
+    - `not` (optional): Gmail labels the message must not have.
+  - `not` (optional): Negate a nested search object.
+  - `or` (optional): Match if any nested object matches. Provide at least two clauses. IMAP OR is binary; longer lists are folded.
+  - `and` (optional): Match if every nested object matches. Top-level fields are already ANDed; use this for grouped clauses.
+- `maxPerFolder` (optional): Most messages scanned in one folder when the server cannot sort the whole snapshot. Default and maximum are limits.maxSortCandidates (5000). A higher value is rejected. Truncated folders report omitted and scanned.
+- `limit` (optional): Page size. Default 25. Summaries are capped at 200 or limits.maxPageSize, whichever is lower. Calls that include message bodies are capped at 20. The cursor stores the limit from the first page; repeat it, or omit it and the stored limit is used. Mail that arrives after the first page is outside this snapshot: call again without a cursor to see it.
+- `cursor` (optional): Opaque cursor from the previous page. It freezes the folder scope, sort, page size, and a snapshot upper UID (uidNext - 1 at the first page) so later arrivals do not shift the walk. The next page starts strictly after the last row in the total order (sort keys, then date, folder, UID). If that row was expunged, the page continues at the first row that sorts after it, so a deletion does not skip the following message. A uidValidity change returns CURSOR_INVALIDATED. An older cursor returns INVALID_ARGUMENT. Omit to start a new snapshot.
+- `order` (optional): Page order when sort is omitted. Default newest-first (arrival descending). oldest-first is arrival ascending. When sort is set, order must agree with the first key. Pass the same order on every page.
+
+### Examples
+
+```json
+{"mailbox":"INBOX","search":{"larger":100000}}
+```
+
+## mail_list_correspondents
+
+List correspondents
+
+Count exact normalized From addresses over a folder scope and optional search. Own identities are excluded. Ties break by address. scanned is how many messages were read. truncated is true when a folder hit its cap, and then the counts cover only the scanned subset. Discover identities with mail_list_accounts.
+
+Annotations: readOnlyHint=true, destructiveHint=false, idempotentHint=true, openWorldHint=true.
+
+### Arguments
+
+- `account` (optional): Account id from mail_list_accounts. Omit to use the configured default account. Example: "work".
+- `mailbox` (optional): Mailbox path as returned by mail_list_mailboxes, in Unicode (not modified UTF-7). Nested folders use the server delimiter, often "/" or ".". Examples: "INBOX", "Projects/2026", "Entwürfe".
+- `folders` (optional): Folder scope. Replaces mailbox when set. Default for a list or search is the single mailbox (INBOX when mailbox is omitted). "all" skips Trash and Junk unless they are named or includeTrash/includeJunk is true.
+- `search` (optional): Structured IMAP SEARCH. Fields are ANDed. Dates are calendar days in UTC. Use mail_search_messages rather than mail_list_messages when you have criteria. Gmail-only fields fail with CAPABILITY_UNSUPPORTED on other servers.
+  - `all` (optional): Match every message. Usually omit this and set a real criterion.
+  - `from` (optional): Substring match on the From header. Example: "ada@example.com".
+  - `to` (optional): Substring match on To.
+  - `cc` (optional): Substring match on Cc.
+  - `bcc` (optional): Substring match on Bcc. Many servers do not store Bcc.
+  - `subject` (optional): Substring match on Subject.
+  - `body` (optional): Substring match on the body, not headers.
+  - `text` (optional): Substring match on headers and body.
+  - `header` (optional): Match one header field.
+    - `name`: Header field name, for example "List-Id" or "Message-ID".
+    - `value` (optional): Substring the header must contain. Omit to test only that the header is present.
+  - `since` (optional): Internal date on or after this day. YYYY-MM-DD or ISO timestamp. Time of day is ignored.
+  - `before` (optional): Internal date before this day (exclusive of the day in IMAP). YYYY-MM-DD.
+  - `on` (optional): Internal date on this calendar day. YYYY-MM-DD.
+  - `sentSince` (optional): Date header on or after this day. YYYY-MM-DD.
+  - `sentBefore` (optional): Date header before this day. YYYY-MM-DD.
+  - `sentOn` (optional): Date header on this day. YYYY-MM-DD.
+  - `larger` (optional): Message size strictly greater than this many octets.
+  - `smaller` (optional): Message size strictly less than this many octets.
+  - `seen` (optional): true requires \Seen, false requires the flag to be absent.
+  - `answered` (optional): true requires \Answered, false requires it absent.
+  - `flagged` (optional): true requires \Flagged, false requires it absent.
+  - `deleted` (optional): true requires \Deleted, false requires it absent.
+  - `draft` (optional): true requires \Draft, false requires it absent.
+  - `recent` (optional): true requires \Recent. Recent is session-specific and often useless after the first look.
+  - `keyword` (optional): Custom keyword that must be set, without a leading backslash. Example: "$Forwarded".
+  - `unkeyword` (optional): Custom keyword that must be absent.
+  - `uid` (optional): UID set. Examples: "10", "10:20", "1,5,9:*".
+  - `seq` (optional): Sequence-number set, not UIDs. Prefer uid. Example: "1:10".
+  - `modseq` (optional): Decimal MODSEQ. Requires CONDSTORE. Matches messages changed after this value.
+  - `emailId` (optional): OBJECTID EMAILID or Gmail X-GM-MSGID. Requires OBJECTID or X-GM-EXT-1.
+  - `threadId` (optional): OBJECTID THREADID or Gmail X-GM-THRID.
+  - `gmraw` (optional): Gmail X-GM-RAW query, the same language as the Gmail search box. Example: "has:attachment newer_than:7d".
+  - `labels` (optional): Gmail label filter. Requires X-GM-EXT-1.
+    - `has` (optional): Gmail labels the message must have.
+    - `not` (optional): Gmail labels the message must not have.
+  - `not` (optional): Negate a nested search object.
+  - `or` (optional): Match if any nested object matches. Provide at least two clauses. IMAP OR is binary; longer lists are folded.
+  - `and` (optional): Match if every nested object matches. Top-level fields are already ANDed; use this for grouped clauses.
+- `maxPerFolder` (optional): Most messages scanned in one folder when the server cannot sort the whole snapshot. Default and maximum are limits.maxSortCandidates (5000). A higher value is rejected. Truncated folders report omitted and scanned.
+- `limit` (optional): Page size. Default 25. Summaries are capped at 200 or limits.maxPageSize, whichever is lower. Calls that include message bodies are capped at 20. The cursor stores the limit from the first page; repeat it, or omit it and the stored limit is used. Mail that arrives after the first page is outside this snapshot: call again without a cursor to see it.
+- `cursor` (optional): Opaque cursor from the previous page. It freezes the folder scope, sort, page size, and a snapshot upper UID (uidNext - 1 at the first page) so later arrivals do not shift the walk. The next page starts strictly after the last row in the total order (sort keys, then date, folder, UID). If that row was expunged, the page continues at the first row that sorts after it, so a deletion does not skip the following message. A uidValidity change returns CURSOR_INVALIDATED. An older cursor returns INVALID_ARGUMENT. Omit to start a new snapshot.
+- `order` (optional): Page order when sort is omitted. Default newest-first (arrival descending). oldest-first is arrival ascending. When sort is set, order must agree with the first key. Pass the same order on every page.
+
+### Examples
+
+```json
+{"folders":"all","search":{"since":"2026-01-01"}}
+```
+
+## mail_search_facets
+
+Count a search
+
+Exact counts for a folder scope and optional search: matches, unread, flagged, and answered per folder, plus a has-attachments count and the top sender addresses and domains. top defaults to 10 and maxes at 100. Ties break alphabetically. Flag counts come from SEARCH and stay exact. Sender and attachment counts cover the scanned subset when a folder is truncated. This tool does not page.
+
+Annotations: readOnlyHint=true, destructiveHint=false, idempotentHint=true, openWorldHint=true.
+
+### Arguments
+
+- `account` (optional): Account id from mail_list_accounts. Omit to use the configured default account. Example: "work".
+- `mailbox` (optional): Mailbox path as returned by mail_list_mailboxes, in Unicode (not modified UTF-7). Nested folders use the server delimiter, often "/" or ".". Examples: "INBOX", "Projects/2026", "Entwürfe".
+- `folders` (optional): Folder scope. Replaces mailbox when set. Default for a list or search is the single mailbox (INBOX when mailbox is omitted). "all" skips Trash and Junk unless they are named or includeTrash/includeJunk is true.
+- `search` (optional): Structured IMAP SEARCH. Fields are ANDed. Dates are calendar days in UTC. Use mail_search_messages rather than mail_list_messages when you have criteria. Gmail-only fields fail with CAPABILITY_UNSUPPORTED on other servers.
+  - `all` (optional): Match every message. Usually omit this and set a real criterion.
+  - `from` (optional): Substring match on the From header. Example: "ada@example.com".
+  - `to` (optional): Substring match on To.
+  - `cc` (optional): Substring match on Cc.
+  - `bcc` (optional): Substring match on Bcc. Many servers do not store Bcc.
+  - `subject` (optional): Substring match on Subject.
+  - `body` (optional): Substring match on the body, not headers.
+  - `text` (optional): Substring match on headers and body.
+  - `header` (optional): Match one header field.
+    - `name`: Header field name, for example "List-Id" or "Message-ID".
+    - `value` (optional): Substring the header must contain. Omit to test only that the header is present.
+  - `since` (optional): Internal date on or after this day. YYYY-MM-DD or ISO timestamp. Time of day is ignored.
+  - `before` (optional): Internal date before this day (exclusive of the day in IMAP). YYYY-MM-DD.
+  - `on` (optional): Internal date on this calendar day. YYYY-MM-DD.
+  - `sentSince` (optional): Date header on or after this day. YYYY-MM-DD.
+  - `sentBefore` (optional): Date header before this day. YYYY-MM-DD.
+  - `sentOn` (optional): Date header on this day. YYYY-MM-DD.
+  - `larger` (optional): Message size strictly greater than this many octets.
+  - `smaller` (optional): Message size strictly less than this many octets.
+  - `seen` (optional): true requires \Seen, false requires the flag to be absent.
+  - `answered` (optional): true requires \Answered, false requires it absent.
+  - `flagged` (optional): true requires \Flagged, false requires it absent.
+  - `deleted` (optional): true requires \Deleted, false requires it absent.
+  - `draft` (optional): true requires \Draft, false requires it absent.
+  - `recent` (optional): true requires \Recent. Recent is session-specific and often useless after the first look.
+  - `keyword` (optional): Custom keyword that must be set, without a leading backslash. Example: "$Forwarded".
+  - `unkeyword` (optional): Custom keyword that must be absent.
+  - `uid` (optional): UID set. Examples: "10", "10:20", "1,5,9:*".
+  - `seq` (optional): Sequence-number set, not UIDs. Prefer uid. Example: "1:10".
+  - `modseq` (optional): Decimal MODSEQ. Requires CONDSTORE. Matches messages changed after this value.
+  - `emailId` (optional): OBJECTID EMAILID or Gmail X-GM-MSGID. Requires OBJECTID or X-GM-EXT-1.
+  - `threadId` (optional): OBJECTID THREADID or Gmail X-GM-THRID.
+  - `gmraw` (optional): Gmail X-GM-RAW query, the same language as the Gmail search box. Example: "has:attachment newer_than:7d".
+  - `labels` (optional): Gmail label filter. Requires X-GM-EXT-1.
+    - `has` (optional): Gmail labels the message must have.
+    - `not` (optional): Gmail labels the message must not have.
+  - `not` (optional): Negate a nested search object.
+  - `or` (optional): Match if any nested object matches. Provide at least two clauses. IMAP OR is binary; longer lists are folded.
+  - `and` (optional): Match if every nested object matches. Top-level fields are already ANDed; use this for grouped clauses.
+- `maxPerFolder` (optional): Most messages scanned in one folder when the server cannot sort the whole snapshot. Default and maximum are limits.maxSortCandidates (5000). A higher value is rejected. Truncated folders report omitted and scanned.
+- `top` (optional): Sender and domain rows. Default 10, max 100.
+
+### Examples
+
+```json
+{"folders":"all","search":{"unkeyword":"$Junk"},"top":10}
+```
+
+## mail_modify_by_search
+
+Modify messages that match a search
+
+Apply addFlags, removeFlags, move, or archive to every message in a folder scope that matches search. dryRun defaults to true and only pages a preview. A real run is refused with SIZE_LIMIT when the match count exceeds limits.maxBulk. move and archive require allowDelete. Adding or removing \Deleted does too. There is no permanent delete here. The preview uses the shared snapshot cursor.
+
+Annotations: readOnlyHint=false, destructiveHint=true, idempotentHint=false, openWorldHint=true.
+
+### Arguments
+
+- `account` (optional): Account id from mail_list_accounts. Omit to use the configured default account. Example: "work".
+- `mailbox` (optional): Mailbox path as returned by mail_list_mailboxes, in Unicode (not modified UTF-7). Nested folders use the server delimiter, often "/" or ".". Examples: "INBOX", "Projects/2026", "Entwürfe".
+- `folders` (optional): Folder scope. Replaces mailbox when set. Default for a list or search is the single mailbox (INBOX when mailbox is omitted). "all" skips Trash and Junk unless they are named or includeTrash/includeJunk is true.
+- `search`: Structured IMAP SEARCH. Fields are ANDed. Dates are calendar days in UTC. Use mail_search_messages rather than mail_list_messages when you have criteria. Gmail-only fields fail with CAPABILITY_UNSUPPORTED on other servers.
+  - `all` (optional): Match every message. Usually omit this and set a real criterion.
+  - `from` (optional): Substring match on the From header. Example: "ada@example.com".
+  - `to` (optional): Substring match on To.
+  - `cc` (optional): Substring match on Cc.
+  - `bcc` (optional): Substring match on Bcc. Many servers do not store Bcc.
+  - `subject` (optional): Substring match on Subject.
+  - `body` (optional): Substring match on the body, not headers.
+  - `text` (optional): Substring match on headers and body.
+  - `header` (optional): Match one header field.
+    - `name`: Header field name, for example "List-Id" or "Message-ID".
+    - `value` (optional): Substring the header must contain. Omit to test only that the header is present.
+  - `since` (optional): Internal date on or after this day. YYYY-MM-DD or ISO timestamp. Time of day is ignored.
+  - `before` (optional): Internal date before this day (exclusive of the day in IMAP). YYYY-MM-DD.
+  - `on` (optional): Internal date on this calendar day. YYYY-MM-DD.
+  - `sentSince` (optional): Date header on or after this day. YYYY-MM-DD.
+  - `sentBefore` (optional): Date header before this day. YYYY-MM-DD.
+  - `sentOn` (optional): Date header on this day. YYYY-MM-DD.
+  - `larger` (optional): Message size strictly greater than this many octets.
+  - `smaller` (optional): Message size strictly less than this many octets.
+  - `seen` (optional): true requires \Seen, false requires the flag to be absent.
+  - `answered` (optional): true requires \Answered, false requires it absent.
+  - `flagged` (optional): true requires \Flagged, false requires it absent.
+  - `deleted` (optional): true requires \Deleted, false requires it absent.
+  - `draft` (optional): true requires \Draft, false requires it absent.
+  - `recent` (optional): true requires \Recent. Recent is session-specific and often useless after the first look.
+  - `keyword` (optional): Custom keyword that must be set, without a leading backslash. Example: "$Forwarded".
+  - `unkeyword` (optional): Custom keyword that must be absent.
+  - `uid` (optional): UID set. Examples: "10", "10:20", "1,5,9:*".
+  - `seq` (optional): Sequence-number set, not UIDs. Prefer uid. Example: "1:10".
+  - `modseq` (optional): Decimal MODSEQ. Requires CONDSTORE. Matches messages changed after this value.
+  - `emailId` (optional): OBJECTID EMAILID or Gmail X-GM-MSGID. Requires OBJECTID or X-GM-EXT-1.
+  - `threadId` (optional): OBJECTID THREADID or Gmail X-GM-THRID.
+  - `gmraw` (optional): Gmail X-GM-RAW query, the same language as the Gmail search box. Example: "has:attachment newer_than:7d".
+  - `labels` (optional): Gmail label filter. Requires X-GM-EXT-1.
+    - `has` (optional): Gmail labels the message must have.
+    - `not` (optional): Gmail labels the message must not have.
+  - `not` (optional): Negate a nested search object.
+  - `or` (optional): Match if any nested object matches. Provide at least two clauses. IMAP OR is binary; longer lists are folded.
+  - `and` (optional): Match if every nested object matches. Top-level fields are already ANDed; use this for grouped clauses.
+- `action`: addFlags and removeFlags use flags. move uses destination. archive moves to the Archive mailbox.
+- `flags` (optional): Flags for addFlags or removeFlags.
+- `destination` (optional): Target mailbox for move. Archive uses this or the resolved Archive mailbox.
+- `dryRun` (optional): Default true. false applies the action.
+- `maxPerFolder` (optional): Most messages scanned in one folder when the server cannot sort the whole snapshot. Default and maximum are limits.maxSortCandidates (5000). A higher value is rejected. Truncated folders report omitted and scanned.
+- `limit` (optional): Page size. Default 25. Summaries are capped at 200 or limits.maxPageSize, whichever is lower. Calls that include message bodies are capped at 20. The cursor stores the limit from the first page; repeat it, or omit it and the stored limit is used. Mail that arrives after the first page is outside this snapshot: call again without a cursor to see it.
+- `cursor` (optional): Opaque cursor from the previous page. It freezes the folder scope, sort, page size, and a snapshot upper UID (uidNext - 1 at the first page) so later arrivals do not shift the walk. The next page starts strictly after the last row in the total order (sort keys, then date, folder, UID). If that row was expunged, the page continues at the first row that sorts after it, so a deletion does not skip the following message. A uidValidity change returns CURSOR_INVALIDATED. An older cursor returns INVALID_ARGUMENT. Omit to start a new snapshot.
+- `order` (optional): Page order when sort is omitted. Default newest-first (arrival descending). oldest-first is arrival ascending. When sort is set, order must agree with the first key. Pass the same order on every page.
+
+### Examples
+
+```json
+{"mailbox":"INBOX","search":{"seen":true},"action":"archive","dryRun":true}
 ```
 

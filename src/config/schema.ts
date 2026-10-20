@@ -29,6 +29,20 @@ export const endpointSchema = z
   .object({
     host: z.string().min(1).optional(),
     port: z.number().int().min(1).max(65535).optional(),
+    connectHost: z
+      .string()
+      .min(1)
+      .optional()
+      .describe(
+        'TCP host when it differs from host, such as 127.0.0.1 for an SSH tunnel. TLS still verifies host.',
+      ),
+    connectPort: z
+      .number()
+      .int()
+      .min(1)
+      .max(65535)
+      .optional()
+      .describe('TCP port when it differs from port. TLS still verifies host.'),
     secure: z
       .boolean()
       .optional()
@@ -78,7 +92,7 @@ export const rateSchema = z
 export const limitsSchema = z
   .object({
     pageSize: z.number().int().positive().default(25),
-    maxPageSize: z.number().int().positive().default(100),
+    maxPageSize: z.number().int().positive().default(200),
     maxBodyChars: z.number().int().positive().default(100_000),
     maxAttachmentBytes: z
       .number()
@@ -110,6 +124,12 @@ export const accountSchema = z
     allowDelete: z.boolean().optional(),
     allowPermanentDelete: z.boolean().optional(),
     recipientDomainAllowList: z.array(z.string().min(1)).optional(),
+    allowFromDomains: z
+      .array(z.string().min(1))
+      .optional()
+      .describe(
+        'When set, From may be any address at these domains in addition to the configured identities. Certificate checks are unrelated and stay enabled.',
+      ),
     sendRateLimit: rateSchema.optional(),
     appendSent: z.union([z.boolean(), z.literal('auto')]).optional(),
     sentMailbox: z.string().min(1).optional(),
@@ -121,6 +141,7 @@ export const accountSchema = z
 
 export const configFileSchema = z
   .object({
+    $schema: z.string().min(1).optional().describe('JSON Schema URL. Ignored by the loader.'),
     defaultAccount: z.string().min(1).optional(),
     logLevel: z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal', 'silent']).optional(),
     poolSize: z.number().int().min(1).max(8).optional(),
@@ -146,6 +167,10 @@ export interface TlsSettings {
 export interface EndpointSettings {
   host: string;
   port: number;
+  /** TCP dial host. Defaults to `host`. TLS still uses `host` or `tls.servername`. */
+  connectHost?: string;
+  /** TCP dial port. Defaults to `port`. */
+  connectPort?: number;
   secure: boolean;
   starttls: StarttlsMode;
   timeoutMs: number;
@@ -197,6 +222,8 @@ export interface ResolvedAccount {
   allowDelete: boolean;
   allowPermanentDelete: boolean;
   recipientDomainAllowList: string[];
+  /** Extra domains whose addresses may be used as From. Empty means identities only. */
+  allowFromDomains: string[];
   sendRateLimit?: { max: number; windowMs: number };
   /** false skips the Sent APPEND. true always appends. auto skips Gmail. */
   appendSent: boolean | 'auto';

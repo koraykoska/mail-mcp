@@ -1,6 +1,8 @@
 import { z } from 'zod';
 import type { MailService } from '../service/mail-service.js';
 import type { MutationKind } from '../safety.js';
+import { cursorLimit, pageKeyList, pageLimit, readPageCursor, resolveOrder } from '../service/browse.js';
+import type { PageOrder } from '../page/snapshot.js';
 import { fields, strictOutput } from './schema.js';
 
 export interface ToolAnnotations {
@@ -18,6 +20,8 @@ export interface ToolDefinition {
   output: z.ZodObject<z.ZodRawShape>;
   annotations: ToolAnnotations;
   kind: 'read' | MutationKind;
+  /** When true, limit, cursor, and order are added and the result uses the shared page envelope. */
+  paged?: boolean;
   examples: string[];
   run(args: Record<string, unknown>, service: MailService): Promise<Record<string, unknown>>;
 }
@@ -27,8 +31,43 @@ const baseOut = {
   account: z.string().describe('Account id that handled the call.'),
 };
 
+const pageFields = {
+  items: z
+    .array(z.record(z.string(), z.unknown()))
+    .describe(
+      'This page. The same cursor model is used for every paged tool: pass nextCursor back as cursor. A new call without a cursor starts a new snapshot and includes mail that arrived after the previous one.',
+    ),
+  nextCursor: z
+    .string()
+    .nullable()
+    .describe('Cursor for the next page, or null on the last page.'),
+  total: z.number().describe('Rows inside the snapshot, before this page is sliced.'),
+  truncated: z
+    .boolean()
+    .describe('True when a cap omitted matches. omitted and scanned on snapshot.folders say which folder.'),
+  snapshot: z
+    .record(z.string(), z.unknown())
+    .describe(
+      'Frozen view from the first page. Message lists store each folder uidValidity and upper UID (uidNext - 1). Later arrivals stay outside this walk.',
+    ),
+  order: z.enum(['newest-first', 'oldest-first']).describe('Order used for this page.'),
+};
+
 function define(tool: ToolDefinition): ToolDefinition {
-  return tool;
+  if (!tool.paged) {
+    return tool;
+  }
+  return {
+    ...tool,
+    input: tool.input
+      .extend({
+        limit: fields.limit,
+        cursor: fields.cursor,
+        order: fields.order,
+      })
+      .strict(),
+    output: tool.output.extend(pageFields).strict(),
+  };
 }
 
 const readAnn = (title: string): ToolAnnotations => ({
@@ -59,9 +98,41 @@ export const TOOLS: ToolDefinition[] = [
       openWorldHint: false,
     },
     kind: 'read',
+    paged: true,
     examples: ['{}'],
-    async run(_args, service) {
-      return { ok: true, accounts: service.listAccounts() };
+    async run(args, service) {
+      const accounts = service.listAccounts();
+      const input = args as { limit?: number; cursor?: string; order?: PageOrder };
+      const cursor = readPageCursor(input.cursor);
+      const { order } = resolveOrder(input.order ? { order: input.order } : {});
+      const limit = pageLimit(
+        cursorLimit(cursor, input.limit, service.config.limits.pageSize),
+        service.config.limits.pageSize,
+        service.config.limits.maxPageSize,
+        false,
+      );
+      const paged = pageKeyList(
+        accounts.map((item) => String(item.id)),
+        {
+          limit,
+          order,
+          ...(cursor ? { cursor } : {}),
+          scope: 'accounts',
+          sort: [{ field: 'arrival', reverse: order === 'newest-first' }],
+        },
+      );
+      const byId = new Map(accounts.map((item) => [String(item.id), item]));
+      const items = paged.keys.map((key) => byId.get(key)).filter((item) => item !== undefined);
+      return {
+        ok: true,
+        accounts: items,
+        items,
+        nextCursor: paged.nextCursor,
+        total: paged.total,
+        truncated: false,
+        order,
+        snapshot: { folders: [] },
+      };
     },
   }),
   define({
@@ -190,7 +261,11 @@ export const TOOLS: ToolDefinition[] = [
         .optional()
         .describe('When true, only subscribed mailboxes. Default false (all listed).'),
     }),
-    output: strictOutput({ ...baseOut, mailboxes: z.array(z.record(z.string(), z.unknown())) }),
+    output: strictOutput({
+      ...baseOut,
+      mailboxes: z.array(z.record(z.string(), z.unknown())),
+      offset: z.number(),
+    }),
     annotations: {
       readOnlyHint: true,
       destructiveHint: false,
@@ -198,10 +273,21 @@ export const TOOLS: ToolDefinition[] = [
       openWorldHint: true,
     },
     kind: 'read',
+    paged: true,
     examples: ['{"subscribedOnly":true}'],
     async run(args, service) {
-      const input = args as { account?: string; subscribedOnly?: boolean };
-      return service.listMailboxes(input.account, input.subscribedOnly === true);
+      const input = args as {
+        account?: string;
+        subscribedOnly?: boolean;
+        limit?: number;
+        cursor?: string;
+        order?: PageOrder;
+      };
+      return service.listMailboxes(input.account, input.subscribedOnly === true, {
+        ...(input.limit !== undefined ? { limit: input.limit } : {}),
+        ...(input.cursor ? { cursor: input.cursor } : {}),
+        ...(input.order ? { order: input.order } : {}),
+      });
     },
   }),
   define({
@@ -353,7 +439,11 @@ export const TOOLS: ToolDefinition[] = [
     description:
       'Shortcut for mail_list_mailboxes with subscribedOnly true. Same result shape. Use it when a client only cares about the subscription list.',
     input: z.object({ account: fields.account }),
-    output: strictOutput({ ...baseOut, mailboxes: z.array(z.record(z.string(), z.unknown())) }),
+    output: strictOutput({
+      ...baseOut,
+      mailboxes: z.array(z.record(z.string(), z.unknown())),
+      offset: z.number(),
+    }),
     annotations: {
       readOnlyHint: true,
       destructiveHint: false,
@@ -361,9 +451,15 @@ export const TOOLS: ToolDefinition[] = [
       openWorldHint: true,
     },
     kind: 'read',
+    paged: true,
     examples: ['{}'],
     async run(args, service) {
-      return service.listMailboxes((args as { account?: string }).account, true);
+      const input = args as { account?: string; limit?: number; cursor?: string; order?: PageOrder };
+      return service.listMailboxes(input.account, true, {
+        ...(input.limit !== undefined ? { limit: input.limit } : {}),
+        ...(input.cursor ? { cursor: input.cursor } : {}),
+        ...(input.order ? { order: input.order } : {}),
+      });
     },
   }),
   define({
@@ -389,10 +485,12 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_list_messages',
     title: 'List message summaries',
     description:
-      'Page message summaries in a mailbox. Default mailbox is INBOX. Default sort is arrival descending (newest first) via the SORT extension, with a client-side fallback that refuses mailboxes larger than limits.maxSortCandidates when the server cannot sort. Each summary has uid, flags, size (octets), date, from, to, subject, hasAttachments, and a snippet of about snippetChars characters (default 160). Pass nextCursor back as cursor. Never returns an unbounded mailbox. For criteria use mail_search_messages; a search object is also accepted here. Optional uidValidity detects a recreated mailbox.',
+      'Page message summaries in a mailbox. Default mailbox is INBOX. Default sort is arrival descending (newest first) via the SORT extension, with a client-side fallback. A folder larger than limits.maxSortCandidates is truncated: snapshot.folders reports omitted and scanned, and paging continues inside that window. Each summary has uid, flags, size (octets), date, from, to, subject, hasAttachments, and a snippet of about snippetChars characters (default 160). Pass nextCursor back as cursor. Mail that arrives after the first page needs a new call without a cursor. For criteria use mail_search_messages; a search object is also accepted here. Optional uidValidity detects a recreated mailbox.',
     input: z.object({
       account: fields.account,
-      mailbox: fields.mailbox.optional().describe('Mailbox path. Default INBOX.'),
+      mailbox: fields.mailbox.optional().describe('Mailbox path. Default INBOX. Ignored when folders is set.'),
+      folders: fields.folders,
+      maxPerFolder: fields.maxPerFolder,
       search: fields.search.optional(),
       sort: z
         .array(fields.sortKey)
@@ -426,6 +524,8 @@ export const TOOLS: ToolDefinition[] = [
         z
           .object({
             uid: z.number(),
+            mailbox: z.string(),
+            uidValidity: z.string(),
             flags: z.array(z.string()),
             size: z.number().nullable(),
             date: z.string().nullable(),
@@ -446,10 +546,14 @@ export const TOOLS: ToolDefinition[] = [
             labels: z.array(z.string()),
             threadId: z.string().nullable(),
             modseq: z.string().nullable(),
+            listUnsubscribe: z.string().nullable(),
+            listId: z.string().nullable(),
+            autoSubmitted: z.string().nullable(),
           })
           .strict(),
       ),
       nextCursor: z.string().nullable(),
+      folders: z.array(z.string()).describe('Mailbox paths included in this snapshot.'),
     }),
     annotations: {
       readOnlyHint: true,
@@ -458,6 +562,7 @@ export const TOOLS: ToolDefinition[] = [
       openWorldHint: true,
     },
     kind: 'read',
+    paged: true,
     examples: ['{"mailbox":"INBOX","limit":10}'],
     async run(args, service) {
       return service.listMessages(args as never);
@@ -471,6 +576,8 @@ export const TOOLS: ToolDefinition[] = [
     input: z.object({
       account: fields.account,
       mailbox: fields.mailbox.optional(),
+      folders: fields.folders,
+      maxPerFolder: fields.maxPerFolder,
       search: fields.search,
       sort: z.array(fields.sortKey).optional(),
       limit: fields.limit,
@@ -501,6 +608,8 @@ export const TOOLS: ToolDefinition[] = [
         z
           .object({
             uid: z.number(),
+            mailbox: z.string(),
+            uidValidity: z.string(),
             flags: z.array(z.string()),
             size: z.number().nullable(),
             date: z.string().nullable(),
@@ -521,10 +630,14 @@ export const TOOLS: ToolDefinition[] = [
             labels: z.array(z.string()),
             threadId: z.string().nullable(),
             modseq: z.string().nullable(),
+            listUnsubscribe: z.string().nullable(),
+            listId: z.string().nullable(),
+            autoSubmitted: z.string().nullable(),
           })
           .strict(),
       ),
       nextCursor: z.string().nullable(),
+      folders: z.array(z.string()).describe('Mailbox paths included in this snapshot.'),
     }),
     annotations: {
       readOnlyHint: true,
@@ -533,6 +646,7 @@ export const TOOLS: ToolDefinition[] = [
       openWorldHint: true,
     },
     kind: 'read',
+    paged: true,
     examples: ['{"mailbox":"INBOX","search":{"seen":false,"from":"ada@example.com"},"limit":20}'],
     async run(args, service) {
       return service.searchMessages(args as never);
@@ -752,7 +866,7 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_list_threads',
     title: 'List threads',
     description:
-      'Group messages into threads. Uses the THREAD extension (REFERENCES by default, or ORDEREDSUBJECT) when the server advertises it and the search is "all"; otherwise threads are built from References and In-Reply-To, with a subject fallback for ORDEREDSUBJECT. The result is a tree plus a paged flat UID list (parent before children). Gmail thread ids, when present on summaries, are a separate field from this tree. Large mailboxes are capped at maxSortCandidates for the client-side path.',
+      'Group messages into threads in one mailbox unless folders is set. Uses the THREAD extension (REFERENCES by default, or ORDEREDSUBJECT) when the server advertises it and the search is "all"; otherwise threads are built from References and In-Reply-To. ORDEREDSUBJECT is the opt-in subject heuristic. The result is a tree plus a paged flat list. Gmail thread ids, when present on summaries, are a separate field from this tree. A folder larger than maxSortCandidates is truncated and reports omitted and scanned.',
     input: z.object({
       account: fields.account,
       mailbox: fields.mailbox.optional(),
@@ -760,7 +874,9 @@ export const TOOLS: ToolDefinition[] = [
       algorithm: z
         .enum(['REFERENCES', 'ORDEREDSUBJECT'])
         .optional()
-        .describe('Default REFERENCES.'),
+        .describe('Default REFERENCES. ORDEREDSUBJECT is the subject heuristic and labels rows as subject.'),
+      folders: fields.folders,
+      maxPerFolder: fields.maxPerFolder,
       limit: fields.limit,
       cursor: fields.cursor,
       uidValidity: fields.uidValidity,
@@ -777,6 +893,7 @@ export const TOOLS: ToolDefinition[] = [
       threads: z.array(z.record(z.string(), z.unknown())),
       uids: z.array(z.number()),
       nextCursor: z.string().nullable(),
+      offset: z.number(),
     }),
     annotations: {
       readOnlyHint: true,
@@ -785,6 +902,7 @@ export const TOOLS: ToolDefinition[] = [
       openWorldHint: true,
     },
     kind: 'read',
+    paged: true,
     examples: ['{"mailbox":"INBOX","algorithm":"REFERENCES","limit":20}'],
     async run(args, service) {
       return service.listThreads(args as never);
@@ -1142,6 +1260,10 @@ export const TOOLS: ToolDefinition[] = [
       destination: z.string().optional(),
       bytes: z.number().optional(),
       replacedUid: z.number().nullable().optional(),
+      identity: z
+        .object({ id: z.string().nullable(), email: z.string(), name: z.string().optional() })
+        .strict(),
+      identityReason: z.enum(['explicit', 'single-match', 'default-no-match', 'default-ambiguous']),
     }),
     annotations: {
       readOnlyHint: false,
@@ -1168,6 +1290,7 @@ export const TOOLS: ToolDefinition[] = [
       to: fields.addressList.optional(),
       cc: fields.addressList.optional(),
       bcc: fields.addressList.optional(),
+      replyTo: fields.addressList.optional(),
       subject: z.string().optional().describe('Replacement subject.'),
       text: z.string().optional().describe('Replacement plain text body.'),
       html: z.string().optional().describe('Replacement HTML body.'),
@@ -1181,6 +1304,10 @@ export const TOOLS: ToolDefinition[] = [
       destination: z.string().optional(),
       bytes: z.number().optional(),
       replacedUid: z.number().nullable(),
+      identity: z
+        .object({ id: z.string().nullable(), email: z.string(), name: z.string().optional() })
+        .strict(),
+      identityReason: z.enum(['explicit', 'single-match', 'default-no-match', 'default-ambiguous']),
     }),
     annotations: {
       readOnlyHint: false,
@@ -1288,6 +1415,14 @@ export const TOOLS: ToolDefinition[] = [
       bytes: z.number(),
       smtp: z.record(z.string(), z.unknown()),
       sentAppend: z.record(z.string(), z.unknown()).nullable(),
+      identity: z
+        .object({
+          id: z.string().nullable(),
+          email: z.string(),
+          name: z.string().optional(),
+        })
+        .strict(),
+      identityReason: z.enum(['explicit', 'single-match', 'default-no-match', 'default-ambiguous']),
     }),
     annotations: {
       readOnlyHint: false,
@@ -1317,6 +1452,12 @@ export const TOOLS: ToolDefinition[] = [
         .describe(
           'true replies to all recipients. Default false replies only to From or Reply-To.',
         ),
+      from: fields.address
+        .optional()
+        .describe(
+          'From identity. When omitted, an identity is selected only if exactly one configured address is in the original To or Cc.',
+        ),
+      replyTo: fields.addressList.optional().describe('Reply-To header. Omit to leave it unset.'),
       text: z.string().optional().describe('Your reply, placed above the quoted original.'),
       html: z
         .string()
@@ -1337,6 +1478,14 @@ export const TOOLS: ToolDefinition[] = [
       bytes: z.number(),
       smtp: z.record(z.string(), z.unknown()),
       sentAppend: z.record(z.string(), z.unknown()).nullable(),
+      identity: z
+        .object({
+          id: z.string().nullable(),
+          email: z.string(),
+          name: z.string().optional(),
+        })
+        .strict(),
+      identityReason: z.enum(['explicit', 'single-match', 'default-no-match', 'default-ambiguous']),
     }),
     annotations: {
       readOnlyHint: false,
@@ -1360,6 +1509,8 @@ export const TOOLS: ToolDefinition[] = [
       mailbox: fields.mailbox,
       uid: fields.uid,
       uidValidity: fields.uidValidity,
+      from: fields.address.optional().describe('From identity. Same selection rules as mail_reply_message.'),
+      replyTo: fields.addressList.optional(),
       to: fields.addressList.min(1),
       cc: fields.addressList.optional(),
       text: z.string().optional().describe('Note placed above the forwarded body.'),
@@ -1388,6 +1539,14 @@ export const TOOLS: ToolDefinition[] = [
       bytes: z.number(),
       smtp: z.record(z.string(), z.unknown()),
       sentAppend: z.record(z.string(), z.unknown()).nullable(),
+      identity: z
+        .object({
+          id: z.string().nullable(),
+          email: z.string(),
+          name: z.string().optional(),
+        })
+        .strict(),
+      identityReason: z.enum(['explicit', 'single-match', 'default-no-match', 'default-ambiguous']),
     }),
     annotations: {
       readOnlyHint: false,
@@ -1411,12 +1570,23 @@ export const TOOLS: ToolDefinition[] = [
       mailbox: fields.mailbox.describe('Mailbox that holds the draft, usually Drafts.'),
       uid: fields.uid,
       uidValidity: fields.uidValidity,
+      from: fields.address.optional().describe('Replace the draft From. Must be an identity or an allowFromDomains address.'),
+      replyTo: fields.addressList.optional().describe('Replace Reply-To.'),
       appendSent: z
         .boolean()
         .optional()
         .describe('Force or skip the Sent APPEND. Default follows the account setting.'),
     }),
-    output: strictOutput({ ...baseOut, uid: z.number(), smtp: z.record(z.string(), z.unknown()) }),
+    output: strictOutput({
+      ...baseOut,
+      uid: z.number(),
+      smtp: z.record(z.string(), z.unknown()),
+      sentAppend: z.record(z.string(), z.unknown()).nullable(),
+      identity: z
+        .object({ id: z.string().nullable(), email: z.string(), name: z.string().optional() })
+        .strict(),
+      identityReason: z.enum(['explicit', 'single-match', 'default-no-match', 'default-ambiguous']),
+    }),
     annotations: {
       readOnlyHint: false,
       destructiveHint: false,
@@ -1482,6 +1652,198 @@ export const TOOLS: ToolDefinition[] = [
     examples: ['{"mailbox":"INBOX","timeoutMs":15000}'],
     async run(args, service) {
       return service.waitForChanges(args as never);
+    },
+  }),
+  define({
+    name: 'mail_get_thread',
+    title: 'Get a conversation',
+    description:
+      'Return one conversation, earlier and later messages, across folders. Pass mailbox and uid, or a messageId. Default folders are the seed mailbox plus Sent, Archive, and All. Junk and Trash are off unless you name them. Messages are linked by Message-ID, In-Reply-To, and References. Gmail X-GM-THRID is used when X-GM-EXT-1 is present, otherwise OBJECTID THREADID. Each item says how it was linked: header, gmail-thrid, objectid, or subject. subject is opt-in via subjectHeuristic. Copies that share a Message-ID collapse; messages with no Message-ID stay separate. alsoIn lists the other folders. The page is a snapshot: mail that arrives later needs a new call without a cursor. includeBodies caps the page at 20. Identities are listed by mail_list_accounts.',
+    input: z.object({
+      account: fields.account,
+      mailbox: fields.mailbox.optional().describe('Required with uid.'),
+      uid: fields.uid.optional(),
+      uidValidity: fields.uidValidity,
+      messageId: z.string().optional().describe('Find the seed by Message-ID instead of uid.'),
+      folders: fields.folders,
+      includeBodies: z.boolean().optional().describe('Include capped plain text. Default false. Page size max 20.'),
+      onlyUnread: z.boolean().optional().describe('Keep only messages without \\Seen.'),
+      subjectHeuristic: z
+        .boolean()
+        .optional()
+        .describe('Also link messages that share a normalized subject and a participant. Default false. Those items are linked "subject".'),
+      maxMessages: z.number().int().positive().max(500).optional().describe('Stop after this many messages. Default 100, max 500.'),
+      maxRounds: z.number().int().positive().max(8).optional().describe('Header-search rounds. Default 4, max 8.'),
+    }),
+    output: strictOutput({
+      ...baseOut,
+      threadKey: z.string(),
+      tree: z.array(z.record(z.string(), z.unknown())),
+      rounds: z.number(),
+      messages: z.array(z.record(z.string(), z.unknown())),
+      offset: z.number(),
+    }),
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+    kind: 'read',
+    paged: true,
+    examples: ['{"mailbox":"INBOX","uid":41}'],
+    async run(args, service) {
+      return service.getThread(args as never);
+    },
+  }),
+  define({
+    name: 'mail_count',
+    title: 'Count messages per folder',
+    description:
+      'STATUS counts for each folder in the scope: messages, unseen, recent, uidNext, and uidValidity. When search is set, matches is the SEARCH count for that folder. The folder list is paged. Counts are exact for the folders on this page. A new call without a cursor sees folders created after the snapshot.',
+    input: z.object({
+      account: fields.account,
+      mailbox: fields.mailbox.optional(),
+      folders: fields.folders,
+      search: fields.search.optional(),
+    }),
+    output: strictOutput({ ...baseOut, offset: z.number() }),
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+    kind: 'read',
+    paged: true,
+    examples: ['{"folders":"all"}'],
+    async run(args, service) {
+      return service.countMessages(args as never);
+    },
+  }),
+  define({
+    name: 'mail_list_attachments',
+    title: 'List attachment metadata',
+    description:
+      'Page attachment metadata across a folder scope: filename, contentType, size, and partId. No bytes. Messages past the per-folder cap are omitted and truncated is true. Use mail_download_attachment for the bytes of one part.',
+    input: z.object({
+      account: fields.account,
+      mailbox: fields.mailbox.optional(),
+      folders: fields.folders,
+      search: fields.search.optional(),
+      maxPerFolder: fields.maxPerFolder,
+    }),
+    output: strictOutput({ ...baseOut, offset: z.number() }),
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+    kind: 'read',
+    paged: true,
+    examples: ['{"mailbox":"INBOX","search":{"larger":100000}}'],
+    async run(args, service) {
+      return service.listAttachments(args as never);
+    },
+  }),
+  define({
+    name: 'mail_list_correspondents',
+    title: 'List correspondents',
+    description:
+      'Count exact normalized From addresses over a folder scope and optional search. Own identities are excluded. Ties break by address. scanned is how many messages were read. truncated is true when a folder hit its cap, and then the counts cover only the scanned subset. Discover identities with mail_list_accounts.',
+    input: z.object({
+      account: fields.account,
+      mailbox: fields.mailbox.optional(),
+      folders: fields.folders,
+      search: fields.search.optional(),
+      maxPerFolder: fields.maxPerFolder,
+    }),
+    output: strictOutput({ ...baseOut, offset: z.number(), scanned: z.number() }),
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+    kind: 'read',
+    paged: true,
+    examples: ['{"folders":"all","search":{"since":"2026-01-01"}}'],
+    async run(args, service) {
+      return service.listCorrespondents(args as never);
+    },
+  }),
+  define({
+    name: 'mail_search_facets',
+    title: 'Count a search',
+    description:
+      'Exact counts for a folder scope and optional search: matches, unread, flagged, and answered per folder, plus a has-attachments count and the top sender addresses and domains. top defaults to 10 and maxes at 100. Ties break alphabetically. Flag counts come from SEARCH and stay exact. Sender and attachment counts cover the scanned subset when a folder is truncated. This tool does not page.',
+    input: z.object({
+      account: fields.account,
+      mailbox: fields.mailbox.optional(),
+      folders: fields.folders,
+      search: fields.search.optional(),
+      maxPerFolder: fields.maxPerFolder,
+      top: z.number().int().positive().max(100).optional().describe('Sender and domain rows. Default 10, max 100.'),
+    }),
+    output: strictOutput({
+      ...baseOut,
+      folders: z.array(z.record(z.string(), z.unknown())),
+      hasAttachments: z.number(),
+      senders: z.array(z.object({ value: z.string(), count: z.number() }).strict()),
+      domains: z.array(z.object({ value: z.string(), count: z.number() }).strict()),
+      scanned: z.number(),
+      truncated: z.boolean(),
+      top: z.number(),
+    }),
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+    kind: 'read',
+    examples: ['{"folders":"all","search":{"unkeyword":"$Junk"},"top":10}'],
+    async run(args, service) {
+      return service.searchFacets(args as never);
+    },
+  }),
+  define({
+    name: 'mail_modify_by_search',
+    title: 'Modify messages that match a search',
+    description:
+      'Apply addFlags, removeFlags, move, or archive to every message in a folder scope that matches search. dryRun defaults to true and only pages a preview. A real run is refused with SIZE_LIMIT when the match count exceeds limits.maxBulk. move and archive require allowDelete. Adding or removing \\Deleted does too. There is no permanent delete here. The preview uses the shared snapshot cursor.',
+    input: z.object({
+      account: fields.account,
+      mailbox: fields.mailbox.optional(),
+      folders: fields.folders,
+      search: fields.search,
+      action: z
+        .enum(['addFlags', 'removeFlags', 'move', 'archive'])
+        .describe('addFlags and removeFlags use flags. move uses destination. archive moves to the Archive mailbox.'),
+      flags: z.array(z.string()).optional().describe('Flags for addFlags or removeFlags.'),
+      destination: z.string().optional().describe('Target mailbox for move. Archive uses this or the resolved Archive mailbox.'),
+      dryRun: z.boolean().optional().describe('Default true. false applies the action.'),
+      maxPerFolder: fields.maxPerFolder,
+    }),
+    output: strictOutput({
+      ...baseOut,
+      dryRun: z.boolean(),
+      action: z.string(),
+      matched: z.number(),
+      offset: z.number(),
+    }),
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
+    kind: 'read',
+    paged: true,
+    examples: ['{"mailbox":"INBOX","search":{"seen":true},"action":"archive","dryRun":true}'],
+    async run(args, service) {
+      return service.modifyBySearch(args as never);
     },
   }),
 ];

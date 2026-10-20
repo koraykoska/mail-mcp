@@ -3,27 +3,58 @@ import path from 'node:path';
 import { MailError } from '../errors.js';
 import { confineToRoot, readBoundedFile } from '../fs-sandbox.js';
 import { redactText } from '../redact.js';
-import type { AppConfig, Identity, ResolvedAccount } from '../config/schema.js';
+import type { AppConfig, ResolvedAccount } from '../config/schema.js';
 import { requireAccount } from '../config/load.js';
 import type { Logger } from '../log.js';
 import { SlidingWindowLimiter } from '../rate-limit.js';
 import { assertMutation, assertRecipients } from '../safety.js';
-import {
-  decodeCursor,
-  encodeCursor,
-  clampLimit,
-  pageAfterUid,
-  pageAnchored,
-} from '../pagination.js';
 import type { ImapPool } from '../imap/pool.js';
 import { assertSearchCapabilities, compileSearch, type SearchCriteria } from '../imap/search.js';
+import type { SortKey } from '../imap/sort.js';
 import {
-  anchorOf,
-  isStrictlyAfter,
-  sortMessages,
-  type SortKey,
-  type SortableMessage,
-} from '../imap/sort.js';
+  cursorLimit,
+  folderPayload,
+  listHeaders,
+  pageKeyList,
+  pageLimit,
+  pageServerUids,
+  pageSummaryRows,
+  readPageCursor,
+  resolveOrder,
+  rowFromSummary,
+  rowsFromScans,
+  scanFolders,
+  scopeFor,
+  snapshotOf,
+  type PageRequest,
+  type SummaryRow,
+} from './browse.js';
+import { parseFolderRequest, resolveFolderPaths, defaultThreadFolders, type ListedFolder } from '../folders.js';
+import { selectIdentity, type IdentityChoice } from '../identities.js';
+import {
+  applySubjectHeuristic,
+  buildTree,
+  chronological,
+  closeByHeaders,
+  dedupeMessages,
+  normalizeMessageId,
+  threadKeyFor,
+  type ConversationMessage,
+  type LinkKind,
+} from '../thread/walk.js';
+import {
+  assertCursorFits,
+  DEFAULT_THREAD_MESSAGES,
+  DEFAULT_THREAD_ROUNDS,
+  DEFAULT_TOP_N,
+  encodeSnapshotCursor,
+  MAX_THREAD_MESSAGES,
+  pageKeys,
+  MAX_THREAD_ROUNDS,
+  MAX_TOP_N,
+  type PageOrder,
+} from '../page/snapshot.js';
+import { dialTarget } from '../net/connect.js';
 import { resolveSpecialUse, type ResolvedSpecialUse } from '../imap/special-use.js';
 import { normalizeFlags, touchesDeleted } from '../imap/flags.js';
 import type {
@@ -50,7 +81,7 @@ import { htmlToSafeText, quoteHtml, sanitizeHtml, textToHtml } from '../mime/htm
 import { hasHighOctets, stripBcc } from '../mime/transfer.js';
 import { headerValue, messageIds } from '../mime/headers.js';
 import { buildReferences, forwardSubject, replySubject } from '../mime/subject.js';
-import { flattenThread, threadMessages, type ThreadNode } from '../mime/thread.js';
+import { flattenThread, normalizedSubject, threadMessages, type ThreadNode } from '../mime/thread.js';
 import { ownAddressesOf, planReply, planReplyAll, quotePlain } from '../mime/reply.js';
 import type { SmtpSender } from '../smtp/client.js';
 import { withTimeout } from '../timeout.js';
@@ -171,11 +202,41 @@ export class MailService {
   async listMailboxes(
     accountId: string | undefined,
     subscribedOnly = false,
+    page?: PageRequest,
   ): Promise<Record<string, unknown>> {
     const account = this.account(accountId);
     return this.withImap(account, async (session) => {
-      const mailboxes = await session.listMailboxes({ subscribedOnly });
-      return { ok: true as const, account: account.id, mailboxes: mailboxes.map(publicMailbox) };
+      const mailboxes = (await session.listMailboxes({ subscribedOnly })).map(publicMailbox);
+      const cursor = readPageCursor(page?.cursor);
+      const { order } = resolveOrder({ order: page?.order });
+      const limit = pageLimit(
+        cursorLimit(cursor, page?.limit, account.limits.pageSize),
+        account.limits.pageSize,
+        account.limits.maxPageSize,
+        false,
+      );
+      const keys = mailboxes.map((item) => String(item.path));
+      const paged = pageKeyList(keys, {
+        limit,
+        order,
+        ...(cursor ? { cursor } : {}),
+        scope: `mailboxes:${subscribedOnly ? 'sub' : 'all'}`,
+        sort: [{ field: 'arrival', reverse: order === 'newest-first' }],
+      });
+      const byPath = new Map(mailboxes.map((item) => [String(item.path), item]));
+      const items = paged.keys.map((key) => byPath.get(key)).filter((item) => item !== undefined);
+      return {
+        ok: true as const,
+        account: account.id,
+        mailboxes: items,
+        items,
+        nextCursor: paged.nextCursor,
+        total: paged.total,
+        offset: paged.offset,
+        truncated: false,
+        order,
+        snapshot: { folders: [], keys: cursor?.keys ?? [...keys].sort() },
+      };
     });
   }
 
@@ -569,67 +630,99 @@ export class MailService {
   ): Promise<Record<string, unknown>> {
     const account = this.account(input.account);
     const algorithm = input.algorithm ?? 'REFERENCES';
-    return this.withMailbox(account, input.mailbox ?? 'INBOX', 'read', async (box, session) => {
-      this.assertUid(box, input.uidValidity);
+    const cursor = readPageCursor(input.cursor);
+    const { order } = resolveOrder({ order: input.order });
+    const limit = pageLimit(
+      cursorLimit(cursor, input.limit, account.limits.pageSize),
+      account.limits.pageSize,
+      account.limits.maxPageSize,
+      false,
+    );
+    return this.withImap(account, async (session) => {
+      const paths = await this.folderPaths(account, session, input);
+      const mailbox = paths[0] ?? input.mailbox ?? 'INBOX';
+      const maxPerFolder = this.perFolderCap(input.maxPerFolder, account.limits.maxSortCandidates);
       const compiled = compileSearch(input.search);
       assertSearchCapabilities(compiled.requires, (name) => session.hasCapability(name));
-      let threads: ThreadNode[] | null = null;
+      const scope = scopeFor(paths, input.search, maxPerFolder, `threads:${algorithm}`);
+      const { scans } = await scanFolders(session, paths, {
+        compiled,
+        keys: [{ field: 'arrival', reverse: order !== 'oldest-first' }],
+        order,
+        ...(cursor ? { cursor } : {}),
+        maxPerFolder,
+        ...(paths.length === 1 && input.uidValidity ? { singleUidValidity: input.uidValidity } : {}),
+        materialize: true,
+      });
+      const folders = folderPayload(scans);
       let source: 'server' | 'client' = 'client';
-      let omitted = 0;
-      if (session.hasCapability('THREAD') || session.hasCapability(`THREAD=${algorithm}`)) {
-        threads = await box.serverThread(algorithm, compiled);
-        if (threads) {
+      if (paths.length === 1 && (session.hasCapability('THREAD') || session.hasCapability(`THREAD=${algorithm}`))) {
+        const serverThreads = await session.withMailbox(mailbox, 'read', (box) =>
+          box.serverThread(algorithm, compiled),
+        );
+        if (serverThreads) {
           source = 'server';
         }
       }
-      if (!threads) {
-        const uids = await box.search(compiled);
-        omitted = Math.max(0, uids.length - account.limits.maxSortCandidates);
-        const limited = uids.slice(0, account.limits.maxSortCandidates);
-        const summaries = await box.fetchSummaries(limited, { snippet: false, snippetChars: 0 });
-        const withRefs = await this.attachReferences(box, summaries);
-        threads = threadMessages(
-          withRefs.map((item) => ({
-            uid: item.uid,
-            messageId: item.messageId,
-            inReplyTo: item.inReplyTo,
-            references: item.references,
-            subject: item.subject,
-          })),
-          algorithm === 'ORDEREDSUBJECT',
-        );
-      }
-      const flat = flattenThread(threads);
-      const limit = clampLimit(input.limit, account.limits.pageSize, account.limits.maxPageSize);
-      const cursor = input.cursor ? decodeCursor(input.cursor, box.uidValidity) : undefined;
-      const page =
-        cursor?.v === 2
-          ? pageAfterUid(flat, limit, cursor.afterUid, box.uidValidity)
-          : pageAnchored(
-              flat,
-              limit,
-              {
-                position: cursor?.v === 3 ? (cursor.position ?? 0) : 0,
-                ...(cursor?.v === 3 && cursor.afterUid !== undefined
-                  ? { afterUid: cursor.afterUid }
-                  : {}),
-              },
-              box.uidValidity,
-            );
-      const pageSet = new Set(page.uids);
+      const summaries = scans.flatMap((scan) =>
+        scan.summaries.map((summary) => ({ summary, mailbox: scan.mailbox, uidValidity: scan.uidValidity })),
+      );
+      const threads = threadMessages(
+        summaries.map((item) => ({
+          uid: item.summary.uid,
+          messageId: item.summary.messageId,
+          inReplyTo: item.summary.inReplyTo,
+          references: item.summary.references,
+          subject: item.summary.subject,
+        })),
+        algorithm === 'ORDEREDSUBJECT',
+      );
+      const byUid = new Map(summaries.map((item) => [`${item.mailbox}\0${item.summary.uid}`, item]));
+      const link: LinkKind = algorithm === 'ORDEREDSUBJECT' ? 'subject' : 'header';
+      const roots = threads
+        .map((node) => threadSummary(node, mailbox, byUid, link))
+        .filter((item): item is NonNullable<ReturnType<typeof threadSummary>> => item !== undefined);
+      const page = pageSummaryRows(roots, {
+        limit,
+        keys: [{ field: 'date', reverse: order !== 'oldest-first' }],
+        order,
+        ...(cursor ? { cursor } : {}),
+        scope,
+        folders,
+      });
+      const pageUids = new Set(page.items.map((item) => item.uid));
+      const omitted = scans.reduce((sum, scan) => sum + scan.omitted, 0);
+      const items = page.items.map((item) => {
+        const row = item as NonNullable<ReturnType<typeof threadSummary>>;
+        return {
+          threadKey: row.threadKey,
+          messageCount: row.messageCount,
+          participants: row.participants,
+          lastDate: row.date ?? row.arrival ?? null,
+          unreadCount: row.unreadCount,
+          mailbox: item.mailbox,
+          uid: item.uid,
+          uidValidity: item.uidValidity,
+          linked: link,
+        };
+      });
       return {
         ok: true as const,
         account: account.id,
-        mailbox: input.mailbox ?? 'INBOX',
-        uidValidity: box.uidValidity,
+        mailbox,
+        uidValidity: folders[0]?.uidValidity ?? '',
         algorithm,
         source,
-        total: flat.length,
+        total: page.total,
+        offset: page.offset,
         omitted,
-        truncated: omitted > 0,
-        threads: pruneThreads(threads, pageSet),
-        uids: page.uids,
+        truncated: scans.some((scan) => scan.truncated),
+        threads: pruneThreads(threads, pageUids),
+        uids: page.items.map((item) => item.uid),
+        items,
         nextCursor: page.nextCursor,
+        order,
+        snapshot: snapshotOf(scans),
       };
     });
   }
@@ -766,7 +859,7 @@ export class MailService {
     assertMutation(account, 'message-write');
     const raw = input.rawBase64
       ? Buffer.from(input.rawBase64, 'base64')
-      : await buildRawMessage(await this.outboundFromParts(account, input));
+      : await buildRawMessage((await this.outboundFromParts(account, input)).message);
     if (raw.length > account.limits.maxMessageBytes) {
       throw new MailError('SIZE_LIMIT', `Message is ${raw.length} bytes, over maxMessageBytes.`);
     }
@@ -910,12 +1003,10 @@ export class MailService {
         'Set draftsMailbox or create a Drafts folder.',
       );
     }
-    const raw = await buildRawMessage(
-      await this.outboundFromParts(account, { ...input, allowEmptyRecipients: true }),
-      {
-        keepBcc: true,
-      },
-    );
+    const built = await this.outboundFromParts(account, { ...input, allowEmptyRecipients: true });
+    const raw = await buildRawMessage(built.message, {
+      keepBcc: true,
+    });
     const appended = await this.withImap(account, (session) =>
       session.append(drafts, raw, ['\\Draft']),
     );
@@ -945,6 +1036,7 @@ export class MailService {
       mailbox: drafts,
       ...appended,
       replacedUid: replaceUid ?? null,
+      ...publicIdentity(built.identity),
     };
   }
 
@@ -977,7 +1069,12 @@ export class MailService {
     if (!account.smtp) {
       throw new MailError('CONFIG_ERROR', `Account "${account.id}" has no SMTP server configured.`);
     }
-    const message = await this.outboundFromParts(account, input);
+    const built = await this.outboundFromParts(account, input);
+    const identity = input.identityChoice ?? built.identity;
+    const message = built.message;
+    if (input.identityChoice) {
+      message.from = input.identityChoice.address;
+    }
     const envelopeTo = (input.envelopeTo ?? envelopeRecipients(message)).map((address) =>
       parseAddress(address),
     );
@@ -1018,6 +1115,7 @@ export class MailService {
         bytes: raw.length,
         smtp: result,
         sentAppend: appended,
+        ...publicIdentity(identity),
       };
     } finally {
       sender.close();
@@ -1050,8 +1148,20 @@ export class MailService {
       ? quoteHtml(loaded.parsed.html, label, when)
       : quoteHtml(textToHtml(loaded.parsed.text || ''), label, when);
     const html = input.html ? `${input.html}${originalHtml}` : originalHtml;
+    const identity = selectIdentity({
+      identities: account.identities,
+      accountEmail: account.email,
+      allowFromDomains: account.allowFromDomains,
+      ...(input.from ? { requested: input.from } : {}),
+      ...(!input.from
+        ? { recipients: [...original.to, ...original.cc].map((item) => item.address) }
+        : {}),
+    });
     const sent = await this.send({
       account: account.id,
+      from: identity.address,
+      identityChoice: identity,
+      ...(input.replyTo ? { replyTo: input.replyTo } : {}),
       to,
       cc,
       subject: input.subject ?? replySubject(loaded.parsed.subject),
@@ -1112,8 +1222,24 @@ export class MailService {
         });
       }
     }
+    const original = {
+      to: asMail(loaded.parsed.to),
+      cc: asMail(loaded.parsed.cc),
+    };
+    const identity = selectIdentity({
+      identities: account.identities,
+      accountEmail: account.email,
+      allowFromDomains: account.allowFromDomains,
+      ...(input.from ? { requested: input.from } : {}),
+      ...(!input.from
+        ? { recipients: [...original.to, ...original.cc].map((item) => item.address) }
+        : {}),
+    });
     const sent = await this.send({
       account: account.id,
+      from: identity.address,
+      identityChoice: identity,
+      ...(input.replyTo ? { replyTo: input.replyTo } : {}),
       to: input.to,
       cc: input.cc,
       subject: input.subject ?? forwardSubject(loaded.parsed.subject),
@@ -1133,7 +1259,13 @@ export class MailService {
     return sent;
   }
 
-  async sendDraft(input: UidInput & { appendSent?: boolean }): Promise<Record<string, unknown>> {
+  async sendDraft(
+    input: UidInput & {
+      appendSent?: boolean;
+      from?: string | MailAddress;
+      replyTo?: Array<string | MailAddress>;
+    },
+  ): Promise<Record<string, unknown>> {
     const account = this.account(input.account);
     assertMutation(account, 'send');
     const source = await this.withMailbox(account, input.mailbox, 'read', async (box) => {
@@ -1155,15 +1287,43 @@ export class MailService {
     const parsed = await parseRawMessage(source);
     const recipients = [...asMail(parsed.to), ...asMail(parsed.cc), ...asMail(parsed.bcc)];
     assertRecipients(account, recipients);
-    const from = asMail(parsed.from)[0]?.address ?? account.email;
-    this.assertIdentity(account, from);
+    const draftedFrom = asMail(parsed.from)[0]?.address ?? account.email;
+    const identity = selectIdentity({
+      identities: account.identities,
+      accountEmail: account.email,
+      allowFromDomains: account.allowFromDomains,
+      requested: input.from ?? draftedFrom,
+    });
+    const from = identity.address.address;
     if (account.sendRateLimit) {
       this.limiter.consume(account.id, account.sendRateLimit.max, account.sendRateLimit.windowMs);
     }
     if (!account.smtp) {
       throw new MailError('CONFIG_ERROR', `Account "${account.id}" has no SMTP server configured.`);
     }
-    const wire = stripBcc(source);
+    let wire = stripBcc(source);
+    if (input.from || input.replyTo) {
+      const built = await this.outboundFromParts(account, {
+        from: identity.address,
+        to: asMail(parsed.to),
+        cc: asMail(parsed.cc),
+        bcc: asMail(parsed.bcc),
+        ...(input.replyTo ? { replyTo: input.replyTo } : {}),
+        subject: parsed.subject,
+        ...(parsed.text !== undefined ? { text: parsed.text } : {}),
+        ...(parsed.html !== undefined ? { html: parsed.html } : {}),
+        attachments: parsed.attachments
+          .filter((item) => item.content && !item.inline)
+          .map((item) => ({
+            ...(item.filename ? { filename: item.filename } : {}),
+            contentType: item.contentType,
+            contentBase64: item.content?.toString('base64') ?? '',
+          })),
+        ...(parsed.messageId ? { headers: { 'Message-ID': parsed.messageId } } : {}),
+      });
+      built.message.from = identity.address;
+      wire = stripBcc(await buildRawMessage(built.message));
+    }
     const sender = await this.smtpFactory(account);
     try {
       const result = await sender.send({
@@ -1181,6 +1341,7 @@ export class MailService {
         smtp: result,
         sentAppend: appended,
         uid: input.uid,
+        ...publicIdentity(identity),
       };
     } finally {
       sender.close();
@@ -1216,6 +1377,579 @@ export class MailService {
     );
   }
 
+  async getThread(input: {
+    account?: string;
+    mailbox?: string;
+    uid?: number;
+    uidValidity?: string;
+    messageId?: string;
+    folders?: unknown;
+    includeBodies?: boolean;
+    onlyUnread?: boolean;
+    subjectHeuristic?: boolean;
+    maxMessages?: number;
+    maxRounds?: number;
+    limit?: number;
+    cursor?: string;
+    order?: PageOrder;
+  }): Promise<Record<string, unknown>> {
+    const account = this.account(input.account);
+    if ((input.uid === undefined) === (input.messageId === undefined) && input.uid === undefined) {
+      throw new MailError('INVALID_ARGUMENT', 'Pass mailbox and uid, or a messageId.');
+    }
+    if (input.uid !== undefined && !input.mailbox) {
+      throw new MailError('INVALID_ARGUMENT', 'mailbox is required with uid.');
+    }
+    const maxMessages = bounded(input.maxMessages, DEFAULT_THREAD_MESSAGES, MAX_THREAD_MESSAGES);
+    const maxRounds = bounded(input.maxRounds, DEFAULT_THREAD_ROUNDS, MAX_THREAD_ROUNDS);
+    const cursor = readPageCursor(input.cursor);
+    const { order } = resolveOrder({ ...(input.order ? { order: input.order } : {}) });
+    const limit = pageLimit(
+      cursorLimit(cursor, input.limit, account.limits.pageSize),
+      account.limits.pageSize,
+      account.limits.maxPageSize,
+      input.includeBodies === true,
+    );
+    return this.withImap(account, async (session) => {
+      const special = await this.special(account, session);
+      const seed = await this.seedMessage(session, input);
+      const paths =
+        input.folders !== undefined
+          ? await this.folderPaths(account, session, { folders: input.folders, mailbox: seed.mailbox })
+          : defaultThreadFolders(seed.mailbox, special);
+      let messages: ConversationMessage[];
+      let rounds = 0;
+      let truncated: boolean;
+      const fast = await this.fastThread(session, paths, seed, maxMessages);
+      if (fast) {
+        messages = fast.messages;
+        truncated = fast.truncated;
+      } else {
+        const closed = await closeByHeaders({
+          seed,
+          folders: paths,
+          maxMessages,
+          maxRounds,
+          search: (folder, ids) => this.searchHeaderIds(session, folder, ids),
+        });
+        messages = closed.messages;
+        rounds = closed.rounds;
+        truncated = closed.truncated;
+      }
+      if (input.subjectHeuristic) {
+        const candidates = await this.subjectCandidates(session, paths, seed);
+        const applied = applySubjectHeuristic(messages, candidates, maxMessages);
+        messages = applied.messages;
+        truncated = truncated || applied.truncated;
+      }
+      const prefer = [input.mailbox ?? seed.mailbox, 'INBOX', special.sent ?? '', special.archive ?? ''];
+      messages = dedupeMessages(messages, prefer);
+      if (input.onlyUnread) {
+        messages = messages.filter((item) => !item.flags.includes('\\Seen'));
+      }
+      const ordered = chronological(messages, order !== 'oldest-first');
+      const rows: SummaryRow[] = ordered.map((item) => ({
+        mailbox: item.mailbox,
+        uid: item.uid,
+        uidValidity: item.uidValidity,
+        date: item.date,
+        arrival: item.internalDate,
+        subject: item.subject,
+        from: item.from[0]?.address,
+        to: item.to[0]?.address,
+        cc: item.cc[0]?.address,
+        summary: {
+          uid: item.uid,
+          flags: item.flags,
+          date: item.date,
+          internalDate: item.internalDate,
+          subject: item.subject,
+          messageId: item.messageId,
+          inReplyTo: item.inReplyTo,
+          references: item.references,
+          from: item.from,
+          to: item.to,
+          cc: item.cc,
+          replyTo: [],
+          hasAttachments: item.hasAttachments,
+          snippet: item.snippet,
+          threadId: item.threadId,
+        },
+      }));
+      const folders = paths.map((mailbox) => ({
+        mailbox,
+        uidValidity: rows.find((row) => row.mailbox === mailbox)?.uidValidity ?? seed.uidValidity,
+        upperUid: 0,
+        matched: rows.filter((row) => row.mailbox === mailbox).length,
+        scanned: rows.filter((row) => row.mailbox === mailbox).length,
+        omitted: 0,
+        truncated: false,
+      }));
+      const scope = scopeFor(paths, undefined, maxMessages, `thread:${normalizeMessageId(seed.messageId) || seed.uid}`);
+      const page = pageSummaryRows(rows, {
+        limit,
+        keys: [{ field: 'date', reverse: order !== 'oldest-first' }],
+        order,
+        ...(cursor ? { cursor } : {}),
+        scope,
+        folders,
+      });
+      const items = [];
+      for (const row of page.items) {
+        const source = ordered.find((item) => item.mailbox === row.mailbox && item.uid === row.uid);
+        let text: string | null = null;
+        let textTruncated = false;
+        if (input.includeBodies && source) {
+          const body = await session.withMailbox(row.mailbox, 'read', async (box) => {
+            const raw = await box.fetchSource(row.uid, account.limits.maxMessageBytes);
+            return raw ? parseRawMessage(raw) : null;
+          });
+          if (body) {
+            const capped = capText(body.text, account.limits.maxBodyChars);
+            text = capped.text ?? null;
+            textTruncated = capped.truncated;
+          }
+        }
+        items.push({
+          mailbox: row.mailbox,
+          uid: row.uid,
+          uidValidity: row.uidValidity,
+          messageId: source?.messageId ?? null,
+          from: source?.from ?? [],
+          to: source?.to ?? [],
+          cc: source?.cc ?? [],
+          date: source?.date ?? source?.internalDate ?? null,
+          subject: source?.subject ?? null,
+          flags: source?.flags ?? [],
+          snippet: source?.snippet ?? null,
+          hasAttachments: source?.hasAttachments ?? false,
+          linked: source?.linked ?? 'header',
+          alsoIn: source?.alsoIn ?? [],
+          threadKey: threadKeyFor(seed),
+          ...(input.includeBodies ? { text, textTruncated } : {}),
+        });
+      }
+      const root = ordered[0] ?? seed;
+      return {
+        ok: true as const,
+        account: account.id,
+        threadKey: threadKeyFor(root.messageId ? root : seed),
+        tree: buildTree(ordered),
+        rounds,
+        items,
+        messages: items,
+        nextCursor: page.nextCursor,
+        total: page.total,
+        offset: page.offset,
+        truncated: truncated || folders.some((folder) => folder.truncated),
+        order,
+        snapshot: { folders },
+      };
+    });
+  }
+
+  async countMessages(input: ListInput): Promise<Record<string, unknown>> {
+    const account = this.account(input.account);
+    const cursor = readPageCursor(input.cursor);
+    const { order } = resolveOrder({ ...(input.order ? { order: input.order } : {}) });
+    const limit = pageLimit(
+      cursorLimit(cursor, input.limit, account.limits.pageSize),
+      account.limits.pageSize,
+      account.limits.maxPageSize,
+      false,
+    );
+    return this.withImap(account, async (session) => {
+      const paths = await this.folderPaths(account, session, input);
+      const scope = scopeFor(paths, input.search, 0, 'count');
+      const paged = pageKeyList(paths, {
+        limit,
+        order,
+        ...(cursor ? { cursor } : {}),
+        scope,
+        sort: [{ field: 'arrival', reverse: order === 'newest-first' }],
+      });
+      const compiled = input.search ? compileSearch(input.search) : undefined;
+      if (compiled) {
+        assertSearchCapabilities(compiled.requires, (name) => session.hasCapability(name));
+      }
+      const items = [];
+      for (const mailbox of paged.keys) {
+        const status = await session.status(mailbox);
+        let matches: number | null = null;
+        if (compiled) {
+          matches = await session.withMailbox(mailbox, 'read', async (box) => (await box.search(compiled)).length);
+        }
+        items.push({
+          mailbox,
+          messages: status.messages ?? null,
+          unseen: status.unseen ?? null,
+          recent: status.recent ?? null,
+          uidNext: status.uidNext ?? null,
+          uidValidity: status.uidValidity ?? null,
+          matches,
+        });
+      }
+      return {
+        ok: true as const,
+        account: account.id,
+        items,
+        nextCursor: paged.nextCursor,
+        total: paged.total,
+        offset: paged.offset,
+        truncated: false,
+        order,
+        snapshot: { folders: [], keys: cursor?.keys ?? [...paths].sort() },
+      };
+    });
+  }
+
+  async listAttachments(input: ListInput): Promise<Record<string, unknown>> {
+    const account = this.account(input.account);
+    const cursor = readPageCursor(input.cursor);
+    const { order } = resolveOrder({ ...(input.sort ? { sort: input.sort } : {}), ...(input.order ? { order: input.order } : {}) });
+    const limit = pageLimit(
+      cursorLimit(cursor, input.limit, account.limits.pageSize),
+      account.limits.pageSize,
+      account.limits.maxPageSize,
+      false,
+    );
+    const maxPerFolder = this.perFolderCap(input.maxPerFolder, account.limits.maxSortCandidates);
+    return this.withImap(account, async (session) => {
+      const paths = await this.folderPaths(account, session, input);
+      const compiled = compileSearch(input.search);
+      assertSearchCapabilities(compiled.requires, (name) => session.hasCapability(name));
+      const scope = scopeFor(paths, input.search, maxPerFolder, 'attachments');
+      const { scans } = await scanFolders(session, paths, {
+        compiled,
+        keys: [{ field: 'arrival', reverse: order !== 'oldest-first' }],
+        order,
+        maxPerFolder,
+        materialize: true,
+      });
+      const attachments: SummaryRow[] = [];
+      for (const scan of scans) {
+        for (const summary of scan.summaries) {
+          if (!summary.hasAttachments) {
+            continue;
+          }
+          const structure = await session.withMailbox(scan.mailbox, 'read', (box) => box.fetchStructure(summary.uid));
+          for (const part of flattenParts(structure)) {
+            attachments.push({
+              ...rowFromSummary(scan, summary),
+              uid: summary.uid,
+              subject: part.filename ?? summary.subject,
+              summary,
+              partId: part.partId,
+              filename: part.filename ?? null,
+              contentType: part.contentType,
+              partSize: part.contentType ? (summary.size ?? 0) : 0,
+            } as SummaryRow);
+          }
+        }
+      }
+      const page = pageSummaryRows(attachments, {
+        limit,
+        keys: [{ field: 'date', reverse: order !== 'oldest-first' }],
+        order,
+        ...(cursor ? { cursor } : {}),
+        scope,
+        folders: folderPayload(scans),
+      });
+      const items = page.items.map((row) => {
+        const extra = row as SummaryRow & { partId?: string; filename?: string | null; contentType?: string };
+        return {
+          mailbox: row.mailbox,
+          uid: row.uid,
+          uidValidity: row.uidValidity,
+          partId: extra.partId ?? '1',
+          filename: extra.filename ?? null,
+          contentType: extra.contentType ?? 'application/octet-stream',
+          size: row.summary.size ?? null,
+          subject: row.summary.subject ?? null,
+          date: row.date ?? row.arrival ?? null,
+        };
+      });
+      return {
+        ok: true as const,
+        account: account.id,
+        items,
+        nextCursor: page.nextCursor,
+        total: page.total,
+        offset: page.offset,
+        truncated: scans.some((scan) => scan.truncated),
+        order,
+        snapshot: snapshotOf(scans),
+      };
+    });
+  }
+
+  async listCorrespondents(input: ListInput & { top?: number }): Promise<Record<string, unknown>> {
+    const account = this.account(input.account);
+    const cursor = readPageCursor(input.cursor);
+    const { order } = resolveOrder({ ...(input.order ? { order: input.order } : {}) });
+    const limit = pageLimit(
+      cursorLimit(cursor, input.limit, account.limits.pageSize),
+      account.limits.pageSize,
+      account.limits.maxPageSize,
+      false,
+    );
+    const maxPerFolder = this.perFolderCap(input.maxPerFolder, account.limits.maxSortCandidates);
+    return this.withImap(account, async (session) => {
+      const paths = await this.folderPaths(account, session, input);
+      const compiled = compileSearch(input.search);
+      assertSearchCapabilities(compiled.requires, (name) => session.hasCapability(name));
+      const { scans } = await scanFolders(session, paths, {
+        compiled,
+        keys: [{ field: 'arrival', reverse: true }],
+        order: 'newest-first',
+        maxPerFolder,
+        materialize: true,
+      });
+      const own = new Set(ownAddressesOf(account.email, account.identities, account.user).map((item) => item.toLowerCase()));
+      const counts = new Map<string, number>();
+      let scanned = 0;
+      for (const scan of scans) {
+        for (const summary of scan.summaries) {
+          scanned += 1;
+          for (const address of summary.from) {
+            const email = address.address?.trim().toLowerCase();
+            if (!email || own.has(email)) {
+              continue;
+            }
+            counts.set(email, (counts.get(email) ?? 0) + 1);
+          }
+        }
+      }
+      const ranked = [...counts.entries()].sort((left, right) => {
+        if (right[1] !== left[1]) {
+          return right[1] - left[1];
+        }
+        return left[0] < right[0] ? -1 : left[0] > right[0] ? 1 : 0;
+      });
+      const scope = scopeFor(paths, input.search, maxPerFolder, 'correspondents');
+      const keys = ranked.map((item) => item[0]);
+      const frozen = cursor?.keys ?? keys;
+      if (cursor) {
+        assertCursorFits(cursor, {
+          scope,
+          order,
+          sort: [{ field: 'arrival', reverse: order === 'newest-first' }],
+          cap: limit,
+          folders: folderPayload(scans).map((folder) => ({ mailbox: folder.mailbox, uidValidity: folder.uidValidity })),
+        });
+      }
+      const slice = pageKeys(frozen, limit, cursor?.anchorKey);
+      const byAddress = new Map(ranked);
+      const items = slice.keys.map((address) => ({ address, count: byAddress.get(address) ?? 0 }));
+      const last = slice.keys[slice.keys.length - 1];
+      const nextCursor =
+        last && slice.next
+          ? encodeSnapshotCursor({
+              v: 4,
+              order,
+              sort: [{ field: 'arrival', reverse: order === 'newest-first' }],
+              cap: limit,
+              scope,
+              folders: folderPayload(scans).map((folder) => ({
+                mailbox: folder.mailbox,
+                uidValidity: folder.uidValidity,
+                upperUid: folder.upperUid,
+              })),
+              keys: frozen,
+              anchorKey: last,
+            })
+          : null;
+      return {
+        ok: true as const,
+        account: account.id,
+        items,
+        nextCursor,
+        total: frozen.length,
+        offset: slice.offset,
+        truncated: scans.some((scan) => scan.truncated),
+        scanned,
+        order,
+        snapshot: snapshotOf(scans),
+      };
+    });
+  }
+
+  async searchFacets(input: ListInput & { top?: number }): Promise<Record<string, unknown>> {
+    const account = this.account(input.account);
+    const top = bounded(input.top, DEFAULT_TOP_N, MAX_TOP_N);
+    const maxPerFolder = this.perFolderCap(input.maxPerFolder, account.limits.maxSortCandidates);
+    return this.withImap(account, async (session) => {
+      const paths = await this.folderPaths(account, session, input);
+      const compiled = compileSearch(input.search);
+      assertSearchCapabilities(compiled.requires, (name) => session.hasCapability(name));
+      const folders = [];
+      const senders = new Map<string, number>();
+      const domains = new Map<string, number>();
+      let attachments = 0;
+      let scanned = 0;
+      let truncated = false;
+      for (const mailbox of paths) {
+        const row = await session.withMailbox(mailbox, 'read', async (box) => {
+          const matched = await box.search(compiled);
+          const unseen = await box.search(andFlag(compiled, 'seen', false));
+          const flagged = await box.search(andFlag(compiled, 'flagged', true));
+          const answered = await box.search(andFlag(compiled, 'answered', true));
+          let ids = matched;
+          let omitted = 0;
+          if (ids.length > maxPerFolder) {
+            ids = [...ids].sort((left, right) => left - right).slice(-maxPerFolder);
+            omitted = matched.length - ids.length;
+            truncated = true;
+          }
+          const summaries = await box.fetchSummaries(ids, { snippet: false, snippetChars: 0 });
+          scanned += summaries.length;
+          let folderAttachments = 0;
+          for (const summary of summaries) {
+            if (summary.hasAttachments) {
+              folderAttachments += 1;
+              attachments += 1;
+            }
+            const from = summary.from[0]?.address?.trim().toLowerCase();
+            if (from) {
+              senders.set(from, (senders.get(from) ?? 0) + 1);
+              const domain = from.split('@')[1];
+              if (domain) {
+                domains.set(domain, (domains.get(domain) ?? 0) + 1);
+              }
+            }
+          }
+          return {
+            mailbox,
+            uidValidity: box.uidValidity,
+            total: matched.length,
+            unread: unseen.length,
+            flagged: flagged.length,
+            answered: answered.length,
+            hasAttachments: folderAttachments,
+            scanned: summaries.length,
+            omitted,
+            truncated: omitted > 0,
+          };
+        });
+        folders.push(row);
+      }
+      return {
+        ok: true as const,
+        account: account.id,
+        folders,
+        hasAttachments: attachments,
+        senders: topCounts(senders, top),
+        domains: topCounts(domains, top),
+        scanned,
+        truncated,
+        top,
+      };
+    });
+  }
+
+  async modifyBySearch(
+    input: ListInput & {
+      action: 'addFlags' | 'removeFlags' | 'move' | 'archive';
+      flags?: string[];
+      destination?: string;
+      dryRun?: boolean;
+    },
+  ): Promise<Record<string, unknown>> {
+    const account = this.account(input.account);
+    const dryRun = input.dryRun !== false;
+    const cursor = readPageCursor(input.cursor);
+    const { keys, order } = resolveOrder({ ...(input.sort ? { sort: input.sort } : {}), ...(input.order ? { order: input.order } : {}) });
+    const limit = pageLimit(
+      cursorLimit(cursor, input.limit, account.limits.pageSize),
+      account.limits.pageSize,
+      account.limits.maxPageSize,
+      false,
+    );
+    const maxPerFolder = this.perFolderCap(input.maxPerFolder, account.limits.maxSortCandidates);
+    if (!dryRun) {
+      if (input.action === 'move' || input.action === 'archive') {
+        assertMutation(account, 'delete');
+      } else if (touchesDeleted(normalizeFlags(input.flags ?? []))) {
+        assertMutation(account, 'delete');
+      } else {
+        assertMutation(account, 'message-write');
+      }
+    }
+    return this.withImap(account, async (session) => {
+      const paths = await this.folderPaths(account, session, input);
+      const compiled = compileSearch(input.search);
+      assertSearchCapabilities(compiled.requires, (name) => session.hasCapability(name));
+      const scope = scopeFor(paths, input.search, maxPerFolder, `bulk:${input.action}`);
+      const { scans } = await scanFolders(session, paths, {
+        compiled,
+        keys,
+        order,
+        maxPerFolder,
+        materialize: true,
+      });
+      const matched = scans.reduce((sum, scan) => sum + scan.matched, 0);
+      if (!dryRun && matched > account.limits.maxBulk) {
+        throw new MailError(
+          'SIZE_LIMIT',
+          `The search matches ${matched} messages and the bulk maximum is ${account.limits.maxBulk}.`,
+          'Narrow the search or raise limits.maxBulk. A dry run can preview them.',
+        );
+      }
+      const rows = rowsFromScans(scans);
+      if (!dryRun) {
+        const destination =
+          input.action === 'archive'
+            ? input.destination ?? (await this.special(account, session)).archive
+            : input.destination;
+        if ((input.action === 'move' || input.action === 'archive') && !destination) {
+          throw new MailError('NOT_FOUND', 'No destination mailbox could be resolved.');
+        }
+        for (const scan of scans) {
+          const uids = scan.summaries.map((item) => item.uid);
+          if (uids.length === 0) {
+            continue;
+          }
+          await session.withMailbox(scan.mailbox, 'write', async (box) => {
+            if (input.action === 'addFlags' || input.action === 'removeFlags') {
+              await box.setFlags(uids, normalizeFlags(input.flags ?? []), input.action === 'addFlags' ? 'add' : 'remove');
+            } else if (destination) {
+              await box.move(uids, destination);
+            }
+          });
+        }
+      }
+      const page = pageSummaryRows(rows, {
+        limit,
+        keys,
+        order,
+        ...(cursor ? { cursor } : {}),
+        scope,
+        folders: folderPayload(scans),
+      });
+      const items = page.items.map((row) => ({
+        mailbox: row.mailbox,
+        uid: row.uid,
+        uidValidity: row.uidValidity,
+        subject: row.summary.subject ?? null,
+        date: row.date ?? row.arrival ?? null,
+      }));
+      return {
+        ok: true as const,
+        account: account.id,
+        dryRun,
+        action: input.action,
+        matched,
+        items,
+        nextCursor: dryRun ? page.nextCursor : null,
+        total: page.total,
+        offset: page.offset,
+        truncated: scans.some((scan) => scan.truncated),
+        order,
+        snapshot: snapshotOf(scans),
+      };
+    });
+  }
+
   async close(): Promise<void> {
     await this.pool.close();
   }
@@ -1225,171 +1959,419 @@ export class MailService {
     fromSearch: boolean,
   ): Promise<Record<string, unknown>> {
     const account = this.account(input.account);
-    const mailbox = input.mailbox ?? 'INBOX';
-    return this.withMailbox(account, mailbox, 'read', async (box, session) => {
-      this.assertUid(box, input.uidValidity);
+    const cursor = readPageCursor(input.cursor);
+    const { keys, order } = resolveOrder({ ...(input.sort ? { sort: input.sort } : {}), ...(input.order ? { order: input.order } : {}) });
+    const limit = pageLimit(
+      cursorLimit(cursor, input.limit, account.limits.pageSize),
+      account.limits.pageSize,
+      account.limits.maxPageSize,
+      false,
+    );
+    const maxPerFolder = this.perFolderCap(input.maxPerFolder, account.limits.maxSortCandidates);
+    return this.withImap(account, async (session) => {
+      const paths = await this.folderPaths(account, session, input);
       const compiled = compileSearch(input.search);
       assertSearchCapabilities(compiled.requires, (name) => session.hasCapability(name));
-      const matched = await box.search(compiled);
-      const keys = input.sort ?? [{ field: 'arrival', reverse: true }];
-      let sortSource: 'server' | 'client';
-      const limitForPage = clampLimit(
-        input.limit,
-        account.limits.pageSize,
-        account.limits.maxPageSize,
-      );
-      const decoded = input.cursor ? decodeCursor(input.cursor, box.uidValidity) : undefined;
-      const legacyAfterUid = decoded?.v === 2 ? decoded.afterUid : undefined;
-      const anchoredAfterUid = decoded?.v === 3 ? decoded.afterUid : undefined;
-      const startIndex = decoded?.v === 3 ? (decoded.position ?? 0) : 0;
-      const anchor = decoded?.v === 3 ? decoded.anchor : undefined;
-      // ESORT PARTIAL is only safe for a fresh page. A later page has to see the
-      // whole ordered result so an expunge above the cursor cannot shift the window.
-      const freshPage = legacyAfterUid === undefined && anchoredAfterUid === undefined && !anchor;
-      const window =
-        session.hasCapability('SORT') && session.hasCapability('ESORT') && freshPage
-          ? { start: startIndex + 1, count: limitForPage }
-          : undefined;
-      const serverSorted = session.hasCapability('SORT')
-        ? await box.serverSort(compiled, keys, window)
-        : null;
-      let pageUids: number[];
-      let nextCursor: string | null;
-      let offset: number;
-      let total: number;
-      let anchorLookup: Map<number, SortableMessage> | undefined;
-      if (serverSorted) {
-        const allow = new Set(matched);
-        if (serverSorted.partial && freshPage) {
-          pageUids = serverSorted.uids.filter((uid) => allow.has(uid));
-          total = matched.length;
-          offset = startIndex;
-          nextCursor = null;
-        } else {
-          const ordered = serverSorted.uids.filter((uid) => allow.has(uid));
-          if (legacyAfterUid !== undefined) {
-            const paged = pageAfterUid(ordered, limitForPage, legacyAfterUid, box.uidValidity);
-            pageUids = paged.uids;
-            nextCursor = paged.nextCursor;
-            offset = paged.offset;
-          } else {
-            const uidMissing =
-              anchoredAfterUid !== undefined && !ordered.includes(anchoredAfterUid);
-            if (uidMissing && anchor) {
-              const summaries = await box.fetchSummaries(ordered, {
-                snippet: false,
-                snippetChars: 0,
-              });
-              anchorLookup = new Map(summaries.map((item) => [item.uid, toSortable(item)]));
-            }
-            const paged = pageAnchored(
-              ordered,
-              limitForPage,
-              {
-                position: startIndex,
-                ...(anchoredAfterUid !== undefined ? { afterUid: anchoredAfterUid } : {}),
-              },
-              box.uidValidity,
-              anchorLookup && anchor
-                ? (uid) => {
-                    const item = anchorLookup?.get(uid);
-                    return item ? isStrictlyAfter(item, anchor) : false;
-                  }
-                : undefined,
-            );
-            pageUids = paged.uids;
-            nextCursor = paged.nextCursor;
-            offset = paged.offset;
-          }
-          total = ordered.length;
-        }
-        sortSource = 'server';
-      } else if (matched.length > account.limits.maxSortCandidates) {
-        throw new MailError(
-          'SIZE_LIMIT',
-          `This mailbox slice has ${matched.length} matches and the server does not advertise SORT. The client-side cap is ${account.limits.maxSortCandidates}.`,
-          'Narrow the search, or use a server with the SORT extension.',
-        );
-      } else {
-        const summaries = await box.fetchSummaries(matched, { snippet: false, snippetChars: 0 });
-        const sortable: Array<SortableMessage & { uid: number }> = summaries.map((item) => ({
-          uid: item.uid,
-          arrival: item.internalDate,
-          date: item.date,
-          from: item.from[0]?.address ?? item.from[0]?.name,
-          to: item.to[0]?.address ?? item.to[0]?.name,
-          cc: item.cc[0]?.address,
-          subject: item.subject,
-          size: item.size,
-        }));
-        const ordered = sortMessages(sortable, keys).map((item) => item.uid);
-        anchorLookup = new Map(sortable.map((item) => [item.uid, item]));
-        if (legacyAfterUid !== undefined) {
-          const paged = pageAfterUid(ordered, limitForPage, legacyAfterUid, box.uidValidity);
-          pageUids = paged.uids;
-          nextCursor = paged.nextCursor;
-          offset = paged.offset;
-        } else {
-          const paged = pageAnchored(
-            ordered,
-            limitForPage,
-            {
-              position: startIndex,
-              ...(anchoredAfterUid !== undefined ? { afterUid: anchoredAfterUid } : {}),
-            },
-            box.uidValidity,
-            anchor
-              ? (uid) => {
-                  const item = anchorLookup?.get(uid);
-                  return item ? isStrictlyAfter(item, anchor) : false;
-                }
-              : undefined,
-          );
-          pageUids = paged.uids;
-          nextCursor = paged.nextCursor;
-          offset = paged.offset;
-        }
-        total = ordered.length;
-        sortSource = 'client';
-      }
-      const messages = await box.fetchSummaries(pageUids, {
-        snippet: input.includeSnippet !== false,
-        snippetChars: input.snippetChars ?? 160,
+      const scope = scopeFor(paths, input.search, maxPerFolder, JSON.stringify(keys));
+      const { scans, sortSource } = await scanFolders(session, paths, {
+        compiled,
+        keys,
+        order,
+        ...(cursor ? { cursor } : {}),
+        maxPerFolder,
+        ...(paths.length === 1 && input.uidValidity ? { singleUidValidity: input.uidValidity } : {}),
       });
-      const byUid = new Map(messages.map((item) => [item.uid, item]));
-      const orderedMessages = pageUids
-        .map((uid) => byUid.get(uid))
-        .filter((item): item is MessageSummary => Boolean(item));
-      const next = offset + orderedMessages.length;
-      if (
-        orderedMessages.length > 0 &&
-        orderedMessages.length >= limitForPage &&
-        next < total &&
-        (nextCursor !== null || (serverSorted?.partial && freshPage))
-      ) {
-        nextCursor = cursorAfterPage(
-          orderedMessages[orderedMessages.length - 1],
-          next,
-          keys,
-          box.uidValidity,
+      const folders = folderPayload(scans);
+      const mailbox = paths[0] ?? 'INBOX';
+      const single = scans.length === 1 ? scans[0] : undefined;
+      const serverUids = single?.serverUids;
+      const anchorMissing = Boolean(cursor?.anchor && serverUids && !serverUids.includes(cursor.anchor.uid));
+      if (serverUids && single && !anchorMissing) {
+        const paged = pageServerUids(serverUids, cursor?.anchor?.uid, limit);
+        const summaries = await session.withMailbox(single.mailbox, 'read', (box) =>
+          box.fetchSummaries(paged.pageUids, {
+            snippet: input.includeSnippet !== false,
+            snippetChars: input.snippetChars ?? 160,
+          }),
         );
-      } else if (serverSorted?.partial && freshPage) {
-        nextCursor = null;
+        const byUid = new Map(summaries.map((item) => [item.uid, item]));
+        const ordered = paged.pageUids
+          .map((uid) => byUid.get(uid))
+          .filter((item): item is MessageSummary => Boolean(item));
+        const rows = ordered.map((summary) => rowFromSummary(single, summary));
+        const decorated = await this.decorateRows(session, rows);
+        const last = rows[rows.length - 1];
+        const more = paged.offset + ordered.length < paged.total;
+        const nextCursor =
+          last && more
+            ? encodeSnapshotCursor({
+                v: 4,
+                order,
+                sort: [...keys],
+                cap: limit,
+                scope,
+                folders: folders.map((folder) => ({
+                  mailbox: folder.mailbox,
+                  uidValidity: folder.uidValidity,
+                  upperUid: folder.upperUid,
+                })),
+                anchor: {
+                  mailbox: last.mailbox,
+                  uid: last.uid,
+                  date: last.date ?? last.arrival ?? '',
+                  field: keys[0]?.field ?? 'arrival',
+                  reverse: Boolean(keys[0]?.reverse),
+                  value: scalar(last, keys[0]?.field ?? 'arrival'),
+                },
+              })
+            : null;
+        if (cursor) {
+          assertCursorFits(cursor, { scope, order, sort: keys, cap: limit, folders });
+        }
+        return this.messagePage(account.id, mailbox, single.uidValidity, {
+          total: paged.total,
+          offset: paged.offset,
+          sort: keys,
+          sortSource,
+          search: fromSearch,
+          messages: decorated,
+          nextCursor,
+          order,
+          truncated: single.truncated,
+          snapshot: snapshotOf(scans),
+          folders: paths,
+        });
       }
-      return {
-        ok: true as const,
-        account: account.id,
-        mailbox,
-        uidValidity: box.uidValidity,
-        total,
-        offset,
+      if (single?.serverUids && single.summaries.length === 0) {
+        const ids =
+          single.serverUids.length > maxPerFolder
+            ? single.serverUids.slice(0, maxPerFolder)
+            : single.serverUids;
+        single.truncated = single.truncated || ids.length < single.serverUids.length;
+        single.omitted += single.serverUids.length - ids.length;
+        single.summaries = await session.withMailbox(single.mailbox, 'read', (box) =>
+          box.fetchSummaries(ids, { snippet: false, snippetChars: 0 }),
+        );
+        single.scanned = single.summaries.length;
+      }
+      const page = pageSummaryRows(rowsFromScans(scans), {
+        limit,
+        keys,
+        order,
+        ...(cursor ? { cursor } : {}),
+        scope,
+        folders: folderPayload(scans),
+      });
+      const snippetRows = await this.withSnippets(session, page.items, input);
+      const decorated = await this.decorateRows(session, snippetRows);
+      return this.messagePage(account.id, mailbox, folders[0]?.uidValidity ?? '', {
+        total: page.total,
+        offset: page.offset,
         sort: keys,
         sortSource,
         search: fromSearch,
-        messages: orderedMessages.map(publicSummary),
-        nextCursor,
-      };
+        messages: decorated,
+        nextCursor: page.nextCursor,
+        order,
+        truncated: scans.some((scan) => scan.truncated),
+        snapshot: snapshotOf(scans),
+        folders: paths,
+      });
     });
+  }
+
+  private messagePage(
+    accountId: string,
+    mailbox: string,
+    uidValidity: string,
+    page: {
+      total: number;
+      offset: number;
+      sort: readonly SortKey[];
+      sortSource: 'server' | 'client';
+      search: boolean;
+      messages: Array<Record<string, unknown>>;
+      nextCursor: string | null;
+      order: PageOrder;
+      truncated: boolean;
+      snapshot: { folders: unknown };
+      folders: string[];
+    },
+  ): Record<string, unknown> {
+    return {
+      ok: true as const,
+      account: accountId,
+      mailbox,
+      uidValidity,
+      total: page.total,
+      offset: page.offset,
+      sort: page.sort,
+      sortSource: page.sortSource,
+      search: page.search,
+      messages: page.messages,
+      items: page.messages,
+      nextCursor: page.nextCursor,
+      order: page.order,
+      truncated: page.truncated,
+      snapshot: page.snapshot,
+      folders: page.folders,
+    };
+  }
+
+  private perFolderCap(requested: number | undefined, max: number): number {
+    const cap = requested ?? max;
+    if (!Number.isInteger(cap) || cap < 1) {
+      throw new MailError('INVALID_ARGUMENT', 'maxPerFolder must be a positive integer.');
+    }
+    if (cap > max) {
+      throw new MailError(
+        'SIZE_LIMIT',
+        `maxPerFolder ${cap} is above the configured maximum of ${max}.`,
+        'Raise limits.maxSortCandidates.',
+      );
+    }
+    return cap;
+  }
+
+  private async folderPaths(
+    account: ResolvedAccount,
+    session: ImapSession,
+    input: { mailbox?: string; folders?: unknown },
+  ): Promise<string[]> {
+    if (input.folders === undefined) {
+      return [input.mailbox ?? 'INBOX'];
+    }
+    const listed = await session.listMailboxes();
+    const special = await this.special(account, session);
+    return resolveFolderPaths(listed.map(listedFolder), special, parseFolderRequest(input.folders)).paths;
+  }
+
+  private async withSnippets(
+    session: ImapSession,
+    rows: readonly SummaryRow[],
+    input: { includeSnippet?: boolean; snippetChars?: number },
+  ): Promise<SummaryRow[]> {
+    if (input.includeSnippet === false || rows.length === 0) {
+      return [...rows];
+    }
+    const grouped = groupRows(rows);
+    const out: SummaryRow[] = [];
+    for (const [mailbox, items] of grouped) {
+      const summaries = await session.withMailbox(mailbox, 'read', (box) =>
+        box.fetchSummaries(
+          items.map((item) => item.uid),
+          { snippet: true, snippetChars: input.snippetChars ?? 160 },
+        ),
+      );
+      const byUid = new Map(summaries.map((item) => [item.uid, item]));
+      for (const item of items) {
+        const summary = byUid.get(item.uid);
+        out.push(summary ? { ...item, summary } : item);
+      }
+    }
+    return out;
+  }
+
+  private async decorateRows(
+    session: ImapSession,
+    rows: readonly SummaryRow[],
+  ): Promise<Array<Record<string, unknown>>> {
+    const grouped = groupRows(rows);
+    const headers = new Map<string, ReturnType<typeof listHeaders>>();
+    for (const [mailbox, items] of grouped) {
+      await session.withMailbox(mailbox, 'read', async (box) => {
+        for (const item of items) {
+          headers.set(`${mailbox}\0${item.uid}`, listHeaders(await box.fetchHeaders(item.uid)));
+        }
+      });
+    }
+    return rows.map((row) =>
+      publicSummary(row.summary, {
+        mailbox: row.mailbox,
+        uidValidity: row.uidValidity,
+        ...(headers.get(`${row.mailbox}\0${row.uid}`) ?? {
+          listUnsubscribe: null,
+          listId: null,
+          autoSubmitted: null,
+        }),
+      }),
+    );
+  }
+
+  private async seedMessage(
+    session: ImapSession,
+    input: { mailbox?: string; uid?: number; uidValidity?: string; messageId?: string },
+  ): Promise<ConversationMessage> {
+    if (input.uid !== undefined && input.mailbox) {
+      return session.withMailbox(input.mailbox, 'read', async (box) => {
+        this.assertUid(box, input.uidValidity);
+        const summary = await this.requireSummary(box, input.uid ?? 0);
+        return this.conversationFrom(box, summary, input.mailbox ?? 'INBOX', 'header');
+      });
+    }
+    const id = normalizeMessageId(input.messageId);
+    if (!id) {
+      throw new MailError('INVALID_ARGUMENT', 'messageId is empty.');
+    }
+    const listed = await session.listMailboxes();
+    for (const mailbox of listed.map((item) => item.path)) {
+      const found = await this.searchHeaderIds(session, mailbox, [id]);
+      const exact = found.find((item) => normalizeMessageId(item.messageId) === id);
+      if (exact) {
+        return { ...exact, linked: 'header' };
+      }
+    }
+    throw new MailError('NOT_FOUND', `No message with Message-ID ${input.messageId} was found.`);
+  }
+
+  private async conversationFrom(
+    box: OpenMailbox,
+    summary: MessageSummary,
+    mailbox: string,
+    linked: LinkKind,
+  ): Promise<ConversationMessage> {
+    const raw = await box.fetchHeaders(summary.uid);
+    const text = raw?.toString('utf8') ?? '';
+    const headers = listHeaders(raw);
+    const references = summary.references ?? messageIds(headerValue(text, 'references'));
+    const inReply = summary.inReplyTo ?? messageIds(headerValue(text, 'in-reply-to'))[0];
+    const message: ConversationMessage = {
+      mailbox,
+      uid: summary.uid,
+      uidValidity: box.uidValidity,
+      references,
+      from: summary.from,
+      to: summary.to,
+      cc: summary.cc,
+      flags: summary.flags,
+      hasAttachments: summary.hasAttachments,
+      linked,
+    };
+    const messageId = summary.messageId ?? headerValue(text, 'message-id');
+    if (messageId) {
+      message.messageId = messageId;
+    }
+    if (inReply) {
+      message.inReplyTo = inReply;
+    }
+    if (summary.subject) {
+      message.subject = summary.subject;
+    }
+    if (summary.date) {
+      message.date = summary.date;
+    }
+    if (summary.internalDate) {
+      message.internalDate = summary.internalDate;
+    }
+    if (summary.snippet) {
+      message.snippet = summary.snippet;
+    }
+    if (summary.threadId) {
+      message.threadId = summary.threadId;
+    }
+    if (headers.listUnsubscribe) {
+      message.listUnsubscribe = headers.listUnsubscribe;
+    }
+    if (headers.listId) {
+      message.listId = headers.listId;
+    }
+    if (headers.autoSubmitted) {
+      message.autoSubmitted = headers.autoSubmitted;
+    }
+    return message;
+  }
+
+  private async searchHeaderIds(
+    session: ImapSession,
+    folder: string,
+    ids: readonly string[],
+  ): Promise<ConversationMessage[]> {
+    if (ids.length === 0) {
+      return [];
+    }
+    const clauses = ids.flatMap((id) => [
+      { header: { name: 'Message-ID', value: id } },
+      { header: { name: 'References', value: id } },
+      { header: { name: 'In-Reply-To', value: id } },
+    ]);
+    const criteria: SearchCriteria = clauses.length === 1 && clauses[0] ? clauses[0] : { or: clauses };
+    const compiled = compileSearch(criteria);
+    return session.withMailbox(folder, 'read', async (box) => {
+      const uids = await box.search(compiled);
+      const summaries = await box.fetchSummaries(uids, { snippet: true, snippetChars: 160 });
+      const found: ConversationMessage[] = [];
+      for (const summary of summaries) {
+        found.push(await this.conversationFrom(box, summary, folder, 'header'));
+      }
+      return found;
+    });
+  }
+
+  private async fastThread(
+    session: ImapSession,
+    folders: readonly string[],
+    seed: ConversationMessage,
+    maxMessages: number,
+  ): Promise<{ messages: ConversationMessage[]; truncated: boolean } | null> {
+    if (!seed.threadId) {
+      return null;
+    }
+    const gmail = session.hasCapability('X-GM-EXT-1');
+    const objectId = session.hasCapability('OBJECTID');
+    if (!gmail && !objectId) {
+      return null;
+    }
+    const linked: LinkKind = gmail ? 'gmail-thrid' : 'objectid';
+    const compiled = compileSearch({ threadId: seed.threadId });
+    assertSearchCapabilities(compiled.requires, (name) => session.hasCapability(name));
+    const messages: ConversationMessage[] = [];
+    let truncated = false;
+    for (const folder of folders) {
+      const found = await session.withMailbox(folder, 'read', async (box) => {
+        const uids = await box.search(compiled);
+        const summaries = await box.fetchSummaries(uids, { snippet: true, snippetChars: 160 });
+        const rows: ConversationMessage[] = [];
+        for (const summary of summaries) {
+          if (messages.length + rows.length >= maxMessages) {
+            truncated = true;
+            break;
+          }
+          rows.push(await this.conversationFrom(box, summary, folder, linked));
+        }
+        return rows;
+      });
+      messages.push(...found);
+    }
+    if (!messages.some((item) => item.mailbox === seed.mailbox && item.uid === seed.uid)) {
+      messages.unshift(seed);
+    }
+    return { messages, truncated };
+  }
+
+  private async subjectCandidates(
+    session: ImapSession,
+    folders: readonly string[],
+    seed: ConversationMessage,
+  ): Promise<ConversationMessage[]> {
+    const subject = normalizedSubject(seed.subject);
+    if (!subject) {
+      return [];
+    }
+    const compiled = compileSearch({ subject });
+    const found: ConversationMessage[] = [];
+    for (const folder of folders) {
+      const rows = await session.withMailbox(folder, 'read', async (box) => {
+        const uids = (await box.search(compiled)).slice(0, 200);
+        const summaries = await box.fetchSummaries(uids, { snippet: false, snippetChars: 0 });
+        const messages: ConversationMessage[] = [];
+        for (const summary of summaries) {
+          messages.push(await this.conversationFrom(box, summary, folder, 'subject'));
+        }
+        return messages;
+      });
+      found.push(...rows);
+    }
+    return found;
   }
 
   private async withImap<T>(
@@ -1494,30 +2476,6 @@ export class MailService {
     return resolved;
   }
 
-  private async attachReferences(
-    box: OpenMailbox,
-    summaries: MessageSummary[],
-  ): Promise<MessageSummary[]> {
-    for (const summary of summaries) {
-      const raw = await box.fetchHeaders(summary.uid);
-      if (!raw) {
-        continue;
-      }
-      const text = raw.toString('utf8');
-      summary.references = messageIds(headerValue(text, 'references'));
-      if (!summary.inReplyTo) {
-        const inReply = headerValue(text, 'in-reply-to');
-        if (inReply) {
-          summary.inReplyTo = messageIds(inReply)[0];
-        }
-      }
-      if (!summary.messageId) {
-        summary.messageId = headerValue(text, 'message-id');
-      }
-    }
-    return summaries;
-  }
-
   private async loadParsed(
     account: ResolvedAccount,
     input: UidInput,
@@ -1543,8 +2501,9 @@ export class MailService {
   private async outboundFromParts(
     account: ResolvedAccount,
     input: ComposeParts,
-  ): Promise<OutboundMessage> {
-    const from = this.resolveFrom(account, input.from);
+  ): Promise<{ message: OutboundMessage; identity: IdentityChoice }> {
+    const identity = this.resolveFrom(account, input.from);
+    const from = identity.address;
     const to = normalizeRecipients(input.to);
     if (to.length === 0 && !input.allowEmptyRecipients) {
       throw new MailError('INVALID_ARGUMENT', 'At least one To recipient is required.');
@@ -1590,29 +2549,16 @@ export class MailService {
     if (input.readReceipt) {
       message.readReceipt = true;
     }
-    return message;
+    return { message, identity };
   }
 
-  private resolveFrom(account: ResolvedAccount, from?: string | MailAddress): MailAddress {
-    const identity = account.identities.find((item) => item.default) ?? account.identities[0];
-    if (!from) {
-      return identityToAddress(identity, account.email);
-    }
-    const parsed = typeof from === 'string' ? parseAddress(from) : from;
-    const match = account.identities.find(
-      (item) => item.email.toLowerCase() === parsed.address.toLowerCase(),
-    );
-    if (!match && parsed.address.toLowerCase() !== account.email.toLowerCase()) {
-      throw new MailError(
-        'PERMISSION_DENIED',
-        `From address ${parsed.address} is not a configured identity for account "${account.id}".`,
-        `Identities: ${account.identities.map((item) => item.email).join(', ')}.`,
-      );
-    }
-    if (!parsed.name && match?.name) {
-      parsed.name = match.name;
-    }
-    return parsed;
+  private resolveFrom(account: ResolvedAccount, from?: string | MailAddress): IdentityChoice {
+    return selectIdentity({
+      identities: account.identities,
+      accountEmail: account.email,
+      allowFromDomains: account.allowFromDomains,
+      ...(from ? { requested: from } : {}),
+    });
   }
 
   private shouldAppend(account: ResolvedAccount): boolean {
@@ -1652,11 +2598,15 @@ export class MailService {
 
   private async probeImap(account: ResolvedAccount): Promise<Record<string, unknown>> {
     try {
+      const dial = dialTarget(account.imap);
       return await this.withImap(account, async (session) => ({
         ok: true,
         host: account.imap.host,
         port: account.imap.port,
         secure: account.imap.secure,
+        connectHost: dial.host,
+        connectPort: dial.port,
+        servername: dial.servername,
         capabilities: [...session.capabilities.keys()].sort(),
       }));
     } catch (error) {
@@ -1699,11 +2649,15 @@ export class MailService {
     }
     try {
       await withTimeout(account.smtp.timeoutMs, 'SMTP verify', sender.verify());
+      const dial = dialTarget(account.smtp);
       return {
         ok: true,
         host: account.smtp.host,
         port: account.smtp.port,
         secure: account.smtp.secure,
+        connectHost: dial.host,
+        connectPort: dial.port,
+        servername: dial.servername,
       };
     } catch (error) {
       const mapped =
@@ -1784,9 +2738,20 @@ function publicMailbox(mailbox: MailboxInfo): Record<string, unknown> {
   };
 }
 
-function publicSummary(summary: MessageSummary): Record<string, unknown> {
+function publicSummary(
+  summary: MessageSummary,
+  extra: {
+    mailbox: string;
+    uidValidity: string;
+    listUnsubscribe: string | null;
+    listId: string | null;
+    autoSubmitted: string | null;
+  },
+): Record<string, unknown> {
   return {
     uid: summary.uid,
+    mailbox: extra.mailbox,
+    uidValidity: extra.uidValidity,
     flags: summary.flags,
     size: summary.size ?? null,
     date: summary.date ?? null,
@@ -1801,6 +2766,9 @@ function publicSummary(summary: MessageSummary): Record<string, unknown> {
     labels: summary.labels ?? [],
     threadId: summary.threadId ?? null,
     modseq: summary.modseq ?? null,
+    listUnsubscribe: extra.listUnsubscribe,
+    listId: extra.listId,
+    autoSubmitted: extra.autoSubmitted,
   };
 }
 
@@ -1816,6 +2784,10 @@ function publicHeaders(parsed: ParsedMessage): Record<string, unknown> {
     messageId: parsed.messageId ?? null,
     inReplyTo: parsed.inReplyTo ?? null,
     references: parsed.references,
+    listId: parsed.headers['list-id'] ?? null,
+    listUnsubscribe: parsed.headers['list-unsubscribe'] ?? null,
+    autoSubmitted: parsed.headers['auto-submitted'] ?? null,
+    authenticationResults: parsed.headers['authentication-results'] ?? null,
   };
 }
 
@@ -1840,17 +2812,6 @@ function normalizeRecipients(value: Array<string | MailAddress> | undefined): Ma
     }
   }
   return out;
-}
-
-function identityToAddress(identity: Identity | undefined, email: string): MailAddress {
-  if (!identity) {
-    return { address: email };
-  }
-  const address: MailAddress = { address: identity.email };
-  if (identity.name) {
-    address.name = identity.name;
-  }
-  return address;
 }
 
 function pickAttachment(
@@ -1917,38 +2878,6 @@ function stripCid(value: string): string {
   return value.trim().replace(/^<|>$/g, '').toLowerCase();
 }
 
-function toSortable(item: MessageSummary): SortableMessage {
-  return {
-    uid: item.uid,
-    arrival: item.internalDate,
-    date: item.date,
-    from: item.from[0]?.address ?? item.from[0]?.name,
-    to: item.to[0]?.address ?? item.to[0]?.name,
-    cc: item.cc[0]?.address,
-    subject: item.subject,
-    size: item.size,
-  };
-}
-
-function cursorAfterPage(
-  last: MessageSummary | undefined,
-  next: number,
-  keys: readonly SortKey[],
-  uidValidity: string,
-): string | null {
-  if (!last) {
-    return null;
-  }
-  const primary = keys[0] ?? { field: 'arrival', reverse: true };
-  return encodeCursor({
-    v: 3,
-    position: next,
-    afterUid: last.uid,
-    uidValidity,
-    anchor: anchorOf(toSortable(last), primary),
-  });
-}
-
 function flagResults(
   uids: number[],
   update: { updated: number[]; modified: number[]; missing: number[] },
@@ -1973,6 +2902,131 @@ function flagResults(
     }
     return { uid, ok: false, code: 'PROTOCOL_ERROR', message: `UID ${uid} was not updated.` };
   });
+}
+
+function publicIdentity(choice: IdentityChoice): { identity: { id: string | null; email: string; name?: string }; identityReason: string } {
+  return {
+    identity: {
+      id: choice.id,
+      email: choice.email,
+      ...(choice.name ? { name: choice.name } : {}),
+    },
+    identityReason: choice.reason,
+  };
+}
+
+function bounded(value: number | undefined, fallback: number, max: number): number {
+  const size = value ?? fallback;
+  if (!Number.isInteger(size) || size < 1 || size > max) {
+    throw new MailError('INVALID_ARGUMENT', `Value must be an integer from 1 to ${max}.`);
+  }
+  return size;
+}
+
+function andFlag(
+  compiled: { query: Record<string, unknown>; requires: Array<'gmail' | 'condstore' | 'objectid'> },
+  flag: 'seen' | 'flagged' | 'answered',
+  value: boolean,
+): { query: Record<string, unknown>; requires: Array<'gmail' | 'condstore' | 'objectid'> } {
+  if (Object.keys(compiled.query).length === 1 && compiled.query.all === true) {
+    return { query: { [flag]: value }, requires: [...compiled.requires] };
+  }
+  return {
+    query: { not: { or: [{ not: compiled.query }, { not: { [flag]: value } }] } },
+    requires: [...compiled.requires],
+  };
+}
+
+function topCounts(counts: Map<string, number>, top: number): Array<{ value: string; count: number }> {
+  return [...counts.entries()]
+    .sort((left, right) => {
+      if (right[1] !== left[1]) {
+        return right[1] - left[1];
+      }
+      return left[0] < right[0] ? -1 : left[0] > right[0] ? 1 : 0;
+    })
+    .slice(0, top)
+    .map(([value, count]) => ({ value, count }));
+}
+
+function listedFolder(mailbox: MailboxInfo): ListedFolder {
+  return mailbox.specialUse ? { path: mailbox.path, specialUse: mailbox.specialUse } : { path: mailbox.path };
+}
+
+function groupRows(rows: readonly SummaryRow[]): Map<string, SummaryRow[]> {
+  const grouped = new Map<string, SummaryRow[]>();
+  for (const row of rows) {
+    const list = grouped.get(row.mailbox);
+    if (list) {
+      list.push(row);
+    } else {
+      grouped.set(row.mailbox, [row]);
+    }
+  }
+  return grouped;
+}
+
+function scalar(row: SummaryRow, field: SortKey['field']): string {
+  if (field === 'size') {
+    return row.size === undefined ? '' : String(row.size);
+  }
+  return row[field] ?? '';
+}
+
+function threadSummary(
+  node: ThreadNode,
+  mailbox: string,
+  byUid: Map<string, { summary: MessageSummary; mailbox: string; uidValidity: string }>,
+  link: LinkKind,
+): (SummaryRow & {
+  participants: string[];
+  messageCount: number;
+  unreadCount: number;
+  threadKey: string;
+  linked: LinkKind;
+}) | undefined {
+  const messages = flattenThread([node])
+    .map((uid) => byUid.get(`${mailbox}\0${uid}`))
+    .filter((item): item is { summary: MessageSummary; mailbox: string; uidValidity: string } => Boolean(item));
+  const first = messages[0];
+  if (!first) {
+    return undefined;
+  }
+  let latest = first;
+  const participants = new Set<string>();
+  let unread = 0;
+  for (const item of messages) {
+    const stamp = item.summary.date || item.summary.internalDate || '';
+    const best = latest.summary.date || latest.summary.internalDate || '';
+    if (stamp > best) {
+      latest = item;
+    }
+    if (!item.summary.flags.includes('\\Seen')) {
+      unread += 1;
+    }
+    for (const address of [...item.summary.from, ...item.summary.to, ...item.summary.cc]) {
+      if (address.address) {
+        participants.add(address.address.toLowerCase());
+      }
+    }
+  }
+  const row = rowFromSummary(latest, latest.summary);
+  row.date = latest.summary.date || latest.summary.internalDate;
+  row.arrival = latest.summary.internalDate;
+  const rootId = first.summary.messageId;
+  return {
+    ...row,
+    participants: [...participants].sort(),
+    messageCount: messages.length,
+    unreadCount: unread,
+    threadKey: threadKeyFor({
+      messageId: rootId,
+      mailbox: first.mailbox,
+      uid: first.summary.uid,
+      uidValidity: first.uidValidity,
+    }),
+    linked: link,
+  };
 }
 
 function pruneThreads(nodes: ThreadNode[], allow: Set<number>): ThreadNode[] {
@@ -2081,13 +3135,16 @@ export interface UidInput {
 export interface ListInput {
   account?: string;
   mailbox?: string;
+  folders?: unknown;
   search?: SearchCriteria;
   sort?: SortKey[];
+  order?: PageOrder;
   limit?: number;
   cursor?: string;
   uidValidity?: string;
   includeSnippet?: boolean;
   snippetChars?: number;
+  maxPerFolder?: number;
 }
 
 export interface GetMessageInput extends UidInput {
@@ -2167,7 +3224,7 @@ export interface BulkInput {
 
 export interface ComposeParts {
   account?: string;
-  from?: string;
+  from?: string | MailAddress;
   to?: Array<string | MailAddress>;
   cc?: Array<string | MailAddress>;
   bcc?: Array<string | MailAddress>;
@@ -2185,6 +3242,7 @@ export interface ComposeParts {
 }
 
 export interface SendInput extends ComposeParts {
+  identityChoice?: IdentityChoice;
   envelopeFrom?: string;
   envelopeTo?: string[];
   dsn?: {
@@ -2202,6 +3260,8 @@ export interface ReplyInput {
   uid: number;
   uidValidity?: string;
   replyAll?: boolean;
+  from?: string | MailAddress;
+  replyTo?: Array<string | MailAddress>;
   text?: string;
   html?: string;
   subject?: string;
@@ -2214,6 +3274,8 @@ export interface ForwardInput {
   mailbox: string;
   uid: number;
   uidValidity?: string;
+  from?: string | MailAddress;
+  replyTo?: Array<string | MailAddress>;
   to: Array<string | MailAddress>;
   cc?: Array<string | MailAddress>;
   text?: string;

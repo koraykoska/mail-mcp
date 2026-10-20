@@ -13,6 +13,7 @@ import {
 } from '../../src/imap/sort.js';
 import { createLogger } from '../../src/log.js';
 import { decodeCursor, encodeCursor, pageAnchored } from '../../src/pagination.js';
+import { decodeSnapshotCursor } from '../../src/page/snapshot.js';
 import { createRuntime } from '../../src/runtime.js';
 import { createMcpServer } from '../../src/server.js';
 import { MailService } from '../../src/service/mail-service.js';
@@ -356,10 +357,9 @@ describe('page cursor after an expunge', () => {
     const row = (first.messages as Array<{ uid: number; subject: string | null }>)[0];
     expect(row?.subject).toBe('Zebra');
     const cursor = String(first.nextCursor);
-    expect(decodeCursor(cursor)).toMatchObject({
-      v: 3,
-      afterUid: row?.uid,
-      anchor: { field: 'subject', reverse: true, value: 'Zebra' },
+    expect(decodeSnapshotCursor(cursor)).toMatchObject({
+      v: 4,
+      anchor: { uid: row?.uid, field: 'subject', reverse: true, value: 'Zebra' },
     });
     await service.deleteMessages({ mailbox: 'INBOX', uids: [Number(row?.uid)], permanent: true });
     const subjects: string[] = [];
