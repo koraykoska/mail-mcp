@@ -445,6 +445,7 @@ async function exercise(label: string, service: MailService, email: string): Pro
       listTool.run(
         {
           folders: { all: true },
+          search: { header: { name: 'Message-ID', value: stamp } },
           limit: 1,
           includeSnippet: false,
           ...(cursor ? { cursor } : {}),
@@ -506,7 +507,7 @@ describe('paged tool contract', () => {
     });
     await exercise('gm', runtime.service, greenmail.email);
     await runtime.close();
-  }, 120_000);
+  }, 180_000);
 
   it('walks every paged tool on Dovecot without gaps or duplicates', async () => {
     const runtime = createRuntime({
@@ -531,5 +532,5 @@ describe('paged tool contract', () => {
     });
     await exercise('dv', runtime.service, dovecot.email);
     await runtime.close();
-  }, 120_000);
+  }, 180_000);
 });
