@@ -279,6 +279,49 @@ describe('GreenMail', () => {
     expect(ok.ok).toBe(true);
     await loose.close();
   });
+
+  it('ANDs a text test with a UID and complements NOT UID', async () => {
+    const runtime = runtimeFor();
+    const stamp = `and-${Date.now()}`;
+    const folder = `Projects/${stamp}`;
+    await runtime.service.createMailbox(undefined, folder);
+    await runtime.service.append({
+      mailbox: folder,
+      to: ['ada@example.com'],
+      subject: `Ada ${stamp}`,
+      text: 'one',
+    });
+    await runtime.service.append({
+      mailbox: folder,
+      to: ['bea@example.com'],
+      subject: `Bea ${stamp}`,
+      text: 'two',
+    });
+    const ada = await runtime.service.searchMessages({
+      mailbox: folder,
+      search: { subject: `Ada ${stamp}` },
+      limit: 10,
+      includeSnippet: false,
+    });
+    expect(ada.total).toBe(1);
+    const uid = Number((ada.messages as Array<{ uid: number }>)[0]?.uid);
+    const withUid = await runtime.service.searchMessages({
+      mailbox: folder,
+      search: { subject: `Ada ${stamp}`, uid: String(uid) },
+      limit: 10,
+      includeSnippet: false,
+    });
+    expect(withUid.total).toBe(1);
+    const rest = await runtime.service.searchMessages({
+      mailbox: folder,
+      search: { not: { uid: String(uid) } },
+      limit: 10,
+      includeSnippet: false,
+    });
+    expect(rest.total).toBe(1);
+    expect((rest.messages as Array<{ uid: number }>)[0]?.uid).not.toBe(uid);
+    await runtime.close();
+  });
 });
 
 describe('scripted IMAP fallbacks', () => {

@@ -106,6 +106,15 @@ export const limitsSchema = z
       .default(35 * 1024 * 1024),
     maxSortCandidates: z.number().int().positive().default(5_000),
     maxBulk: z.number().int().positive().default(200),
+    bulkBudgetMs: z
+      .number()
+      .int()
+      .positive()
+      .max(50_000)
+      .default(20_000)
+      .describe(
+        'Wall-clock budget for one bulk change (flags, copy, move, delete, labels, modify-by-search). The call stops between chunks and returns the UIDs still to do. Capped at 50000 so the call finishes inside a 60 second request limit.',
+      ),
   })
   .strict();
 
@@ -206,6 +215,7 @@ export interface Limits {
   maxMessageBytes: number;
   maxSortCandidates: number;
   maxBulk: number;
+  bulkBudgetMs: number;
 }
 
 export interface ResolvedAccount {

@@ -39,6 +39,7 @@ export function account(overrides: Partial<ResolvedAccount> = {}): ResolvedAccou
       maxMessageBytes: 2 * 1024 * 1024,
       maxSortCandidates: 5000,
       maxBulk: 50,
+      bulkBudgetMs: 20_000,
     },
   };
   return { ...base, ...overrides, limits: { ...base.limits, ...(overrides.limits ?? {}) } };

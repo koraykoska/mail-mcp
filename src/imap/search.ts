@@ -51,16 +51,45 @@ export interface CompiledSearch {
   requires: SearchCapability[];
 }
 
-/** AND a UID set onto a compiled query. `1:5` and `8:*` are sequence-set text. */
-export function andSearchUid(compiled: CompiledSearch, range: string): CompiledSearch {
-  const query = compiled.query;
-  if (Object.keys(query).length === 1 && query.all === true) {
-    return { query: { uid: range }, requires: [...compiled.requires] };
+/**
+ * Keys the search evaluator handles. They are never sent to the server:
+ * `NOT UID` and `NOT <sequence>` are not portable, and neither is a NOT
+ * wrapped around a mix of text and flag tests.
+ */
+export const CLIENT_QUERY_KEYS = ['$and', '$or', '$complement'] as const;
+
+/** True when the query must be resolved with UID sets instead of one SEARCH. */
+export function isClientQuery(query: Record<string, unknown>): boolean {
+  return CLIENT_QUERY_KEYS.some((key) => key in query);
+}
+
+/**
+ * AND extra IMAP keys onto a compiled query by juxtaposition.
+ * `1:*` does not narrow a query that already names a UID set.
+ */
+export function andSearchQuery(
+  compiled: CompiledSearch,
+  extra: Record<string, unknown>,
+): CompiledSearch {
+  if (isMatchAll(compiled.query)) {
+    return { query: { ...extra }, requires: [...compiled.requires] };
+  }
+  if (
+    extra.uid === '1:*' &&
+    typeof compiled.query.uid === 'string' &&
+    !isClientQuery(compiled.query)
+  ) {
+    return { query: compiled.query, requires: [...compiled.requires] };
   }
   return {
-    query: { not: { or: [{ not: query }, { not: { uid: range } }] } },
+    query: andQueries([compiled.query, extra]),
     requires: [...compiled.requires],
   };
+}
+
+/** AND a UID set onto a compiled query. `1:5` and `8:*` are sequence-set text. */
+export function andSearchUid(compiled: CompiledSearch, range: string): CompiledSearch {
+  return andSearchQuery(compiled, { uid: range });
 }
 
 export function compileSearch(criteria: SearchCriteria | undefined): CompiledSearch {
@@ -151,13 +180,13 @@ function compileNode(
     flat.labels = criteria.labels;
   }
   if (criteria.not) {
-    parts.push({ not: compileNode(criteria.not, requires) });
+    parts.push(compileNot(compileNode(criteria.not, requires)));
   }
   if (criteria.or) {
     if (criteria.or.length < 2) {
       throw new MailError('INVALID_ARGUMENT', 'search.or needs at least two clauses.');
     }
-    parts.push({ or: criteria.or.map((clause) => compileNode(clause, requires)) });
+    parts.push(compileOr(criteria.or.map((clause) => compileNode(clause, requires))));
   }
   if (criteria.and) {
     for (const clause of criteria.and) {
@@ -167,15 +196,12 @@ function compileNode(
   if (criteria.all) {
     flat.all = true;
   }
-  const nonEmptyFlat = Object.keys(flat).length > 0 ? flat : undefined;
-  const all = [...(nonEmptyFlat ? [nonEmptyFlat] : []), ...parts];
-  if (all.length === 0) {
-    return { all: true };
+  const pieces: Record<string, unknown>[] = [];
+  if (Object.keys(flat).length > 0) {
+    pieces.push(flat);
   }
-  if (all.length === 1) {
-    return all[0] ?? { all: true };
-  }
-  return { not: { or: all.map((item) => ({ not: item })) } };
+  pieces.push(...parts);
+  return andQueries(pieces);
 }
 
 function assignText(target: Record<string, unknown>, key: string, value: string | undefined): void {
@@ -244,4 +270,143 @@ export function assertSearchCapabilities(
       );
     }
   }
+}
+
+export function isMatchAll(query: Record<string, unknown>): boolean {
+  const keys = Object.keys(query);
+  return keys.length === 1 && keys[0] === 'all' && query.all === true;
+}
+
+/**
+ * Resolve a compiled query to UIDs.
+ * `$and` intersects, `$or` unions, and `$complement` subtracts from every UID.
+ * Anything else is one server SEARCH. The callback must not receive a client key.
+ */
+export async function evaluateSearch(
+  query: Record<string, unknown>,
+  run: (query: Record<string, unknown>) => Promise<number[]>,
+): Promise<number[]> {
+  if (Array.isArray(query.$and)) {
+    let acc: Set<number> | undefined;
+    for (const part of query.$and) {
+      const ids = await evaluateSearch(part as Record<string, unknown>, run);
+      const next = new Set(ids);
+      acc = acc ? new Set([...acc].filter((uid) => next.has(uid))) : next;
+    }
+    return sorted([...(acc ?? [])]);
+  }
+  if (Array.isArray(query.$or)) {
+    const acc = new Set<number>();
+    for (const part of query.$or) {
+      for (const uid of await evaluateSearch(part as Record<string, unknown>, run)) {
+        acc.add(uid);
+      }
+    }
+    return sorted([...acc]);
+  }
+  if (query.$complement && typeof query.$complement === 'object') {
+    const universe = await run({ all: true });
+    const inner = await evaluateSearch(query.$complement as Record<string, unknown>, run);
+    const drop = new Set(inner);
+    return universe.filter((uid) => !drop.has(uid));
+  }
+  return run(query);
+}
+
+/** True when a NOT above this node would have to negate a UID or sequence set. */
+export function mentionsUidOrSeq(value: unknown): boolean {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+  if (Array.isArray(value)) {
+    return value.some((item) => mentionsUidOrSeq(item));
+  }
+  const record = value as Record<string, unknown>;
+  if ('uid' in record || 'seq' in record) {
+    return true;
+  }
+  return Object.values(record).some((item) => mentionsUidOrSeq(item));
+}
+
+function sorted(uids: number[]): number[] {
+  return uids.sort((left, right) => left - right);
+}
+
+function andQueries(parts: Record<string, unknown>[]): Record<string, unknown> {
+  const nodes: Record<string, unknown>[] = [];
+  for (const part of parts) {
+    if (Array.isArray(part.$and)) {
+      nodes.push(...(part.$and as Record<string, unknown>[]));
+      continue;
+    }
+    if (isMatchAll(part)) {
+      continue;
+    }
+    nodes.push(part);
+  }
+  if (nodes.length === 0) {
+    return { all: true };
+  }
+  if (nodes.length === 1) {
+    return nodes[0] ?? { all: true };
+  }
+  const merged: Record<string, unknown> = {};
+  const rest: Record<string, unknown>[] = [];
+  for (const part of nodes) {
+    if (isClientQuery(part) || overlaps(merged, part)) {
+      rest.push(part);
+      continue;
+    }
+    Object.assign(merged, part);
+  }
+  const combined = [...(Object.keys(merged).length > 0 ? [merged] : []), ...rest];
+  if (combined.length === 1) {
+    return combined[0] ?? { all: true };
+  }
+  return { $and: combined };
+}
+
+function overlaps(left: Record<string, unknown>, right: Record<string, unknown>): boolean {
+  return Object.keys(right).some((key) => key in left);
+}
+
+/**
+ * IMAP NOT is sent only for a single key that is not a UID, a sequence, or OR.
+ * Anything else is the complement of a positive search, computed from UID sets.
+ */
+function compileNot(inner: Record<string, unknown>): Record<string, unknown> {
+  if (isImapNotSafe(inner)) {
+    return { not: inner };
+  }
+  return { $complement: inner };
+}
+
+function isImapNotSafe(query: Record<string, unknown>): boolean {
+  if (isClientQuery(query) || mentionsUidOrSeq(query)) {
+    return false;
+  }
+  const keys = Object.keys(query);
+  if (keys.length !== 1) {
+    return false;
+  }
+  const key = keys[0];
+  if (!key || key === 'or' || key === 'uid' || key === 'seq') {
+    return false;
+  }
+  if (key === 'not') {
+    const nested = query.not;
+    return (
+      typeof nested === 'object' &&
+      nested !== null &&
+      isImapNotSafe(nested as Record<string, unknown>)
+    );
+  }
+  return true;
+}
+
+function compileOr(parts: Record<string, unknown>[]): Record<string, unknown> {
+  if (parts.every((part) => !isClientQuery(part))) {
+    return { or: parts };
+  }
+  return { $or: parts };
 }

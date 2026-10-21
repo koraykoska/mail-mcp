@@ -33,6 +33,13 @@ export interface ScriptedOptions {
   /** Answer UNCHANGEDSINCE STORE with a MODIFIED response code. */
   modifiedStore?: boolean;
   refuseCopy?: boolean;
+  /**
+   * iCloud SEARCH: `NOT UID` and `NOT <sequence>` match nothing, and a NOT that
+   * mixes a text test with a flag or UID test is `NO [UNAVAILABLE]`.
+   */
+  icloud?: boolean;
+  /** COPY stores the messages and answers OK without a COPYUID response code. */
+  omitCopyUid?: boolean;
 }
 
 /**
@@ -305,8 +312,20 @@ export class ScriptedImap {
         no('SEARCH refused');
         return;
       }
+      if (this.options.icloud) {
+        const fault = icloudCommandFault(args);
+        if (fault === 'unavailable') {
+          no('[UNAVAILABLE] Unexpected exception');
+          return;
+        }
+        if (fault === 'empty') {
+          this.writeSearch(ctx, tag, args, []);
+          ok('SEARCH completed');
+          return;
+        }
+      }
       const uids = searchUids(args, this.messages);
-      ctx.write(`* SEARCH ${uids.join(' ')}\r\n`);
+      this.writeSearch(ctx, tag, args, uids);
       ok('SEARCH completed');
       return;
     }
@@ -462,13 +481,15 @@ export class ScriptedImap {
         no('STORE failed');
         return;
       }
+      const targets = new Set(parseUidSet(argParts[1] ?? '', this.messages));
       if (this.options.modifiedStore && args.toUpperCase().includes('UNCHANGEDSINCE')) {
         ok('[MODIFIED 1] STORE completed');
         return;
       }
-      const uid = Number(argParts[1]);
-      const message = this.messages.find((item) => item.uid === uid);
-      if (message) {
+      for (const message of this.messages) {
+        if (!targets.has(message.uid)) {
+          continue;
+        }
         const flags = flagsIn(args);
         const upper = args.toUpperCase();
         if (upper.includes('-FLAGS')) {
@@ -491,19 +512,32 @@ export class ScriptedImap {
         no('COPY failed');
         return;
       }
-      const uid = Number(argParts[1]);
       const destination = unquote(argParts[argParts.length - 1] ?? '');
-      const source = this.messages.find((item) => item.uid === uid);
-      if (!source || !destination) {
+      const sources = parseUidSet(argParts[1] ?? '', this.messages)
+        .map((uid) => this.messages.find((item) => item.uid === uid))
+        .filter((item): item is ScriptedMessage => Boolean(item));
+      if (!destination || sources.length === 0) {
         no('COPY failed');
         return;
       }
       const copied = this.copies.get(destination) ?? [];
-      const newUid = this.nextUid;
-      this.nextUid += 1;
-      copied.push({ uid: newUid, raw: source.raw, flags: [...source.flags] });
+      const sourceUids: number[] = [];
+      const newUids: number[] = [];
+      for (const source of sources) {
+        const newUid = this.nextUid;
+        this.nextUid += 1;
+        copied.push({ uid: newUid, raw: source.raw, flags: [...source.flags] });
+        sourceUids.push(source.uid);
+        newUids.push(newUid);
+      }
       this.copies.set(destination, copied);
-      ok(`[COPYUID ${this.uidValidity} ${uid} ${newUid}] COPY completed`);
+      if (this.options.omitCopyUid) {
+        ok('COPY completed');
+        return;
+      }
+      ok(
+        `[COPYUID ${this.uidValidity} ${sourceUids.join(',')} ${newUids.join(',')}] COPY completed`,
+      );
       return;
     }
     if (command === 'UID' && args.toUpperCase().includes('MOVE')) {
@@ -556,12 +590,26 @@ export class ScriptedImap {
       return;
     }
     if (command === 'UID' && args.toUpperCase().startsWith('EXPUNGE')) {
-      const uid = Number(argParts[1]);
-      this.messages = this.messages.filter((message) => message.uid !== uid);
+      const targets = new Set(parseUidSet(argParts[1] ?? '', this.messages));
+      this.messages = this.messages.filter((message) => !targets.has(message.uid));
       ok('EXPUNGE completed');
       return;
     }
     bad(`Unsupported ${command}`);
+  }
+
+  private writeSearch(
+    ctx: { write: (line: string) => void },
+    tag: string,
+    args: string,
+    uids: number[],
+  ): void {
+    if (args.toUpperCase().includes('RETURN')) {
+      const listed = uids.length > 0 ? ` ALL ${uids.join(',')}` : '';
+      ctx.write(`* ESEARCH (TAG "${tag}") UID COUNT ${uids.length}${listed}\r\n`);
+      return;
+    }
+    ctx.write(`* SEARCH ${uids.join(' ')}\r\n`);
   }
 }
 
@@ -611,6 +659,28 @@ function headerOf(raw: string, name: string): string | undefined {
 
 function imapQuote(value: string): string {
   return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+
+function parseUidSet(token: string, messages: ScriptedMessage[]): number[] {
+  return searchUids(`UID ${token}`, messages);
+}
+
+/** iCloud faults, matched against the SEARCH command text. */
+function icloudCommandFault(args: string): 'empty' | 'unavailable' | null {
+  const upper = args.toUpperCase();
+  const text = /(?:FROM|TO|CC|BCC|SUBJECT|BODY|TEXT|HEADER|LARGER|SMALLER)/.test(upper);
+  const flag =
+    /(?:\bSEEN\b|\bUNSEEN\b|\bFLAGGED\b|\bUNFLAGGED\b|\bANSWERED\b|\bDELETED\b|\bDRAFT\b|\bKEYWORD\b)/.test(
+      upper,
+    );
+  const notUid = /NOT\s+UID\b/.test(upper) || /(?:^|\s)NOT\s+\d/.test(upper);
+  if (/NOT/.test(upper) && text && (flag || notUid || /\bUID\b/.test(upper))) {
+    return 'unavailable';
+  }
+  if (notUid) {
+    return 'empty';
+  }
+  return null;
 }
 
 function searchUids(args: string, messages: ScriptedMessage[]): number[] {

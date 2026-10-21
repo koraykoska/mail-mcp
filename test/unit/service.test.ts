@@ -185,7 +185,7 @@ describe('mail service against the in-memory session', () => {
     const ctx = service(session, appConfig({ readOnly: true, allowSend: false }));
     await expect(ctx.mail.createMailbox(undefined, 'X')).rejects.toThrow(/readOnly/);
     const writable = service(
-      new FakeSession(['IMAP4rev1']),
+      new FakeSession(['IMAP4rev1', 'MOVE', 'UIDPLUS']),
       appConfig({ sendRateLimit: { max: 1, windowMs: 60_000 } }),
     );
     await writable.mail.send({ to: ['ada@example.com'], subject: '1', text: 'a' });
@@ -219,7 +219,7 @@ describe('mail service against the in-memory session', () => {
       action: 'move',
       destination: 'Archive',
     });
-    await writable.mail.bulk({ mailbox: 'INBOX', uids: [1], action: 'delete' });
+    await writable.mail.bulk({ mailbox: 'Archive', uids: [1], action: 'delete' });
     const gmail = service(new FakeSession(['IMAP4rev1', 'X-GM-EXT-1', 'MOVE', 'UIDPLUS']));
     await gmail.mail.append({ mailbox: 'INBOX', subject: 'L', text: 'x', to: ['ada@example.com'] });
     await gmail.mail.bulk({ mailbox: 'INBOX', uids: [1], action: 'addLabels', labels: ['Work'] });

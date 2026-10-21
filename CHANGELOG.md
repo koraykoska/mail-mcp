@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Search AND is one SEARCH with the criteria side by side. A NOT over a UID set, a sequence set, or more than one criterion is computed from UID sets on the client, so the same query matches the same messages on iCloud, Gmail, Dovecot, and GreenMail. A text criterion combined with a UID or a flag is sent as that one SEARCH.
+- `PROTOCOL_ERROR` includes the server's `NO` or `BAD` text when the server sent one.
+- Bulk flag, copy, move, delete, label, and modify-by-search calls send UID sets in chunks of 25. `limits.bulkBudgetMs` (default 20000, maximum 50000) bounds the call. The result adds `complete`, `remaining`, and `stopped` (`budget`, `cancelled`, or null). Pass `remaining` back with the same action to resume. `ok` is true only when every requested UID was attempted and succeeded. `mail_modify_by_search` also returns `results` (empty on a dry run). Labels on a server without `X-GM-EXT-1` fail the call with `CAPABILITY_UNSUPPORTED`.
+- A move without the MOVE extension copies and expunges only UIDs confirmed by UIDPLUS `COPYUID`. Unconfirmed UIDs stay in the source mailbox and are reported. A duplicate in the destination can remain. Without MOVE and without UIDPLUS the move is `CAPABILITY_UNSUPPORTED`.
+
 ## 0.2.0
 
 - The Gmail `X-GM-THRID` and OBJECTID fast paths keep the earliest in-scope messages when `maxMessages` trips, using the same date, mailbox, and UID order as the header walk. Every id the capability search returned is still walked.

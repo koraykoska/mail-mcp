@@ -3,7 +3,12 @@ import {
   hasExactCapability as exactCapability,
 } from '../../src/imap/capabilities.js';
 import { MailError } from '../../src/errors.js';
-import type { CompiledSearch } from '../../src/imap/search.js';
+import {
+  evaluateSearch,
+  isClientQuery,
+  mentionsUidOrSeq,
+  type CompiledSearch,
+} from '../../src/imap/search.js';
 import type { SortKey } from '../../src/imap/sort.js';
 import type { ThreadNode } from '../../src/mime/thread.js';
 import type {
@@ -57,6 +62,26 @@ export class FakeSession implements ImapSession {
   /** UIDs that SEARCH and SORT still return, but FETCH omits. */
   ghostUids = new Set<number>();
   partBodies = new Map<string, { content: Buffer; contentType: string; filename?: string }>();
+  /** Wait before each mailbox command. Used to trip the bulk time budget. */
+  latencyMs = 0;
+  /** Called after each mailbox command's latency, before the command returns. */
+  afterCommand: (() => void) | undefined;
+  /**
+   * Treat `NOT UID` / `NOT <seq>` as an empty set, and reject a NOT that mixes
+   * a text test with a flag or UID test, matching iCloud.
+   */
+  emulateIcloud = false;
+  /** COPY succeeds and stores the messages, but omits COPYUID. */
+  suppressCopyUid = false;
+  /** Plain queries handed to the matcher, after client-side AND/NOT resolution. */
+  readonly searchLog: Record<string, unknown>[] = [];
+
+  async pace(): Promise<void> {
+    if (this.latencyMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, this.latencyMs));
+    }
+    this.afterCommand?.();
+  }
 
   constructor(
     capabilities: string[] = [
@@ -332,9 +357,26 @@ class FakeBox implements OpenMailbox {
   }
 
   async search(compiled: CompiledSearch): Promise<number[]> {
-    return this.box.messages
-      .filter((message) => matches(message, compiled.query))
-      .map((message) => message.uid);
+    await this.session.pace();
+    return evaluateSearch(compiled.query, async (query) => {
+      this.session.searchLog.push(query);
+      if (this.session.emulateIcloud) {
+        const fault = icloudSearchFault(query);
+        if (fault === 'unavailable') {
+          throw new MailError(
+            'PROTOCOL_ERROR',
+            'The mail server returned an error: NO [UNAVAILABLE] Unexpected exception',
+          );
+        }
+        if (fault === 'empty') {
+          return [];
+        }
+      }
+      return this.box.messages
+        .map((message, index) => ({ message, seq: index + 1 }))
+        .filter(({ message, seq }) => matches(message, query, seq))
+        .map(({ message }) => message.uid);
+    });
   }
 
   async fetchSummaries(
@@ -440,6 +482,7 @@ class FakeBox implements OpenMailbox {
     operation: 'add' | 'remove' | 'set',
     unchangedSince?: string,
   ): Promise<FlagUpdate> {
+    await this.session.pace();
     const missing: number[] = [];
     const modified: number[] = [];
     const updated: number[] = [];
@@ -470,6 +513,7 @@ class FakeBox implements OpenMailbox {
   }
 
   async setLabels(uids: number[]): Promise<void> {
+    await this.session.pace();
     if (!this.session.hasCapability('X-GM-EXT-1')) {
       throw new MailError(
         'CAPABILITY_UNSUPPORTED',
@@ -482,6 +526,7 @@ class FakeBox implements OpenMailbox {
   }
 
   async copy(uids: number[], destination: string): Promise<Record<string, number>> {
+    await this.session.pace();
     const dest = this.session.ensure(destination);
     const map: Record<string, number> = {};
     for (const uid of uids) {
@@ -494,21 +539,38 @@ class FakeBox implements OpenMailbox {
         flags: [...message.flags],
         raw: Buffer.from(message.raw),
       });
-      map[String(uid)] = next;
+      if (!this.session.suppressCopyUid) {
+        map[String(uid)] = next;
+      }
     }
     return map;
   }
 
-  async move(uids: number[], destination: string): Promise<Record<string, number>> {
-    if (!this.session.hasCapability('MOVE') && !this.session.hasCapability('UIDPLUS')) {
-      throw new MailError('PROTOCOL_ERROR', 'MOVE unavailable');
+  async move(
+    uids: number[],
+    destination: string,
+  ): Promise<{ map: Record<string, number>; kept: number[] }> {
+    await this.session.pace();
+    if (this.session.hasCapability('MOVE')) {
+      const map = await this.copy(uids, destination);
+      const moved = uids.filter((uid) => map[String(uid)] !== undefined);
+      this.box.messages = this.box.messages.filter((message) => !moved.includes(message.uid));
+      return { map, kept: uids.filter((uid) => map[String(uid)] === undefined) };
+    }
+    if (!this.session.hasCapability('UIDPLUS')) {
+      throw new MailError('CAPABILITY_UNSUPPORTED', 'This server has neither MOVE nor UIDPLUS.');
     }
     const map = await this.copy(uids, destination);
-    this.box.messages = this.box.messages.filter((message) => !uids.includes(message.uid));
-    return map;
+    const confirmed = uids.filter((uid) => map[String(uid)] !== undefined);
+    this.box.messages = this.box.messages.filter((message) => !confirmed.includes(message.uid));
+    return {
+      map,
+      kept: uids.filter((uid) => map[String(uid)] === undefined),
+    };
   }
 
   async expunge(uids?: number[]): Promise<void> {
+    await this.session.pace();
     if (uids && uids.length > 0) {
       this.box.messages = this.box.messages.filter((message) => !uids.includes(message.uid));
       return;
@@ -521,7 +583,7 @@ class FakeBox implements OpenMailbox {
     _keys: SortKey[],
     window?: { start: number; count: number },
   ): Promise<ServerSortResult | null> {
-    if (!this.session.hasCapability('SORT')) {
+    if (!this.session.hasCapability('SORT') || isClientQuery(compiled.query)) {
       return null;
     }
     const uids = (await this.search(compiled)).sort((left, right) => right - left);
@@ -555,69 +617,166 @@ class FakeBox implements OpenMailbox {
   }
 }
 
-function matches(message: StoredMessage, query: Record<string, unknown>): boolean {
+function matches(message: StoredMessage, query: Record<string, unknown>, seq: number): boolean {
   if (query.all === true && Object.keys(query).length === 1) {
     return true;
   }
-  if (typeof query.not === 'object' && query.not) {
-    return !matches(message, query.not as Record<string, unknown>);
-  }
-  if (Array.isArray(query.or)) {
-    return query.or.some((item) => matches(message, item as Record<string, unknown>));
-  }
-  if (query.seen === true && !message.flags.includes('\\Seen')) {
-    return false;
-  }
-  if (query.seen === false && message.flags.includes('\\Seen')) {
-    return false;
-  }
-  if (typeof query.uid === 'string' && !uidInSet(message.uid, query.uid)) {
-    return false;
-  }
-  if (query.flagged === true && !message.flags.includes('\\Flagged')) {
-    return false;
-  }
-  if (query.flagged === false && message.flags.includes('\\Flagged')) {
-    return false;
-  }
-  if (query.answered === true && !message.flags.includes('\\Answered')) {
-    return false;
-  }
-  if (query.answered === false && message.flags.includes('\\Answered')) {
-    return false;
-  }
-  if (query.header && typeof query.header === 'object') {
-    const entry = Object.entries(query.header as Record<string, unknown>)[0];
-    if (entry) {
-      const raw = header(message.raw, entry[0]);
-      if (!raw) {
-        return false;
-      }
-      if (typeof entry[1] === 'string' && !raw.toLowerCase().includes(entry[1].toLowerCase())) {
-        return false;
-      }
+  for (const [key, value] of Object.entries(query)) {
+    if (key === 'all') {
+      continue;
     }
-  }
-  if (typeof query.from === 'string' && !(message.from ?? '').includes(String(query.from))) {
-    return false;
-  }
-  if (
-    typeof query.subject === 'string' &&
-    !(message.subject ?? '').includes(String(query.subject))
-  ) {
-    return false;
-  }
-  const text = message.raw.toString('utf8');
-  if (typeof query.text === 'string' && !text.includes(String(query.text))) {
-    return false;
-  }
-  if (typeof query.threadId === 'string') {
-    const threadId = header(message.raw, 'x-gm-thrid');
-    if (!threadId || threadId !== query.threadId) {
+    if (key === 'not' && value && typeof value === 'object') {
+      if (matches(message, value as Record<string, unknown>, seq)) {
+        return false;
+      }
+      continue;
+    }
+    if (key === 'or' && Array.isArray(value)) {
+      if (!value.some((item) => matches(message, item as Record<string, unknown>, seq))) {
+        return false;
+      }
+      continue;
+    }
+    if (!matchesKey(message, key, value, seq)) {
       return false;
     }
   }
   return true;
+}
+
+function matchesKey(message: StoredMessage, key: string, value: unknown, seq: number): boolean {
+  if (key === 'seen') {
+    const seen = message.flags.includes('\\Seen');
+    return value === true ? seen : value === false ? !seen : true;
+  }
+  if (key === 'flagged') {
+    const flagged = message.flags.includes('\\Flagged');
+    return value === true ? flagged : value === false ? !flagged : true;
+  }
+  if (key === 'answered') {
+    const answered = message.flags.includes('\\Answered');
+    return value === true ? answered : value === false ? !answered : true;
+  }
+  if (key === 'uid' && typeof value === 'string') {
+    return uidInSet(message.uid, value);
+  }
+  if (key === 'seq' && typeof value === 'string') {
+    return uidInSet(seq, value);
+  }
+  if (key === 'header' && value && typeof value === 'object') {
+    const entry = Object.entries(value as Record<string, unknown>)[0];
+    if (!entry) {
+      return true;
+    }
+    const raw = header(message.raw, entry[0]);
+    if (!raw) {
+      return false;
+    }
+    if (typeof entry[1] === 'string' && !raw.toLowerCase().includes(entry[1].toLowerCase())) {
+      return false;
+    }
+    return true;
+  }
+  if (key === 'from' && typeof value === 'string') {
+    return (message.from ?? '').includes(value);
+  }
+  if (key === 'subject' && typeof value === 'string') {
+    return (message.subject ?? '').includes(value);
+  }
+  if (key === 'text' && typeof value === 'string') {
+    return message.raw.toString('utf8').includes(value);
+  }
+  if (key === 'threadId' && typeof value === 'string') {
+    return header(message.raw, 'x-gm-thrid') === value;
+  }
+  return true;
+}
+
+const TEXT_KEYS = new Set([
+  'from',
+  'to',
+  'cc',
+  'bcc',
+  'subject',
+  'body',
+  'text',
+  'header',
+  'larger',
+  'smaller',
+]);
+const FLAG_KEYS = new Set([
+  'seen',
+  'answered',
+  'flagged',
+  'deleted',
+  'draft',
+  'recent',
+  'keyword',
+  'unkeyword',
+  'unKeyword',
+]);
+
+/**
+ * iCloud's SEARCH faults, applied to a query object before it is matched.
+ * `empty` is `NOT UID` / `NOT <sequence>` (the result is nothing).
+ * `unavailable` is a NOT that mixes a text test with a flag or UID test.
+ */
+export function icloudSearchFault(query: unknown): 'empty' | 'unavailable' | null {
+  return faultWalk(query);
+}
+
+function faultWalk(query: unknown): 'empty' | 'unavailable' | null {
+  if (!query || typeof query !== 'object') {
+    return null;
+  }
+  if (Array.isArray(query)) {
+    for (const item of query) {
+      const found = faultWalk(item);
+      if (found) {
+        return found;
+      }
+    }
+    return null;
+  }
+  const record = query as Record<string, unknown>;
+  if (record.not && typeof record.not === 'object') {
+    const inner = record.not;
+    const text = hasKey(inner, TEXT_KEYS);
+    const flag = hasKey(inner, FLAG_KEYS);
+    const uid = mentionsUidOrSeq(inner);
+    if (text && (flag || uid)) {
+      return 'unavailable';
+    }
+    if (uid) {
+      return 'empty';
+    }
+  }
+  for (const value of Object.values(record)) {
+    const found = faultWalk(value);
+    if (found) {
+      return found;
+    }
+  }
+  return null;
+}
+
+function hasKey(value: unknown, keys: Set<string>): boolean {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+  if (Array.isArray(value)) {
+    return value.some((item) => hasKey(item, keys));
+  }
+  const record = value as Record<string, unknown>;
+  for (const [key, nested] of Object.entries(record)) {
+    if (keys.has(key)) {
+      return true;
+    }
+    if (hasKey(nested, keys)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function uidInSet(uid: number, set: string): boolean {

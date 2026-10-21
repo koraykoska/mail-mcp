@@ -108,6 +108,30 @@ There is no config key for a default folder list. The defaults live on the tools
 
 `folders` may be one mailbox path, a list, a special-use flag such as `\Sent`, a glob such as `Projects/*`, the string `all`, or an object `{ all, mailboxes, specialUse, globs, exclude, includeTrash, includeJunk }`. `all` skips Trash and Junk unless they are named, or `includeTrash` / `includeJunk` is true. Multi-folder reads run one mailbox at a time on one IMAP connection. `maxPerFolder` caps how many messages are scanned in a folder when the server cannot sort the whole snapshot. The default and the maximum are `limits.maxSortCandidates` (5000). A truncated folder reports `truncated`, `omitted`, and `scanned`. `mail_list_correspondents`, and the sender and attachment counts of `mail_search_facets`, ignore that window and read every match in batches of 200, up to 10000 messages per folder. Above that cap `truncated` and `partial` are true and the counts cover only the scanned prefix. Flag counts stay exact. `mail_list_threads` reports `source: "server"` only for a single folder whose THREAD tree was used. One `threadKey` identifies the conversation: the earliest message in the set that has no parent, by its Message-ID, or by mailbox, UIDVALIDITY, and UID when it has none.
 
+### Search
+
+Criteria in one search object are sent as one IMAP SEARCH, with the keys side by side. That is how IMAP expresses AND, and it means the same thing on iCloud, Gmail, Dovecot, and GreenMail. A `NOT` of a UID set, a sequence set, or more than one criterion is not sent to the server. The client searches for the positive set and for every message in the folder, then returns the difference. A single text key or a single flag can still be negated on the server.
+
+When the server answers `NO` or `BAD`, the tool error is `PROTOCOL_ERROR` and the message includes that response text.
+
+### Bulk changes
+
+`mail_set_flags`, `mail_copy_messages`, `mail_move_messages`, `mail_delete_messages`, `mail_set_labels`, `mail_bulk_modify`, and a real `mail_modify_by_search` send UID sets (`UID STORE`, `UID COPY`, `UID MOVE`, `UID EXPUNGE`) in chunks of 25. They stop between chunks when `limits.bulkBudgetMs` elapses or the client cancels the request. An in-flight chunk is allowed to finish. Nothing about the batch is stored on the server. Call again with `remaining` and the same action to continue.
+
+| Field       | Meaning                                                                                                                                                                                                                                                                              |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `complete`  | False when some UIDs were not attempted. True for a dry run of `mail_modify_by_search`.                                                                                                                                                                                              |
+| `remaining` | UIDs not attempted, in request order. Empty when `complete` is true. On `mail_modify_by_search` each entry is `{ mailbox, uid }`, in folder order.                                                                                                                                   |
+| `stopped`   | `budget` when the time budget or a timeout stopped the call, `cancelled` when the client aborted, or null when every requested UID was attempted. A command that fails after some UIDs succeeded also leaves this null: those UIDs are in `results` and the rest are in `remaining`. |
+| `ok`        | True only when `complete` is true and every per-UID result succeeded.                                                                                                                                                                                                                |
+| `results`   | One entry per attempted UID (`uid`, `ok`, and `code` / `message` when it failed). Copy and move include `value`, the destination UID when UIDPLUS returned one. `mail_modify_by_search` returns this list, empty on a dry run.                                                       |
+
+`limits.bulkBudgetMs` defaults to 20000 and cannot be set above 50000, so the call returns inside a 60 second request limit. A timeout or a dropped connection puts the in-flight chunk back into `remaining` and sets `stopped` to `budget`. Repeating that chunk can copy a message twice. It does not remove a message whose copy was not confirmed.
+
+A move uses `UID MOVE` when the server advertises MOVE. Otherwise it copies, then expunges only the UIDs named by UIDPLUS `COPYUID`. A UID the server does not confirm stays in the source mailbox, with `ok: false` and a message that the original was left in place. A duplicate in the destination can remain. A server with neither MOVE nor UIDPLUS is refused with `CAPABILITY_UNSUPPORTED`. `allowPermanentDelete` does not permit expunging every `\Deleted` message in order to finish that move. Copy does not need `COPYUID`.
+
+`mail_modify_by_search` still returns `SIZE_LIMIT` and changes nothing when the match count is above `maxBulk` or a folder was truncated. The time budget applies only after that check.
+
 ## Configuration
 
 Accounts come from a JSON or JSONC file, environment variables, or both. The checked-in schema is [`schema/config.schema.json`](schema/config.schema.json) (JSON Schema draft-07, generated from the zod schema in `src/config/schema.ts`). Regenerate it with `npx tsx scripts/generate-config-schema.ts`. A unit test fails when the file drifts. The same page is summarized in [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
@@ -176,6 +200,7 @@ Set on the root, on an account, or both. Account keys win. All values are positi
 | `maxMessageBytes`    | 36700160 (35 MiB) | Largest raw message fetched or appended.                                                                                                                                                                                                       |
 | `maxSortCandidates`  | 5000              | Default and maximum for `maxPerFolder`. A folder that exceeds it is truncated and reports `omitted` and `scanned`.                                                                                                                             |
 | `maxBulk`            | 200               | Most UIDs in one bulk flag, move, or copy, and the most matches `mail_modify_by_search` will change when `dryRun` is false. A real run that did not load every match, or that truncated a folder, fails with `SIZE_LIMIT` and changes nothing. |
+| `bulkBudgetMs`       | 20000             | Wall-clock budget for one bulk flag, copy, move, delete, label, or modify-by-search call. The call stops between chunks of 25 and returns `remaining`. Maximum 50000, so the call finishes inside a 60 second request limit.                   |
 
 ### Accounts and provider presets
 
@@ -309,6 +334,7 @@ Three accounts. The iCloud mailbox sends as `user@icloud.com` and as `me@example
     "maxMessageBytes": 36700160,
     "maxSortCandidates": 5000,
     "maxBulk": 200,
+    "bulkBudgetMs": 20000,
   },
   "accounts": {
     "icloud": {

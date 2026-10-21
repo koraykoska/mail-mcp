@@ -142,7 +142,14 @@ export interface OpenMailbox {
   ): Promise<FlagUpdate>;
   setLabels(uids: number[], labels: string[], operation: 'add' | 'remove' | 'set'): Promise<void>;
   copy(uids: number[], destination: string): Promise<Record<string, number>>;
-  move(uids: number[], destination: string): Promise<Record<string, number>>;
+  /**
+   * Move UIDs. `kept` lists source UIDs that were not removed because the
+   * server did not confirm the copy. Those originals are still in the mailbox.
+   */
+  move(
+    uids: number[],
+    destination: string,
+  ): Promise<{ map: Record<string, number>; kept: number[] }>;
   expunge(uids?: number[]): Promise<void>;
   /** Null when the server has no SORT extension. A refused SORT throws. */
   serverSort(
@@ -215,6 +222,8 @@ export interface ImapSession {
   connect(): Promise<void>;
   logout(): Promise<void>;
   close(): void;
+  /** Bound the next command's socket timeout. The pool restores the account timeout afterwards. */
+  setCommandTimeout?(timeoutMs: number): void;
   /**
    * The pool calls this once, after the session is tracked.
    * Invoke the handler when the socket fails or closes on its own so the slot can be dropped.

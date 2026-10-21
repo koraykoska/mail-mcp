@@ -66,6 +66,12 @@ function textOf(error: ErrorLike): string {
   if (typeof error.message === 'string') {
     parts.push(error.message);
   }
+  if (typeof error.responseText === 'string') {
+    parts.push(error.responseText);
+  }
+  if (typeof error.responseStatus === 'string') {
+    parts.push(error.responseStatus);
+  }
   if (typeof error.response === 'string') {
     parts.push(error.response);
   }
@@ -73,6 +79,22 @@ function textOf(error: ErrorLike): string {
     parts.push(error.code);
   }
   return parts.join(' ');
+}
+
+/** Tagged NO/BAD text, when the library kept it. Preferred over a generic message. */
+export function serverRefusal(error: unknown): string {
+  const like = asErrorLike(error);
+  const status = typeof like.responseStatus === 'string' ? like.responseStatus : '';
+  const text = typeof like.responseText === 'string' ? like.responseText : '';
+  if (status !== 'NO' && status !== 'BAD' && !text) {
+    return '';
+  }
+  const detail = [status === 'NO' || status === 'BAD' ? status : '', text]
+    .filter(Boolean)
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return detail.slice(0, 400);
 }
 
 /**
@@ -183,7 +205,8 @@ export function mapTransportError(error: unknown): MailError {
     );
   }
 
-  const safe = text.replace(/\s+/g, ' ').trim().slice(0, 400);
+  const refusal = serverRefusal(like);
+  const safe = (refusal || text).replace(/\s+/g, ' ').trim().slice(0, 400);
   return new MailError(
     'PROTOCOL_ERROR',
     safe ? `The mail server returned an error: ${safe}` : 'The mail server returned an error.',

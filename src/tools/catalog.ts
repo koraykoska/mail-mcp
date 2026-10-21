@@ -37,6 +37,23 @@ const baseOut = {
   account: z.string().describe('Account id that handled the call.'),
 };
 
+const bulkProgress = {
+  complete: z
+    .boolean()
+    .describe(
+      'False when limits.bulkBudgetMs elapsed, or the client cancelled, before every UID was attempted. Resume with remaining. Nothing about the batch is stored on the server.',
+    ),
+  remaining: z
+    .array(z.number())
+    .describe('UIDs not attempted, in request order. Empty when complete is true.'),
+  stopped: z
+    .enum(['budget', 'cancelled'])
+    .nullable()
+    .describe(
+      'budget when the time budget stopped the call between chunks, cancelled when the client aborted, or null when every UID was attempted.',
+    ),
+};
+
 const pageFields = {
   items: z
     .array(z.record(z.string(), z.unknown()))
@@ -926,7 +943,7 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_set_flags',
     title: 'Add, remove, or replace flags',
     description:
-      'Change flags or keywords on one or more UIDs. operation add is +FLAGS, remove is -FLAGS, set replaces the whole flag set (FLAGS). Adding or removing \\Deleted, and a set that would clear \\Deleted, require allowDelete. System flags may be written "\\\\Seen" or "seen". Custom keywords must not contain spaces. unchangedSince is the CONDSTORE UNCHANGEDSINCE mod-sequence; omit it when the server has no CONDSTORE. Blocked when the account is readOnly. Does not expunge. ok is false when any UID failed; uids lists only the UIDs that changed.',
+      'Change flags or keywords on one or more UIDs. operation add is +FLAGS, remove is -FLAGS, set replaces the whole flag set (FLAGS). The UIDs go out as UID STORE sets, in chunks, not one command per UID. Adding or removing \\Deleted, and a set that would clear \\Deleted, require allowDelete. System flags may be written "\\\\Seen" or "seen". Custom keywords must not contain spaces. unchangedSince is the CONDSTORE UNCHANGEDSINCE mod-sequence; omit it when the server has no CONDSTORE. Blocked when the account is readOnly. Does not expunge. ok is false when any UID failed or the call stopped early; uids lists only the UIDs that changed. complete, remaining, and stopped say whether the caller must resume.',
     input: z.object({
       account: fields.account,
       mailbox: fields.mailbox,
@@ -960,6 +977,7 @@ export const TOOLS: ToolDefinition[] = [
           })
           .strict(),
       ),
+      ...bulkProgress,
     }),
     annotations: {
       readOnlyHint: false,
@@ -977,7 +995,7 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_copy_messages',
     title: 'Copy messages',
     description:
-      'COPY UIDs to another mailbox, leaving the originals. Requires the destination to exist. Returns per-UID results and, when UIDPLUS is available, the new UID. Blocked when readOnly. Prefer mail_move_messages when the original should disappear.',
+      'COPY UIDs to another mailbox as one UID COPY per chunk, leaving the originals. Requires the destination to exist. Returns per-UID results and, when UIDPLUS is available, the new UID. complete is false and remaining lists UIDs not attempted when the time budget or cancellation stops the call. Blocked when readOnly. Prefer mail_move_messages when the original should disappear.',
     input: z.object({
       account: fields.account,
       mailbox: fields.mailbox,
@@ -991,6 +1009,7 @@ export const TOOLS: ToolDefinition[] = [
       destination: z.string(),
       move: z.boolean(),
       results: z.array(z.record(z.string(), z.unknown())),
+      ...bulkProgress,
     }),
     annotations: {
       readOnlyHint: false,
@@ -1008,7 +1027,7 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_move_messages',
     title: 'Move messages',
     description:
-      'Move UIDs to another mailbox. Uses MOVE when the server advertises it. Otherwise copies, sets \\Deleted, and UID EXPUNGEs, which requires UIDPLUS. Without MOVE and UIDPLUS the call is refused, because a plain EXPUNGE would remove every \\Deleted message. allowPermanentDelete does not permit that. Requires allowDelete. Destination must exist.',
+      'Move UIDs to another mailbox in chunks. Uses UID MOVE when the server advertises MOVE. Otherwise UID COPY, then UID EXPUNGE of only the UIDs named by COPYUID. A UID the server does not confirm is left in place and reported; a duplicate in the destination is acceptable, losing the original is not. Without MOVE and UIDPLUS the call is refused, because a plain EXPUNGE would remove every \\Deleted message. allowPermanentDelete does not permit that. Requires allowDelete. Destination must exist. complete is false and remaining lists UIDs not attempted when the time budget or cancellation stops the call.',
     input: z.object({
       account: fields.account,
       mailbox: fields.mailbox,
@@ -1022,6 +1041,7 @@ export const TOOLS: ToolDefinition[] = [
       destination: z.string(),
       move: z.boolean(),
       results: z.array(z.record(z.string(), z.unknown())),
+      ...bulkProgress,
     }),
     annotations: {
       readOnlyHint: false,
@@ -1060,6 +1080,7 @@ export const TOOLS: ToolDefinition[] = [
       results: z.array(z.record(z.string(), z.unknown())).optional(),
       destination: z.string().optional(),
       move: z.boolean().optional(),
+      ...bulkProgress,
     }),
     annotations: {
       readOnlyHint: false,
@@ -1178,6 +1199,7 @@ export const TOOLS: ToolDefinition[] = [
           })
           .strict(),
       ),
+      ...bulkProgress,
     }),
     annotations: {
       readOnlyHint: false,
@@ -1195,7 +1217,7 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_bulk_modify',
     title: 'Bulk modify messages',
     description:
-      'Apply one action to many UIDs and return a per-UID result. Actions: addFlags, removeFlags, setFlags, copy, move, delete, addLabels, removeLabels. delete uses the Trash move unless permanent is true. copy and move need destination. Flag actions need flags. Label actions need labels and Gmail. The call itself succeeds when the batch was attempted; inspect results[].ok. UIDs above maxBulk are rejected up front.',
+      'Apply one action to many UIDs and return a per-UID result. UIDs are sent as set commands in chunks (UID STORE, UID COPY, UID MOVE, or UID EXPUNGE), not one round trip per message. Actions: addFlags, removeFlags, setFlags, copy, move, delete, addLabels, removeLabels. delete uses the Trash move unless permanent is true. A move without the MOVE extension copies and expunges only UIDs confirmed by COPYUID. copy and move need destination. Flag actions need flags. Label actions need labels and Gmail. The call itself succeeds when the batch was attempted; inspect results[].ok. complete is false and remaining lists UIDs not attempted when limits.bulkBudgetMs elapses or the client cancels. Pass remaining back to resume. UIDs above maxBulk are rejected up front.',
     input: z.object({
       account: fields.account,
       mailbox: fields.mailbox,
@@ -1229,6 +1251,7 @@ export const TOOLS: ToolDefinition[] = [
       mailbox: z.string(),
       action: z.string(),
       results: z.array(z.record(z.string(), z.unknown())),
+      ...bulkProgress,
     }),
     annotations: {
       readOnlyHint: false,
@@ -1906,7 +1929,7 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_modify_by_search',
     title: 'Modify messages that match a search',
     description:
-      'Apply addFlags, removeFlags, move, or archive to every message in a folder scope that matches search. dryRun defaults to true and only pages a preview. A real run is refused with SIZE_LIMIT, and changes nothing, when the match count exceeds limits.maxBulk or any folder is truncated or not fully loaded. move and archive require allowDelete. Adding or removing \\Deleted does too. There is no permanent delete here. The preview uses the shared snapshot cursor. The tool is a write: a readOnly account does not advertise it.',
+      'Apply addFlags, removeFlags, move, or archive to every message in a folder scope that matches search. dryRun defaults to true and only pages a preview. A real run is refused with SIZE_LIMIT, and changes nothing, when the match count exceeds limits.maxBulk or any folder is truncated or not fully loaded. The change uses the same chunked UID sets as the other bulk tools, and stops between chunks when limits.bulkBudgetMs elapses or the client cancels. complete is false and remaining lists mailbox and UID pairs not attempted. move and archive require allowDelete. Adding or removing \\Deleted does too. A move without MOVE expunges only COPYUID-confirmed UIDs. There is no permanent delete here. The preview uses the shared snapshot cursor. The tool is a write: a readOnly account does not advertise it.',
     input: z.object({
       account: fields.account,
       mailbox: fields.mailbox.optional(),
@@ -1931,6 +1954,19 @@ export const TOOLS: ToolDefinition[] = [
       action: z.string(),
       matched: z.number(),
       offset: z.number(),
+      complete: z
+        .boolean()
+        .describe('True for a dry run, and for a real run that attempted every match.'),
+      remaining: z
+        .array(z.object({ mailbox: z.string(), uid: z.number() }).strict())
+        .describe('Matches not attempted, in folder order. Empty when complete is true.'),
+      stopped: z
+        .enum(['budget', 'cancelled'])
+        .nullable()
+        .describe('Why a real run stopped early, or null.'),
+      results: z
+        .array(z.record(z.string(), z.unknown()))
+        .describe('Per-UID outcome of a real run. Empty on a dry run.'),
     }),
     annotations: {
       readOnlyHint: false,
