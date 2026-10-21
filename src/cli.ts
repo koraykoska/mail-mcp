@@ -9,6 +9,7 @@ import { assertSupportedNode } from './runtime-check.js';
 import { startHttpServer } from './http.js';
 import { createLogger, parseLogLevel } from './log.js';
 import { redactText, redactValue } from './redact.js';
+import { ensureAttachmentsDir } from './fs-sandbox.js';
 import { createRuntime } from './runtime.js';
 import { createMcpServer } from './server.js';
 import { SERVER_NAME, VERSION } from './version.js';
@@ -63,6 +64,13 @@ export async function run(argv: string[], env: NodeJS.ProcessEnv = process.env):
     }
   }
   const logger = createLogger({ level: config.logLevel, secrets: config.secrets });
+  if (config.attachmentsDir) {
+    try {
+      config = { ...config, attachmentsDir: await ensureAttachmentsDir(config.attachmentsDir) };
+    } catch (error) {
+      return fail(error, env, config.secrets);
+    }
+  }
   const runtime = createRuntime({ config, logger });
   if (args.check) {
     try {

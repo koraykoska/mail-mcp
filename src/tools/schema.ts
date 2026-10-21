@@ -230,7 +230,9 @@ const attachment = z
     filename: z
       .string()
       .optional()
-      .describe('File name shown to the recipient. Example: "notes.pdf".'),
+      .describe(
+        'File name shown to the recipient. Example: "notes.pdf". When omitted and path is set, the basename of path is used (the path you passed, not a symlink target). A forwarded attachment keeps the original file name. A contentBase64 part with no filename is named by the composer.',
+      ),
     contentType: z
       .string()
       .optional()
@@ -247,7 +249,7 @@ const attachment = z
       .string()
       .optional()
       .describe(
-        'Absolute or process-relative filesystem path to read. The server reads the file locally.',
+        'Absolute or process-relative filesystem path to read. Requires attachmentsDir. The resolved path must stay inside that directory. mail-mcp creates attachmentsDir when it is missing and does not create a directory from this path. A missing file is NOT_FOUND.',
       ),
     cid: z
       .string()

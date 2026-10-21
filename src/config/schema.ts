@@ -177,7 +177,9 @@ export const configFileSchema = z
       .string()
       .min(1)
       .optional()
-      .describe('If set, mail_download_attachment can only write inside this directory.'),
+      .describe(
+        'Directory attachment path reads and savePath writes must stay inside. Created at startup and before use when missing, mode 0700. Subdirectories of a caller path are not created.',
+      ),
     limits: limitsSchema.partial().optional(),
     accounts: z.record(z.string().min(1), accountSchema).optional(),
   })

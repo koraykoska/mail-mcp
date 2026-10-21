@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- `mail_create_reply_draft` and `mail_create_forward_draft` save a reply or a forward in Drafts with `\Draft` and return the new UID. They use the same composition as `mail_reply_message` and `mail_forward_message` (threading headers, subject, quoting, recipients, identity, and for a forward the original attachments) and do not send. `allowSend` is not required. The original message is not marked answered or forwarded. `mail_update_draft` copies `In-Reply-To` and `References` from the stored draft onto the replacement, and does not append the replacement when that draft cannot be read. `mail_send_draft` sends those headers intact. Custom headers still cannot set `In-Reply-To` or `References`.
+- An attachment `path` with no `filename` uses the basename of the path that was passed. A forwarded attachment keeps its original file name. An explicit `filename` wins.
+- When `attachmentsDir` is set, mail-mcp creates that directory if it is missing, at startup and again before a path is read or a `savePath` is written. A directory it creates is mode `0700`. An existing directory keeps its mode. A directory derived from a caller path is not created. A missing file or a missing directory inside `attachmentsDir` is `NOT_FOUND`. A failure to create `attachmentsDir` is `CONFIG_ERROR` and names the config key and the path.
+
 ## 0.3.0
 
 - Search AND is one SEARCH with the criteria side by side. A NOT over a UID set, a sequence set, or more than one criterion is computed from UID sets on the client, so the same query matches the same messages on iCloud, Gmail, Dovecot, and GreenMail. A text criterion combined with a UID or a flag is sent as that one SEARCH.

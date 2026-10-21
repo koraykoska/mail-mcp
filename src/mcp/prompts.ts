@@ -38,7 +38,7 @@ export function registerPrompts(server: McpServer): void {
     {
       title: 'Draft a reply',
       description:
-        'Instructions for drafting a reply to one UID. The caller should fetch the message and then either show the draft or send it with mail_reply_message after confirmation.',
+        'Instructions for drafting a reply to one UID. The caller should fetch the message, save it with mail_create_reply_draft, and send it with mail_reply_message or mail_send_draft only after confirmation.',
       argsSchema: {
         account: z.string().optional().describe('Account id.'),
         mailbox: z.string().describe('Mailbox path. Usually INBOX.'),
@@ -58,8 +58,9 @@ export function registerPrompts(server: McpServer): void {
               args.instruction
                 ? `Instruction from the user: ${args.instruction}`
                 : 'Keep the reply short and specific.',
-              'Show the draft and wait for confirmation before calling mail_reply_message.',
-              'When sending, pass the same mailbox and uid so In-Reply-To and References are set for you.',
+              'Save it with mail_create_reply_draft (same mailbox and uid) so In-Reply-To, References, and the quoted body are stored in Drafts without sending.',
+              'Show that draft and wait for confirmation before calling mail_reply_message or mail_send_draft.',
+              'mail_reply_message sends immediately. mail_send_draft sends the saved draft and keeps its threading headers.',
             ].join('\n'),
           },
         },

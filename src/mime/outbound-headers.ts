@@ -29,7 +29,7 @@ const FIELD_NAME = /^[!-9;-~]+$/;
 
 /**
  * Custom `headers` may set these names, plus any X-* field that is not a routing alias.
- * In-Reply-To and References are set only by the reply path.
+ * In-Reply-To and References are set only by reply and by mail_create_reply_draft.
  */
 export const HEADER_ALLOWLIST = new Set([
   'list-unsubscribe',
