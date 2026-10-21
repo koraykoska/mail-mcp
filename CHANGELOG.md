@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0
 
 - `mail_create_reply_draft` and `mail_create_forward_draft` save a reply or a forward in Drafts with `\Draft` and return the new UID. They use the same composition as `mail_reply_message` and `mail_forward_message` (threading headers, subject, quoting, recipients, identity, and for a forward the original attachments) and do not send. `allowSend` is not required. The original message is not marked answered or forwarded. `mail_update_draft` copies `In-Reply-To` and `References` from the stored draft onto the replacement, and does not append the replacement when that draft cannot be read. `mail_send_draft` sends those headers intact. Custom headers still cannot set `In-Reply-To` or `References`.
 - An attachment `path` with no `filename` uses the basename of the path that was passed. A forwarded attachment keeps its original file name. An explicit `filename` wins.
