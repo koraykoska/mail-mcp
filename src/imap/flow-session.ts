@@ -8,19 +8,19 @@ import {
   type SearchObject,
 } from 'imapflow';
 import { searchCompiler } from 'imapflow/lib/search-compiler.js';
-import { MailError, mapMailboxOpenError, mapTransportError } from '../errors.js';
+import { MailError, mapMailboxOpenError, mapTransportError, serverRefusal } from '../errors.js';
 import { capabilityMatches, hasExactCapability as exactCapability } from './capabilities.js';
 import { headerValue, messageIds } from '../mime/headers.js';
 import { decodeTransfer, parseSequenceSet } from '../mime/transfer.js';
 import { VERSION } from '../version.js';
-import type { ResolvedAccount } from '../config/schema.js';
+import { boundedCommandTimeout, type ResolvedAccount } from '../config/schema.js';
 import { dialTarget } from '../net/connect.js';
 import type { Logger } from '../log.js';
 import { decodeBody } from '../charset.js';
 import { findTextPart } from '../mime/parse.js';
 import { makeSnippet, htmlToRoughText } from '../mime/snippet.js';
 import type { ThreadNode } from '../mime/thread.js';
-import type { CompiledSearch } from './search.js';
+import { evaluateSearch, isClientQuery, isMatchAll, type CompiledSearch } from './search.js';
 import { sortKeyToImap, type SortKey } from './sort.js';
 import { flagsToList, normalizeFlags } from './flags.js';
 import {
@@ -54,7 +54,10 @@ interface RawClient {
     command: string,
     attributes: unknown,
     options?: {
-      untagged?: Record<string, (untagged: { attributes?: ImapAttr[] }) => void | Promise<void>>;
+      untagged?: Record<
+        string,
+        (untagged: { attributes?: ImapAttr[]; numbers?: number[] }) => void | Promise<void>
+      >;
     },
   ): Promise<{ next: () => IteratorResult<unknown> | void }>;
   preCheck?: (() => Promise<void>) | false;
@@ -74,7 +77,29 @@ export class ImapFlowSession implements ImapSession {
   private onDead: (() => void) | undefined;
   /** Clients closed on purpose. Their error and close events must not evict the pool slot. */
   private readonly retiring = new WeakSet<ImapFlow>();
+  /** Latest tagged NO or BAD captured from the IMAP logger. Search turns a refusal into false. */
+  private lastRefusal = '';
+  /** Socket or timeout failure seen in the IMAP logger. A dead session is not a NO/BAD. */
+  private lastBreak: 'timeout' | 'connection' | null = null;
   readonly capabilities = new Map<string, boolean | number>();
+  private readonly imapLogger = {
+    trace: (): void => undefined,
+    debug: (): void => undefined,
+    info: (): void => undefined,
+    error: (): void => undefined,
+    fatal: (): void => undefined,
+    warn: (entry: unknown): void => {
+      const detail = refusalFromLog(entry);
+      if (detail) {
+        this.lastRefusal = detail;
+        return;
+      }
+      const kind = breakFromLog(entry);
+      if (kind) {
+        this.lastBreak = kind;
+      }
+    },
+  };
 
   constructor(
     private readonly account: ResolvedAccount,
@@ -96,6 +121,29 @@ export class ImapFlowSession implements ImapSession {
       return false;
     }
     return client.enabled.has('CONDSTORE') || client.enabled.has('QRESYNC');
+  }
+
+  /**
+   * Same decision imapflow uses. ENABLE must have taken effect, or the greeting
+   * must be rev2-only. Advertising IMAP4rev2 next to IMAP4rev1 does not count.
+   */
+  rev2Active(): boolean {
+    const client = this.client;
+    if (!client) {
+      return false;
+    }
+    return (
+      client.enabled.has('IMAP4REV2') ||
+      (client.capabilities.has('IMAP4rev2') && !client.capabilities.has('IMAP4rev1'))
+    );
+  }
+
+  moveSupported(): boolean {
+    return this.hasCapability('MOVE') || this.rev2Active();
+  }
+
+  uidPlusSupported(): boolean {
+    return this.hasCapability('UIDPLUS') || this.rev2Active();
   }
 
   serverId(): Record<string, string> | null {
@@ -125,7 +173,7 @@ export class ImapFlowSession implements ImapSession {
   }
 
   idleBudgetMs(): number {
-    return this.account.imap.timeoutMs;
+    return boundedCommandTimeout(this.account.imap.timeoutMs);
   }
 
   /** Remember a parser-size failure even when the command later rejects with a follow-on error. */
@@ -180,6 +228,82 @@ export class ImapFlowSession implements ImapSession {
     } catch {
       client.close();
     }
+  }
+
+  clearRefusal(): void {
+    this.lastRefusal = '';
+    this.lastBreak = null;
+  }
+
+  /** PROTOCOL_ERROR that keeps the server's NO or BAD text when the logger saw one. */
+  refused(fallback: string, hint?: string): MailError {
+    const detail = this.lastRefusal;
+    this.lastRefusal = '';
+    return new MailError(
+      'PROTOCOL_ERROR',
+      detail ? `The mail server returned an error: ${detail}` : fallback,
+      hint,
+    );
+  }
+
+  /**
+   * A command that returned false or undefined. A logged NO/BAD on a live session
+   * stays PROTOCOL_ERROR. A timeout, a logged socket error, or a session that is
+   * no longer usable is not a per-UID failure.
+   */
+  commandFailure(fallback: string, hint?: string): MailError {
+    return this.failureFromState(fallback, hint);
+  }
+
+  /** A command that threw. Connection loss and timeouts are not protocol refusals. */
+  failTransport(error: unknown, fallback: string, hint?: string): MailError {
+    if (error instanceof MailError) {
+      return error;
+    }
+    const mapped = mapTransportError(error);
+    if (mapped.code === 'TIMEOUT' || mapped.code === 'CONNECTION_FAILED') {
+      this.lastBreak = null;
+      this.lastRefusal = '';
+      return mapped;
+    }
+    const fromState = this.failureFromState(fallback, hint);
+    if (fromState.code === 'CONNECTION_FAILED' || fromState.code === 'TIMEOUT') {
+      return fromState;
+    }
+    if (serverRefusal(error)) {
+      return mapped;
+    }
+    return fromState;
+  }
+
+  private failureFromState(fallback: string, hint?: string): MailError {
+    const kind = this.lastBreak;
+    this.lastBreak = null;
+    if (kind === 'timeout') {
+      this.lastRefusal = '';
+      return new MailError(
+        'TIMEOUT',
+        'The mail server did not respond in time.',
+        'Increase imap.timeoutMs, and confirm the host and port are reachable.',
+      );
+    }
+    if (kind === 'connection' || this.hasFailed()) {
+      this.lastRefusal = '';
+      return new MailError(
+        'CONNECTION_FAILED',
+        'The connection to the mail server failed or was closed.',
+        'The command was not confirmed. Resume with the UIDs that were in flight.',
+      );
+    }
+    return this.refused(fallback, hint);
+  }
+
+  setCommandTimeout(timeoutMs: number): void {
+    const client = this.client;
+    if (!client || timeoutMs <= 0) {
+      return;
+    }
+    replaceSocketTimeout(client, timeoutMs);
   }
 
   close(): void {
@@ -643,11 +767,11 @@ export class ImapFlowSession implements ImapSession {
       servername: dial.servername,
       secure: endpoint.secure,
       tls,
-      logger: false,
+      logger: this.imapLogger,
       disableAutoIdle: true,
-      connectionTimeout: endpoint.timeoutMs,
-      greetingTimeout: Math.min(endpoint.timeoutMs, 16_000),
-      socketTimeout: endpoint.timeoutMs,
+      connectionTimeout: boundedCommandTimeout(endpoint.timeoutMs),
+      greetingTimeout: Math.min(boundedCommandTimeout(endpoint.timeoutMs), 16_000),
+      socketTimeout: boundedCommandTimeout(endpoint.timeoutMs),
       clientInfo: { name: 'mail-mcp', version: VERSION },
       auth: await this.authOptions(),
       qresync: true,
@@ -764,29 +888,139 @@ class FlowMailbox implements OpenMailbox {
   }
 
   async search(compiled: CompiledSearch): Promise<number[]> {
-    const esearch =
-      this.session.hasCapability('ESEARCH') || this.session.hasCapability('IMAP4REV2');
-    const result = esearch
-      ? await this.client.search(compiled.query as SearchObject, {
-          uid: true,
-          returnOptions: ['ALL', 'COUNT'],
-        })
-      : await this.client.search(compiled.query as SearchObject, { uid: true });
-    if (result === false) {
+    return evaluateSearch(compiled.query, (query) => this.searchPlain(query));
+  }
+
+  private async searchPlain(query: Record<string, unknown>): Promise<number[]> {
+    const esearch = this.session.hasCapability('ESEARCH') || this.session.rev2Active();
+    this.session.clearRefusal();
+    const hint =
+      'The mailbox was not empty; the search itself failed. Narrow the criteria or check capabilities.';
+    if (esearch) {
+      return this.readSearchUids(query, hint);
+    }
+    let result: Awaited<ReturnType<ImapFlow['search']>>;
+    try {
+      result = await this.client.search(query as SearchObject, { uid: true });
+    } catch (error) {
+      throw this.session.failTransport(error, 'The server refused the SEARCH command.', hint);
+    }
+    // imapflow returns undefined when no mailbox is selected, and false when the
+    // socket dies without a tagged NO/BAD. Neither one is an empty match.
+    if (result == null || !this.client.usable || !this.client.mailbox) {
       throw new MailError(
-        'PROTOCOL_ERROR',
-        'The server refused the SEARCH command.',
-        'The mailbox was not empty; the search itself failed. Narrow the criteria or check capabilities.',
+        'CONNECTION_FAILED',
+        'The connection to the mail server failed or was closed.',
+        'The search did not finish on a selected mailbox, so no UID is reported missing.',
       );
     }
-    if (!result) {
-      return [];
+    if (result === false) {
+      throw this.session.commandFailure('The server refused the SEARCH command.', hint);
     }
     if (Array.isArray(result)) {
       return result;
     }
-    if (result.all) {
-      return parseSequenceSet(result.all);
+    return [];
+  }
+
+  /**
+   * One UID SEARCH. `*` is not expanded and the command is not repeated.
+   * A second answer can name different messages while the mailbox size stays
+   * the same, so a starred or unreadable set is refused instead.
+   */
+  private async readSearchUids(query: Record<string, unknown>, hint: string): Promise<number[]> {
+    if (!this.client.usable || !this.client.mailbox || this.session.hasFailed()) {
+      throw new MailError(
+        'CONNECTION_FAILED',
+        'The connection to the mail server failed or was closed.',
+        'The search did not finish on a selected mailbox, so no UID is reported missing.',
+      );
+    }
+    const fromSearch: number[] = [];
+    const fromEsearch: number[] = [];
+    let sawSearch = false;
+    let sawEsearchAll = false;
+    let sawStar = false;
+    let count = 0;
+    const criteria = searchAttributes(this.client, { query, requires: [] });
+    const raw = this.client as unknown as RawClient;
+    try {
+      const response = await raw.exec(
+        'UID SEARCH',
+        [
+          { type: 'ATOM', value: 'RETURN' },
+          [
+            { type: 'ATOM', value: 'ALL' },
+            { type: 'ATOM', value: 'COUNT' },
+          ],
+          ...(Array.isArray(criteria) ? criteria : [criteria]),
+        ],
+        {
+          untagged: {
+            SEARCH: (untagged) => {
+              sawSearch = true;
+              const parsed = searchLineUids(untagged);
+              if (parsed.star) {
+                sawStar = true;
+                return;
+              }
+              fromSearch.push(...parsed.uids);
+            },
+            ESEARCH: (untagged) => {
+              const parsed = esearchUidList(untagged.attributes);
+              if (parsed.count !== undefined) {
+                count = parsed.count;
+              }
+              if (!parsed.present) {
+                return;
+              }
+              sawEsearchAll = true;
+              if (!parsed.explicit) {
+                sawStar = true;
+                return;
+              }
+              fromEsearch.push(...parsed.uids);
+            },
+          },
+        },
+      );
+      response.next();
+    } catch (error) {
+      throw this.session.failTransport(error, 'The server refused the SEARCH command.', hint);
+    }
+    if (!this.client.usable || !this.client.mailbox || this.session.hasFailed()) {
+      throw new MailError(
+        'CONNECTION_FAILED',
+        'The connection to the mail server failed or was closed.',
+        'The search did not finish on a selected mailbox, so no UID is reported missing.',
+      );
+    }
+    if (sawStar) {
+      throw new MailError(
+        'PROTOCOL_ERROR',
+        'The server answered with a UID set containing *, which cannot be resolved safely; no message was changed. Repeat the search.',
+      );
+    }
+    const searchUids = normalizeUids(fromSearch);
+    const esearchUids = normalizeUids(fromEsearch);
+    if (sawSearch && sawEsearchAll && !sameUids(searchUids, esearchUids)) {
+      throw new MailError(
+        'PROTOCOL_ERROR',
+        'The server returned two different UID lists for one search, so neither list was used.',
+        'Repeat the search. No message was changed from this result.',
+      );
+    }
+    if (sawEsearchAll) {
+      return esearchUids;
+    }
+    if (sawSearch) {
+      return searchUids;
+    }
+    if (count > 0) {
+      throw new MailError(
+        'PROTOCOL_ERROR',
+        'The server answered with a UID set containing *, which cannot be resolved safely; no message was changed. Repeat the search.',
+      );
     }
     return [];
   }
@@ -971,6 +1205,23 @@ class FlowMailbox implements OpenMailbox {
     return toBodyNode(row.bodyStructure);
   }
 
+  private async commandResult<T>(
+    run: () => Promise<T>,
+    fallback: string,
+    hint?: string,
+  ): Promise<Exclude<T, false | undefined | null | ''>> {
+    let result: T;
+    try {
+      result = await run();
+    } catch (error) {
+      throw error instanceof MailError ? error : this.session.failTransport(error, fallback, hint);
+    }
+    if (!result) {
+      throw this.session.commandFailure(fallback, hint);
+    }
+    return result as Exclude<T, false | undefined | null | ''>;
+  }
+
   async setFlags(
     uids: number[],
     flags: string[],
@@ -1006,15 +1257,16 @@ class FlowMailbox implements OpenMailbox {
     }
     const options = { uid: true };
     const range = uidList(targets);
-    const ok =
-      operation === 'add'
-        ? await this.client.messageFlagsAdd(range, normalized, options)
-        : operation === 'remove'
-          ? await this.client.messageFlagsRemove(range, normalized, options)
-          : await this.client.messageFlagsSet(range, normalized, options);
-    if (!ok) {
-      throw new MailError('PROTOCOL_ERROR', 'The server rejected the flag update.');
-    }
+    this.session.clearRefusal();
+    await this.commandResult(
+      () =>
+        operation === 'add'
+          ? this.client.messageFlagsAdd(range, normalized, options)
+          : operation === 'remove'
+            ? this.client.messageFlagsRemove(range, normalized, options)
+            : this.client.messageFlagsSet(range, normalized, options),
+      'The server rejected the flag update.',
+    );
     return { updated: targets, modified: [], missing };
   }
 
@@ -1069,39 +1321,74 @@ class FlowMailbox implements OpenMailbox {
     }
     const range = uidList(uids);
     const options = { uid: true, useLabels: true };
-    const ok =
-      operation === 'add'
-        ? await this.client.messageFlagsAdd(range, labels, options)
-        : operation === 'remove'
-          ? await this.client.messageFlagsRemove(range, labels, options)
-          : await this.client.messageFlagsSet(range, labels, options);
-    if (!ok) {
-      throw new MailError('PROTOCOL_ERROR', 'The server rejected the label update.');
-    }
+    this.session.clearRefusal();
+    await this.commandResult(
+      () =>
+        operation === 'add'
+          ? this.client.messageFlagsAdd(range, labels, options)
+          : operation === 'remove'
+            ? this.client.messageFlagsRemove(range, labels, options)
+            : this.client.messageFlagsSet(range, labels, options),
+      'The server rejected the label update.',
+    );
   }
 
   async copy(uids: number[], destination: string): Promise<Record<string, number>> {
-    const result = await this.client.messageCopy(uidList(uids), destination, { uid: true });
-    if (!result) {
-      throw new MailError('PROTOCOL_ERROR', `COPY to "${destination}" failed.`);
-    }
+    this.session.clearRefusal();
+    const result = await this.commandResult(
+      () => this.client.messageCopy(uidList(uids), destination, { uid: true }),
+      `COPY to "${destination}" failed.`,
+    );
     return uidMapToRecord(result.uidMap);
   }
 
-  async move(uids: number[], destination: string): Promise<Record<string, number>> {
-    const result = await this.client.messageMove(uidList(uids), destination, { uid: true });
-    if (!result) {
-      throw new MailError('PROTOCOL_ERROR', `MOVE to "${destination}" failed.`);
+  async move(
+    uids: number[],
+    destination: string,
+  ): Promise<{ map: Record<string, number>; kept: number[] }> {
+    if (uids.length === 0) {
+      return { map: {}, kept: [] };
     }
-    return uidMapToRecord(result.uidMap);
+    // imapflow's fallback marks the whole range \Deleted and then expunges it,
+    // including messages the COPY did not confirm. Do that ourselves.
+    if (!this.session.moveSupported()) {
+      if (!this.session.uidPlusSupported()) {
+        throw new MailError(
+          'CAPABILITY_UNSUPPORTED',
+          'This server has neither MOVE nor UIDPLUS. Copying and then expunging would remove every \\Deleted message, not only the requested UIDs.',
+          'Use a server with MOVE or UIDPLUS. allowPermanentDelete is not consent to expunge unrelated messages.',
+        );
+      }
+      const copied = await this.copy(uids, destination);
+      const confirmed = uids.filter((uid) => copied[String(uid)] !== undefined);
+      const kept = uids.filter((uid) => copied[String(uid)] === undefined);
+      if (confirmed.length > 0) {
+        await this.expunge(confirmed);
+      }
+      const map: Record<string, number> = {};
+      for (const uid of confirmed) {
+        const destinationUid = copied[String(uid)];
+        if (destinationUid !== undefined) {
+          map[String(uid)] = destinationUid;
+        }
+      }
+      return { map, kept };
+    }
+    this.session.clearRefusal();
+    const result = await this.commandResult(
+      () => this.client.messageMove(uidList(uids), destination, { uid: true }),
+      `MOVE to "${destination}" failed.`,
+    );
+    return { map: uidMapToRecord(result.uidMap), kept: [] };
   }
 
   async expunge(uids?: number[]): Promise<void> {
     if (uids && uids.length > 0) {
-      const ok = await this.client.messageDelete(uidList(uids), { uid: true });
-      if (!ok) {
-        throw new MailError('PROTOCOL_ERROR', 'EXPUNGE of the requested UIDs failed.');
-      }
+      this.session.clearRefusal();
+      await this.commandResult(
+        () => this.client.messageDelete(uidList(uids), { uid: true }),
+        'EXPUNGE of the requested UIDs failed.',
+      );
       return;
     }
     const raw = this.client as unknown as RawClient;
@@ -1114,7 +1401,7 @@ class FlowMailbox implements OpenMailbox {
     keys: SortKey[],
     window?: { start: number; count: number },
   ): Promise<ServerSortResult | null> {
-    if (!this.session.hasCapability('SORT') || keys.length === 0) {
+    if (!this.session.hasCapability('SORT') || keys.length === 0 || isClientQuery(compiled.query)) {
       return null;
     }
     const searchParts = sortSearchParts(this.client, compiled);
@@ -1163,9 +1450,20 @@ class FlowMailbox implements OpenMailbox {
           const response = await raw.exec('UID SORT', attempt.args, {
             untagged: {
               SORT: (untagged) => {
-                for (const attribute of untagged.attributes ?? []) {
-                  const value = Number(attribute.value);
-                  if (Number.isInteger(value)) {
+                const attributes = (untagged.attributes ?? []) as unknown[];
+                for (let index = 0; index < attributes.length; index += 1) {
+                  const attribute = attributes[index];
+                  // (MODSEQ n) is a parenthesized modifier. A bare MODSEQ atom is the same value.
+                  if (Array.isArray(attribute)) {
+                    continue;
+                  }
+                  const token = attrText(attribute);
+                  if (token.toUpperCase() === 'MODSEQ') {
+                    index += 1;
+                    continue;
+                  }
+                  const value = Number(token);
+                  if (Number.isInteger(value) && value > 0) {
                     numbers.push(value);
                   }
                 }
@@ -1315,10 +1613,21 @@ class FlowMailbox implements OpenMailbox {
                   }
                   for (let index = 0; index < nodes.length; index += 1) {
                     const node = nodes[index];
+                    if (Array.isArray(node)) {
+                      visit(node);
+                      continue;
+                    }
                     const token = String(node?.value ?? '').toUpperCase();
                     const next = nodes[index + 1];
-                    if (token === 'UID' && next?.value !== undefined) {
-                      uid = Number(next.value);
+                    if (token === 'MODSEQ') {
+                      index += 1;
+                      continue;
+                    }
+                    if (token === 'UID' && next?.value !== undefined && !Array.isArray(next)) {
+                      const parsed = Number(next.value);
+                      if (Number.isInteger(parsed) && parsed > 0) {
+                        uid = parsed;
+                      }
                     }
                     if (token === 'PREVIEW' && typeof next?.value === 'string') {
                       preview = next.value;
@@ -1633,11 +1942,6 @@ function searchAttributes(client: ImapFlow, compiled: CompiledSearch): unknown {
   return searchCompiler(client, compiled.query as SearchObject);
 }
 
-function isMatchAll(query: Record<string, unknown>): boolean {
-  const keys = Object.keys(query);
-  return keys.length === 1 && keys[0] === 'all' && query.all === true;
-}
-
 function modifiedFromResponse(response: unknown): number[] {
   const found: string[] = [];
   collectModified(response, found);
@@ -1683,8 +1987,15 @@ function esearchNumbers(attributes: ImapAttr[]): { uids: number[]; count?: numbe
       const token = String(node?.value ?? '').toUpperCase();
       const next = nodes[index + 1];
       const nextAttr = Array.isArray(next) ? undefined : (next as ImapAttr | undefined);
+      // MIN, MAX, and MODSEQ are one number each. None of them is the match list.
+      if (token === 'MIN' || token === 'MAX' || token === 'MODSEQ') {
+        continue;
+      }
       if (token === 'COUNT' && nextAttr?.value !== undefined) {
-        count = Number(nextAttr.value);
+        const parsed = Number(nextAttr.value);
+        if (Number.isInteger(parsed) && parsed >= 0) {
+          count = parsed;
+        }
       }
       if (token === 'ALL' && next !== undefined) {
         const text = sequenceText(next);
@@ -1787,6 +2098,169 @@ export function parseThreadNode(attribute: ImapAttr): ThreadNode {
     children.push(parseThreadNode(item));
   });
   return { uid, children };
+}
+
+function refusalFromLog(entry: unknown): string {
+  if (!entry || typeof entry !== 'object') {
+    return '';
+  }
+  const err = (entry as { err?: unknown }).err;
+  return serverRefusal(err);
+}
+
+const EXPLICIT_UID_SET = /^\d+(:\d+)?(,\d+(:\d+)?)*$/;
+
+function attrText(node: unknown): string {
+  if (!node || typeof node !== 'object' || Array.isArray(node)) {
+    return '';
+  }
+  const value = (node as ImapAttr).value;
+  return value === undefined ? '' : String(value);
+}
+
+/**
+ * UIDs from one untagged SEARCH line. A parenthesized `(MODSEQ n)` and a bare
+ * MODSEQ atom are the highest mod-sequence of the matches, not another UID.
+ * `*` is not expanded.
+ */
+function searchLineUids(untagged: { attributes?: ImapAttr[]; numbers?: number[] }): {
+  star: boolean;
+  uids: number[];
+} {
+  if (Array.isArray(untagged.numbers)) {
+    return {
+      star: false,
+      uids: untagged.numbers.filter((value) => Number.isInteger(value) && value > 0),
+    };
+  }
+  const uids: number[] = [];
+  let star = false;
+  const attributes = (untagged.attributes ?? []) as unknown[];
+  for (let index = 0; index < attributes.length; index += 1) {
+    const attribute = attributes[index];
+    if (Array.isArray(attribute)) {
+      continue;
+    }
+    const value = attrText(attribute);
+    if (value.toUpperCase() === 'MODSEQ') {
+      index += 1;
+      continue;
+    }
+    if (value.includes('*')) {
+      star = true;
+      continue;
+    }
+    if (EXPLICIT_UID_SET.test(value)) {
+      uids.push(...parseSequenceSet(value));
+    }
+  }
+  return { star, uids };
+}
+
+function esearchUidList(attributes: ImapAttr[] | undefined): {
+  present: boolean;
+  star: boolean;
+  explicit: boolean;
+  uids: number[];
+  count?: number;
+} {
+  const nodes = (attributes ?? []) as unknown[];
+  let index = 0;
+  if (Array.isArray(nodes[0])) {
+    index += 1;
+  }
+  if (attrText(nodes[index]).toUpperCase() === 'UID') {
+    index += 1;
+  }
+  let present = false;
+  let star = false;
+  let explicit = false;
+  const uids: number[] = [];
+  let count: number | undefined;
+  while (index < nodes.length) {
+    const key = attrText(nodes[index]).toUpperCase();
+    if (!key) {
+      index += 1;
+      continue;
+    }
+    const next = nodes[index + 1];
+    if (key === 'COUNT') {
+      const text = attrText(next);
+      if (/^\d+$/.test(text)) {
+        count = Number(text);
+      }
+      index += 2;
+      continue;
+    }
+    if (key === 'MIN' || key === 'MAX' || key === 'MODSEQ' || key === 'PARTIAL') {
+      index += 2;
+      continue;
+    }
+    if (key === 'ALL') {
+      present = true;
+      const set = attrText(next);
+      if (!EXPLICIT_UID_SET.test(set)) {
+        star = set.includes('*');
+        explicit = false;
+        uids.length = 0;
+      } else {
+        explicit = true;
+        star = false;
+        uids.push(...parseSequenceSet(set));
+      }
+      index += 2;
+      continue;
+    }
+    index += 2;
+  }
+  return {
+    present,
+    star,
+    explicit,
+    uids,
+    ...(count !== undefined ? { count } : {}),
+  };
+}
+
+function normalizeUids(uids: number[]): number[] {
+  return [...new Set(uids)]
+    .filter((uid) => Number.isInteger(uid) && uid > 0)
+    .sort((left, right) => left - right);
+}
+
+function sameUids(left: number[], right: number[]): boolean {
+  return left.length === right.length && left.every((uid, index) => uid === right[index]);
+}
+
+function breakFromLog(entry: unknown): 'timeout' | 'connection' | null {
+  if (!entry || typeof entry !== 'object') {
+    return null;
+  }
+  const err = (entry as { err?: unknown }).err;
+  if (!err || typeof err !== 'object' || serverRefusal(err)) {
+    return null;
+  }
+  const like = err as { code?: unknown; message?: unknown };
+  const code = typeof like.code === 'string' ? like.code : '';
+  const message = typeof like.message === 'string' ? like.message.toLowerCase() : '';
+  if (code === 'ETIMEDOUT' || code === 'ESOCKETTIMEDOUT' || /timeout|timed out/.test(message)) {
+    return 'timeout';
+  }
+  if (
+    code === 'NoConnection' ||
+    code === 'EConnectionClosed' ||
+    code === 'ECONNRESET' ||
+    code === 'EPIPE' ||
+    code === 'ECONNREFUSED' ||
+    code === 'ClosedAfterConnectText' ||
+    code === 'ClosedAfterConnectTLS' ||
+    /connection not available|socket is already closed|socket closed|econnreset|epipe|connection closed|unexpected close|closedafterconnecttext/.test(
+      message,
+    )
+  ) {
+    return 'connection';
+  }
+  return null;
 }
 
 function replaceSocketTimeout(client: ImapFlow, timeoutMs: number): number {

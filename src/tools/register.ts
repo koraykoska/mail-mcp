@@ -1,5 +1,6 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { isMailError, mapTransportError, type MailError } from '../errors.js';
+import { runWithRequest } from '../request-context.js';
 import { redactText } from '../redact.js';
 import { anyAccountAllows } from '../safety.js';
 import type { MailService } from '../service/mail-service.js';
@@ -26,9 +27,11 @@ export function registerTools(server: McpServer, service: MailService): ToolDefi
           ...tool.annotations,
         },
       },
-      async (args) => {
+      async (args, extra) => {
         try {
-          const data = await tool.run((args ?? {}) as Record<string, unknown>, service);
+          const data = await runWithRequest(extra.signal, () =>
+            tool.run((args ?? {}) as Record<string, unknown>, service),
+          );
           return {
             content: [{ type: 'text', text: renderToolText(data) }],
             structuredContent: data,

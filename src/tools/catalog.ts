@@ -37,6 +37,25 @@ const baseOut = {
   account: z.string().describe('Account id that handled the call.'),
 };
 
+const bulkProgress = {
+  complete: z
+    .boolean()
+    .describe(
+      'False when the call stopped before every UID was attempted. Chunks that finished are already applied. Resume with remaining. Repeating an in-flight chunk can copy a message twice. It does not remove a message whose copy was not confirmed.',
+    ),
+  remaining: z
+    .array(z.number())
+    .describe(
+      'UIDs not attempted, in request order. Includes the in-flight chunk when the call stopped for the budget, a dropped connection, or cancellation. Empty when complete is true.',
+    ),
+  stopped: z
+    .enum(['budget', 'cancelled', 'connection'])
+    .nullable()
+    .describe(
+      'budget when the time budget stopped the call before the next chunk. The budget includes waiting for a connection. cancelled when the client aborted. connection when the connection failed or the session was unusable during a chunk; that chunk is in remaining and was not confirmed. null when every UID was attempted, or when a command failed after some UIDs succeeded: those UIDs are in results and later UIDs are in remaining.',
+    ),
+};
+
 const pageFields = {
   items: z
     .array(z.record(z.string(), z.unknown()))
@@ -584,7 +603,7 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_search_messages',
     title: 'Search messages',
     description:
-      'Search with the full structured IMAP SEARCH grammar (from, to, cc, bcc, subject, body, text, header, internal and sent dates, larger/smaller, flags and keywords, UID and sequence sets, NOT/OR/AND, MODSEQ, and Gmail X-GM-RAW / thread id / labels when the server supports them). Same paging and summaries as mail_list_messages. Use this tool, not mail_list_messages, when the user describes what to find. An empty search object is rejected. ESEARCH is used internally when ImapFlow can; the result you see is always a paged list plus total.',
+      'Search with the full structured IMAP SEARCH grammar (from, to, cc, bcc, subject, body, text, header, internal and sent dates, larger/smaller, flags and keywords, UID and sequence sets, NOT/OR/AND, MODSEQ, and Gmail X-GM-RAW / thread id / labels when the server supports them). Same paging and summaries as mail_list_messages. Use this tool, not mail_list_messages, when the user describes what to find. An empty search object is rejected. ESEARCH is used internally when the server advertises it. A response that contains `*`, or that is not a fully explicit UID list, is PROTOCOL_ERROR and no message is changed. An explicit list is returned as a paged list plus total. A `(MODSEQ n)` modifier on the response is not a match.',
     input: z.object({
       account: fields.account,
       mailbox: fields.mailbox.optional(),
@@ -926,7 +945,7 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_set_flags',
     title: 'Add, remove, or replace flags',
     description:
-      'Change flags or keywords on one or more UIDs. operation add is +FLAGS, remove is -FLAGS, set replaces the whole flag set (FLAGS). Adding or removing \\Deleted, and a set that would clear \\Deleted, require allowDelete. System flags may be written "\\\\Seen" or "seen". Custom keywords must not contain spaces. unchangedSince is the CONDSTORE UNCHANGEDSINCE mod-sequence; omit it when the server has no CONDSTORE. Blocked when the account is readOnly. Does not expunge. ok is false when any UID failed; uids lists only the UIDs that changed.',
+      'Change flags or keywords on one or more UIDs. operation add is +FLAGS, remove is -FLAGS, set replaces the whole flag set (FLAGS). The UIDs go out as UID STORE sets, in chunks, not one command per UID. Adding or removing \\Deleted, and a set that would clear \\Deleted, require allowDelete. System flags may be written "\\\\Seen" or "seen". Custom keywords must not contain spaces. unchangedSince is the CONDSTORE UNCHANGEDSINCE mod-sequence; omit it when the server has no CONDSTORE. Blocked when the account is readOnly. Does not expunge. ok is false when any UID failed or the call stopped early; uids lists only the UIDs that changed. complete, remaining, and stopped say whether the caller must resume.',
     input: z.object({
       account: fields.account,
       mailbox: fields.mailbox,
@@ -960,6 +979,7 @@ export const TOOLS: ToolDefinition[] = [
           })
           .strict(),
       ),
+      ...bulkProgress,
     }),
     annotations: {
       readOnlyHint: false,
@@ -977,7 +997,7 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_copy_messages',
     title: 'Copy messages',
     description:
-      'COPY UIDs to another mailbox, leaving the originals. Requires the destination to exist. Returns per-UID results and, when UIDPLUS is available, the new UID. Blocked when readOnly. Prefer mail_move_messages when the original should disappear.',
+      'COPY UIDs to another mailbox as one UID COPY per chunk, leaving the originals. Requires the destination to exist. Returns per-UID results and, when UIDPLUS is available, the new UID. complete is false and remaining lists UIDs not attempted when the time budget elapses, the connection drops, or the client cancels. Blocked when readOnly. Prefer mail_move_messages when the original should disappear.',
     input: z.object({
       account: fields.account,
       mailbox: fields.mailbox,
@@ -991,6 +1011,7 @@ export const TOOLS: ToolDefinition[] = [
       destination: z.string(),
       move: z.boolean(),
       results: z.array(z.record(z.string(), z.unknown())),
+      ...bulkProgress,
     }),
     annotations: {
       readOnlyHint: false,
@@ -1008,7 +1029,7 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_move_messages',
     title: 'Move messages',
     description:
-      'Move UIDs to another mailbox. Uses MOVE when the server advertises it. Otherwise copies, sets \\Deleted, and UID EXPUNGEs, which requires UIDPLUS. Without MOVE and UIDPLUS the call is refused, because a plain EXPUNGE would remove every \\Deleted message. allowPermanentDelete does not permit that. Requires allowDelete. Destination must exist.',
+      'Move UIDs to another mailbox in chunks. Uses UID MOVE when the server advertises MOVE or IMAP4rev2 is active. Otherwise UID COPY, then UID EXPUNGE of only the UIDs named by COPYUID. UIDPLUS is decided the same way: advertised, or IMAP4rev2 active. A bare IMAP4rev2 token next to IMAP4rev1 is not enough. A UID the server does not confirm is left in place and reported; a duplicate in the destination is acceptable, losing the original is not. Without MOVE and UIDPLUS the call is refused, because a plain EXPUNGE would remove every \\Deleted message. allowPermanentDelete does not permit that. Requires allowDelete. Destination must exist. complete is false and remaining lists UIDs not attempted when the time budget elapses, the connection drops, or the client cancels.',
     input: z.object({
       account: fields.account,
       mailbox: fields.mailbox,
@@ -1022,6 +1043,7 @@ export const TOOLS: ToolDefinition[] = [
       destination: z.string(),
       move: z.boolean(),
       results: z.array(z.record(z.string(), z.unknown())),
+      ...bulkProgress,
     }),
     annotations: {
       readOnlyHint: false,
@@ -1039,7 +1061,7 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_delete_messages',
     title: 'Delete messages',
     description:
-      'Delete UIDs. By default they are moved to the resolved Trash mailbox (special-use, config, or a well-known name). permanent true UID EXPUNGEs only those UIDs and requires both allowPermanentDelete and UIDPLUS. Without UIDPLUS the call is refused rather than expunging every \\Deleted message. Deleting messages that are already in Trash requires permanent true. Requires allowDelete. Adding \\Deleted via mail_set_flags is the same delete permission. Use mail_expunge_mailbox only when you intend to purge every \\Deleted message in a mailbox.',
+      'Delete UIDs. By default they are moved to the resolved Trash mailbox (special-use, config, or a well-known name). permanent true UID EXPUNGEs only those UIDs and requires both allowPermanentDelete and UIDPLUS. UIDPLUS counts when it is advertised or when IMAP4rev2 is active. Without it the call is refused rather than expunging every \\Deleted message. Deleting messages that are already in Trash requires permanent true. Requires allowDelete. Adding \\Deleted via mail_set_flags is the same delete permission. Use mail_expunge_mailbox only when you intend to purge every \\Deleted message in a mailbox. complete is false and remaining lists UIDs not attempted when the time budget elapses, the connection drops, or the client cancels.',
     input: z.object({
       account: fields.account,
       mailbox: fields.mailbox,
@@ -1060,6 +1082,7 @@ export const TOOLS: ToolDefinition[] = [
       results: z.array(z.record(z.string(), z.unknown())).optional(),
       destination: z.string().optional(),
       move: z.boolean().optional(),
+      ...bulkProgress,
     }),
     annotations: {
       readOnlyHint: false,
@@ -1178,6 +1201,7 @@ export const TOOLS: ToolDefinition[] = [
           })
           .strict(),
       ),
+      ...bulkProgress,
     }),
     annotations: {
       readOnlyHint: false,
@@ -1195,7 +1219,7 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_bulk_modify',
     title: 'Bulk modify messages',
     description:
-      'Apply one action to many UIDs and return a per-UID result. Actions: addFlags, removeFlags, setFlags, copy, move, delete, addLabels, removeLabels. delete uses the Trash move unless permanent is true. copy and move need destination. Flag actions need flags. Label actions need labels and Gmail. The call itself succeeds when the batch was attempted; inspect results[].ok. UIDs above maxBulk are rejected up front.',
+      'Apply one action to many UIDs and return a per-UID result. UIDs are sent as set commands in chunks (UID STORE, UID COPY, UID MOVE, or UID EXPUNGE), not one round trip per message. Actions: addFlags, removeFlags, setFlags, copy, move, delete, addLabels, removeLabels. delete uses the Trash move unless permanent is true. A move without MOVE copies and expunges only UIDs confirmed by COPYUID. MOVE and UIDPLUS count as available when advertised, or when IMAP4rev2 is active. copy and move need destination. Flag actions need flags. Label actions need labels and Gmail. ok is false when any UID failed or the call stopped early. complete is false and remaining lists UIDs not attempted when the time budget elapses, the connection drops, or the client cancels. A dropped connection sets stopped to connection. Pass remaining back to resume. UIDs above maxBulk are rejected up front.',
     input: z.object({
       account: fields.account,
       mailbox: fields.mailbox,
@@ -1229,6 +1253,7 @@ export const TOOLS: ToolDefinition[] = [
       mailbox: z.string(),
       action: z.string(),
       results: z.array(z.record(z.string(), z.unknown())),
+      ...bulkProgress,
     }),
     annotations: {
       readOnlyHint: false,
@@ -1906,7 +1931,7 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_modify_by_search',
     title: 'Modify messages that match a search',
     description:
-      'Apply addFlags, removeFlags, move, or archive to every message in a folder scope that matches search. dryRun defaults to true and only pages a preview. A real run is refused with SIZE_LIMIT, and changes nothing, when the match count exceeds limits.maxBulk or any folder is truncated or not fully loaded. move and archive require allowDelete. Adding or removing \\Deleted does too. There is no permanent delete here. The preview uses the shared snapshot cursor. The tool is a write: a readOnly account does not advertise it.',
+      'Apply addFlags, removeFlags, move, or archive to every message in a folder scope that matches search. dryRun defaults to true and only pages a preview. A real run is refused with SIZE_LIMIT, and changes nothing, when the match count exceeds limits.maxBulk or any folder is truncated or not fully loaded. The change uses the same chunked UID sets as the other bulk tools. limits.bulkBudgetMs covers waiting for a connection, the folder scan, and the chunks. The call stops before the next chunk when that budget elapses, the connection drops, or the client cancels. complete is false and remaining lists mailbox and UID pairs that were found and not attempted. When the scan stops before every folder, remaining is empty, nothing is changed, and stopped is budget: repeat the same search. A partial list is not returned, because resuming it would skip folders that were not scanned. When the scan finishes and the budget stops before a chunk, remaining lists every match. An empty remaining with stopped budget means repeat the same search. move and archive require allowDelete. Adding or removing \\Deleted does too. A move without MOVE expunges only COPYUID-confirmed UIDs. MOVE and UIDPLUS count as available when advertised, or when IMAP4rev2 is active. There is no permanent delete here. The preview uses the shared snapshot cursor. The tool is a write: a readOnly account does not advertise it.',
     input: z.object({
       account: fields.account,
       mailbox: fields.mailbox.optional(),
@@ -1931,6 +1956,25 @@ export const TOOLS: ToolDefinition[] = [
       action: z.string(),
       matched: z.number(),
       offset: z.number(),
+      complete: z
+        .boolean()
+        .describe(
+          'True for a dry run that finished, and for a real run that attempted every match. False when the call stopped early. Chunks that finished are already applied.',
+        ),
+      remaining: z
+        .array(z.object({ mailbox: z.string(), uid: z.number() }).strict())
+        .describe(
+          'Matches that were found and not attempted, in folder order. Empty when complete is true. When the scan stops before every folder, this is empty and nothing was changed: repeat the same search. When the scan finishes and the budget stops before a chunk, this lists every match.',
+        ),
+      stopped: z
+        .enum(['budget', 'cancelled', 'connection'])
+        .nullable()
+        .describe(
+          'budget when the time budget, including the connection wait and the folder scan, stopped the call before the next chunk. cancelled when the client aborted. connection when the connection failed during a chunk; that chunk is in remaining and was not confirmed. null when every match was attempted, or when a command failed after some matches succeeded.',
+        ),
+      results: z
+        .array(z.record(z.string(), z.unknown()))
+        .describe('Per-UID outcome of a real run. Empty on a dry run.'),
     }),
     annotations: {
       readOnlyHint: false,

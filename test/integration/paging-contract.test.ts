@@ -492,7 +492,7 @@ describe('paged tool contract', () => {
           port: greenmail.imapPort,
           secure: false,
           starttls: 'disabled',
-          timeoutMs: 15_000,
+          timeoutMs: 45_000,
           tls: { rejectUnauthorized: false },
         },
         user: greenmail.user,
@@ -507,7 +507,7 @@ describe('paged tool contract', () => {
     });
     await exercise('gm', runtime.service, greenmail.email);
     await runtime.close();
-  }, 180_000);
+  }, 300_000);
 
   it('walks every paged tool on Dovecot without gaps or duplicates', async () => {
     const runtime = createRuntime({

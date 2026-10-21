@@ -4,6 +4,17 @@ import { PROVIDER_IDS, type ProviderId } from './providers.js';
 export const starttlsModeSchema = z.enum(['required', 'optional', 'disabled']);
 export type StarttlsMode = z.infer<typeof starttlsModeSchema>;
 
+/** One connect or command must finish inside a 60 second client limit. */
+export const MAX_ENDPOINT_TIMEOUT_MS = 50_000;
+
+/** Cap a configured command budget. The default of 30000 is left as it is. */
+export function boundedCommandTimeout(timeoutMs: number): number {
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 1) {
+    return timeoutMs;
+  }
+  return Math.min(Math.floor(timeoutMs), MAX_ENDPOINT_TIMEOUT_MS);
+}
+
 export const tlsSchema = z
   .object({
     rejectUnauthorized: z
@@ -54,7 +65,15 @@ export const endpointSchema = z
       .describe(
         'required (default when secure is false), optional, or disabled. disabled is cleartext and must be explicit.',
       ),
-    timeoutMs: z.number().int().positive().optional(),
+    timeoutMs: z
+      .number()
+      .int()
+      .positive()
+      .max(MAX_ENDPOINT_TIMEOUT_MS)
+      .optional()
+      .describe(
+        'Connect and command budget in milliseconds. Default 30000. Maximum 50000 so one call stays inside a 60 second client limit.',
+      ),
     tls: tlsSchema.optional(),
   })
   .strict();
@@ -106,6 +125,15 @@ export const limitsSchema = z
       .default(35 * 1024 * 1024),
     maxSortCandidates: z.number().int().positive().default(5_000),
     maxBulk: z.number().int().positive().default(200),
+    bulkBudgetMs: z
+      .number()
+      .int()
+      .positive()
+      .max(50_000)
+      .default(20_000)
+      .describe(
+        'Wall-clock budget for one bulk change (flags, copy, move, delete, labels, modify-by-search). It includes waiting for a connection and the modify-by-search folder scan. The call stops before the next chunk and returns the UIDs still to do. Capped at 50000 so the call finishes inside a 60 second request limit.',
+      ),
   })
   .strict();
 
@@ -206,6 +234,7 @@ export interface Limits {
   maxMessageBytes: number;
   maxSortCandidates: number;
   maxBulk: number;
+  bulkBudgetMs: number;
 }
 
 export interface ResolvedAccount {

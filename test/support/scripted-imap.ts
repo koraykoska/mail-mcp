@@ -33,6 +33,43 @@ export interface ScriptedOptions {
   /** Answer UNCHANGEDSINCE STORE with a MODIFIED response code. */
   modifiedStore?: boolean;
   refuseCopy?: boolean;
+  /**
+   * iCloud SEARCH: `NOT UID` and `NOT <sequence>` match nothing, and a NOT that
+   * mixes a text test with a flag or UID test is `NO [UNAVAILABLE]`.
+   */
+  icloud?: boolean;
+  /** COPY stores the messages and answers OK without a COPYUID response code. */
+  omitCopyUid?: boolean;
+  /**
+   * Drop the socket around one command. `nth` counts matches of `pattern` starting at 1.
+   * Without `apply`, the socket closes before that command runs.
+   * With `apply`, that command finishes and the next command closes the socket before it runs.
+   */
+  dropMatching?: { pattern: RegExp; nth?: number; apply?: boolean };
+  /** Advertised capabilities left out of the ENABLED response. The ENABLE command still succeeds. */
+  omitEnabled?: string[];
+  /** A UID SEARCH that matches every message answers ESEARCH ALL 1:* instead of listing UIDs. */
+  esearchAllStar?: boolean;
+  /**
+   * When a UID SEARCH uses RETURN, this value is the ESEARCH ALL set.
+   * Return undefined to list the matching UIDs.
+   */
+  esearchAll?: (args: string, uids: number[]) => string | undefined;
+  /** Extra untagged lines written before a UID SEARCH that has no RETURN. */
+  beforePlainSearch?: () => string | undefined;
+  /** A UID SEARCH without RETURN answers ESEARCH ALL * instead of a number list. */
+  plainSearchStar?: boolean;
+  /** With RETURN, also send this `* SEARCH` line. Used when it disagrees with ALL. */
+  alsoSearch?: string;
+  /**
+   * Append a CONDSTORE modifier. A plain search answers `* SEARCH <uids> (MODSEQ n)`.
+   * An ESEARCH search answers `ALL <uids> MODSEQ n` and the same parenthesized SEARCH line.
+   */
+  searchModseq?: number;
+  /** SELECT reports this UIDNEXT instead of the next UID the server will assign. */
+  selectUidNext?: number;
+  /** Write the greeting and then close the socket, before login. */
+  closeAfterGreeting?: boolean;
 }
 
 /**
@@ -49,6 +86,8 @@ export class ScriptedImap {
   private nextUid = 1;
   private clients = new Set<Socket>();
   readonly trace: string[] = [];
+  private dropHits = 0;
+  private dropNext = false;
   private readonly listening: Promise<void>;
 
   constructor(private readonly options: ScriptedOptions = {}) {
@@ -60,12 +99,45 @@ export class ScriptedImap {
       let commands = 0;
       let selected = false;
       let tlsUpgraded = false;
+      const enabled = new Set<string>();
       const write = (line: string): void => {
         if (!socket.destroyed) {
           socket.write(line);
         }
       };
+      const context = (): {
+        write: (line: string) => void;
+        selected: () => boolean;
+        select: () => void;
+        capabilities: string[];
+        tlsUpgraded: () => boolean;
+        markTls: () => void;
+        noteEnabled: (name: string) => void;
+        isRev2: () => boolean;
+      } => ({
+        write,
+        selected: () => selected,
+        select: () => {
+          selected = true;
+        },
+        capabilities,
+        tlsUpgraded: () => tlsUpgraded,
+        markTls: () => {
+          tlsUpgraded = true;
+        },
+        noteEnabled: (name: string) => {
+          enabled.add(name.toUpperCase());
+        },
+        isRev2: () =>
+          enabled.has('IMAP4REV2') ||
+          (capabilities.some((item) => item.toUpperCase() === 'IMAP4REV2') &&
+            !capabilities.some((item) => item.toUpperCase() === 'IMAP4REV1')),
+      });
       write('* OK scripted IMAP ready\r\n');
+      if (this.options.closeAfterGreeting) {
+        socket.end();
+        return;
+      }
       const consume = (): void => {
         while (buffer.length > 0) {
           const newline = buffer.indexOf('\r\n');
@@ -86,18 +158,7 @@ export class ScriptedImap {
             if (buffer.subarray(0, 2).toString() === '\r\n') {
               buffer = buffer.subarray(2);
             }
-            this.handle(socket, line, data, {
-              write,
-              selected: () => selected,
-              select: () => {
-                selected = true;
-              },
-              capabilities,
-              tlsUpgraded: () => tlsUpgraded,
-              markTls: () => {
-                tlsUpgraded = true;
-              },
-            });
+            this.handle(socket, line, data, context());
             continue;
           }
           if (line.endsWith('}') && !line.includes('+')) {
@@ -108,18 +169,7 @@ export class ScriptedImap {
             socket.destroy();
             return;
           }
-          this.handle(socket, line, undefined, {
-            write,
-            selected: () => selected,
-            select: () => {
-              selected = true;
-            },
-            capabilities,
-            tlsUpgraded: () => tlsUpgraded,
-            markTls: () => {
-              tlsUpgraded = true;
-            },
-          });
+          this.handle(socket, line, undefined, context());
         }
       };
       socket.on('data', (chunk: Buffer) => {
@@ -153,6 +203,16 @@ export class ScriptedImap {
     return uid;
   }
 
+  /** Remove one UID and leave the next-UID counter where it is. */
+  dropUid(uid: number): void {
+    this.messages = this.messages.filter((message) => message.uid !== uid);
+  }
+
+  /** Mailboxes that received a COPY or MOVE. */
+  copiedPaths(): string[] {
+    return [...this.copies.keys()];
+  }
+
   /** Messages currently in INBOX or a mailbox created by COPY. */
   messagesIn(path: string): ScriptedMessage[] {
     if (path.toUpperCase() === 'INBOX') {
@@ -182,6 +242,8 @@ export class ScriptedImap {
       capabilities: string[];
       tlsUpgraded: () => boolean;
       markTls: () => void;
+      noteEnabled: (name: string) => void;
+      isRev2: () => boolean;
     },
   ): void {
     const match = /^(\S+)\s+(.*)$/.exec(line.trim());
@@ -193,7 +255,28 @@ export class ScriptedImap {
     const [commandRaw, ...argParts] = splitCommand(rest);
     const command = (commandRaw ?? '').toUpperCase();
     const args = argParts.join(' ');
-    this.trace.push(`${command} ${args}`.trim());
+    const lineText = `${command} ${args}`.trim();
+    this.trace.push(lineText);
+    if (this.dropNext) {
+      this.dropNext = false;
+      socket.destroy();
+      return;
+    }
+    const drop = this.options.dropMatching;
+    if (drop) {
+      drop.pattern.lastIndex = 0;
+      if (drop.pattern.test(lineText)) {
+        this.dropHits += 1;
+        if (this.dropHits === (drop.nth ?? 1)) {
+          if (drop.apply) {
+            this.dropNext = true;
+          } else {
+            socket.destroy();
+            return;
+          }
+        }
+      }
+    }
     const ok = (text: string): void => ctx.write(`${tag} OK ${text}\r\n`);
     const bad = (text: string): void => ctx.write(`${tag} BAD ${text}\r\n`);
     const no = (text: string): void => ctx.write(`${tag} NO ${text}\r\n`);
@@ -289,7 +372,9 @@ export class ScriptedImap {
       ctx.write('* 0 RECENT\r\n');
       ctx.write(`* ${this.messages.length} EXISTS\r\n`);
       ctx.write(`* OK [UIDVALIDITY ${this.uidValidity}] UIDs valid\r\n`);
-      ctx.write(`* OK [UIDNEXT ${this.nextUid}] Predicted next UID\r\n`);
+      ctx.write(
+        `* OK [UIDNEXT ${this.options.selectUidNext ?? this.nextUid}] Predicted next UID\r\n`,
+      );
       ok(`[${command === 'EXAMINE' ? 'READ-ONLY' : 'READ-WRITE'}] ${command} completed`);
       return;
     }
@@ -305,8 +390,20 @@ export class ScriptedImap {
         no('SEARCH refused');
         return;
       }
+      if (this.options.icloud) {
+        const fault = icloudCommandFault(args);
+        if (fault === 'unavailable') {
+          no('[UNAVAILABLE] Unexpected exception');
+          return;
+        }
+        if (fault === 'empty') {
+          this.writeSearch(ctx, tag, args, []);
+          ok('SEARCH completed');
+          return;
+        }
+      }
       const uids = searchUids(args, this.messages);
-      ctx.write(`* SEARCH ${uids.join(' ')}\r\n`);
+      this.writeSearch(ctx, tag, args, uids);
       ok('SEARCH completed');
       return;
     }
@@ -330,9 +427,15 @@ export class ScriptedImap {
     }
     if (command === 'ENABLE') {
       const requested = args.split(/\s+/).filter(Boolean);
-      const enabled = requested.filter((item) =>
-        ctx.capabilities.some((capability) => capability.toUpperCase() === item.toUpperCase()),
+      const omitted = new Set((this.options.omitEnabled ?? []).map((item) => item.toUpperCase()));
+      const enabled = requested.filter(
+        (item) =>
+          ctx.capabilities.some((capability) => capability.toUpperCase() === item.toUpperCase()) &&
+          !omitted.has(item.toUpperCase()),
       );
+      for (const item of enabled) {
+        ctx.noteEnabled(item);
+      }
       if (enabled.length > 0) {
         ctx.write(`* ENABLED ${enabled.join(' ')}\r\n`);
       }
@@ -346,11 +449,15 @@ export class ScriptedImap {
       const sourceWanted = sectionId === '' && Boolean(section);
       const headerWanted = sectionId.toUpperCase().includes('HEADER');
       const partWanted = Boolean(section) && !sourceWanted && !headerWanted;
-      const uidFilter = /^\d+$/.test(argParts[1] ?? '') ? Number(argParts[1]) : undefined;
+      const uidToken = argParts[1] ?? '';
+      const allowed =
+        uidToken.length > 0 && uidToken !== '*'
+          ? new Set(parseUidSet(uidToken, this.messages))
+          : undefined;
       let sequence = 0;
       for (const message of this.messages) {
         sequence += 1;
-        if (uidFilter !== undefined && message.uid !== uidFilter) {
+        if (allowed && !allowed.has(message.uid)) {
           continue;
         }
         const source = Buffer.from(message.raw);
@@ -462,13 +569,15 @@ export class ScriptedImap {
         no('STORE failed');
         return;
       }
+      const targets = new Set(parseUidSet(argParts[1] ?? '', this.messages));
       if (this.options.modifiedStore && args.toUpperCase().includes('UNCHANGEDSINCE')) {
         ok('[MODIFIED 1] STORE completed');
         return;
       }
-      const uid = Number(argParts[1]);
-      const message = this.messages.find((item) => item.uid === uid);
-      if (message) {
+      for (const message of this.messages) {
+        if (!targets.has(message.uid)) {
+          continue;
+        }
         const flags = flagsIn(args);
         const upper = args.toUpperCase();
         if (upper.includes('-FLAGS')) {
@@ -491,27 +600,64 @@ export class ScriptedImap {
         no('COPY failed');
         return;
       }
-      const uid = Number(argParts[1]);
       const destination = unquote(argParts[argParts.length - 1] ?? '');
-      const source = this.messages.find((item) => item.uid === uid);
-      if (!source || !destination) {
+      const sources = parseUidSet(argParts[1] ?? '', this.messages)
+        .map((uid) => this.messages.find((item) => item.uid === uid))
+        .filter((item): item is ScriptedMessage => Boolean(item));
+      if (!destination || sources.length === 0) {
         no('COPY failed');
         return;
       }
       const copied = this.copies.get(destination) ?? [];
-      const newUid = this.nextUid;
-      this.nextUid += 1;
-      copied.push({ uid: newUid, raw: source.raw, flags: [...source.flags] });
+      const sourceUids: number[] = [];
+      const newUids: number[] = [];
+      for (const source of sources) {
+        const newUid = this.nextUid;
+        this.nextUid += 1;
+        copied.push({ uid: newUid, raw: source.raw, flags: [...source.flags] });
+        sourceUids.push(source.uid);
+        newUids.push(newUid);
+      }
       this.copies.set(destination, copied);
-      ok(`[COPYUID ${this.uidValidity} ${uid} ${newUid}] COPY completed`);
+      if (this.options.omitCopyUid) {
+        ok('COPY completed');
+        return;
+      }
+      ok(
+        `[COPYUID ${this.uidValidity} ${sourceUids.join(',')} ${newUids.join(',')}] COPY completed`,
+      );
       return;
     }
     if (command === 'UID' && args.toUpperCase().includes('MOVE')) {
-      if (!ctx.capabilities.includes('MOVE')) {
+      if (!ctx.capabilities.includes('MOVE') && !ctx.isRev2()) {
         bad('MOVE not supported');
         return;
       }
-      ok('MOVE completed');
+      const destination = unquote(argParts[argParts.length - 1] ?? '');
+      const sources = parseUidSet(argParts[1] ?? '', this.messages)
+        .map((uid) => this.messages.find((item) => item.uid === uid))
+        .filter((item): item is ScriptedMessage => Boolean(item));
+      if (!destination || sources.length === 0) {
+        no('MOVE failed');
+        return;
+      }
+      const copied = this.copies.get(destination) ?? [];
+      const sourceUids: number[] = [];
+      const newUids: number[] = [];
+      const moved = new Set<number>();
+      for (const source of sources) {
+        const newUid = this.nextUid;
+        this.nextUid += 1;
+        copied.push({ uid: newUid, raw: source.raw, flags: [...source.flags] });
+        sourceUids.push(source.uid);
+        newUids.push(newUid);
+        moved.add(source.uid);
+      }
+      this.copies.set(destination, copied);
+      this.messages = this.messages.filter((message) => !moved.has(message.uid));
+      ok(
+        `[COPYUID ${this.uidValidity} ${sourceUids.join(',')} ${newUids.join(',')}] MOVE completed`,
+      );
       return;
     }
     if (command === 'APPEND') {
@@ -556,12 +702,52 @@ export class ScriptedImap {
       return;
     }
     if (command === 'UID' && args.toUpperCase().startsWith('EXPUNGE')) {
-      const uid = Number(argParts[1]);
-      this.messages = this.messages.filter((message) => message.uid !== uid);
+      const targets = new Set(parseUidSet(argParts[1] ?? '', this.messages));
+      this.messages = this.messages.filter((message) => !targets.has(message.uid));
       ok('EXPUNGE completed');
       return;
     }
     bad(`Unsupported ${command}`);
+  }
+
+  private writeSearch(
+    ctx: { write: (line: string) => void },
+    tag: string,
+    args: string,
+    uids: number[],
+  ): void {
+    if (args.toUpperCase().includes('RETURN')) {
+      const custom = this.options.esearchAll?.(args, uids);
+      const star =
+        custom === undefined &&
+        this.options.esearchAllStar &&
+        uids.length > 0 &&
+        uids.length === this.messages.length;
+      const all = custom ?? (star ? '1:*' : uids.length > 0 ? uids.join(',') : undefined);
+      const listed = all ? ` ALL ${all}` : '';
+      const modseq =
+        this.options.searchModseq !== undefined ? ` MODSEQ ${this.options.searchModseq}` : '';
+      if (this.options.alsoSearch !== undefined) {
+        ctx.write(`* SEARCH ${this.options.alsoSearch}\r\n`);
+      } else if (this.options.searchModseq !== undefined) {
+        const list = uids.join(' ');
+        ctx.write(`* SEARCH ${list}${list ? ' ' : ''}(MODSEQ ${this.options.searchModseq})\r\n`);
+      }
+      ctx.write(`* ESEARCH (TAG "${tag}") UID COUNT ${uids.length}${listed}${modseq}\r\n`);
+      return;
+    }
+    const banner = this.options.beforePlainSearch?.();
+    if (banner) {
+      ctx.write(banner);
+    }
+    if (this.options.plainSearchStar) {
+      ctx.write(`* ESEARCH (TAG "${tag}") UID ALL *\r\n`);
+      return;
+    }
+    const list = uids.join(' ');
+    const modseq =
+      this.options.searchModseq !== undefined ? `(MODSEQ ${this.options.searchModseq})` : '';
+    ctx.write(`* SEARCH ${[list, modseq].filter(Boolean).join(' ')}\r\n`);
   }
 }
 
@@ -611,6 +797,28 @@ function headerOf(raw: string, name: string): string | undefined {
 
 function imapQuote(value: string): string {
   return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+
+function parseUidSet(token: string, messages: ScriptedMessage[]): number[] {
+  return searchUids(`UID ${token}`, messages);
+}
+
+/** iCloud faults, matched against the SEARCH command text. */
+function icloudCommandFault(args: string): 'empty' | 'unavailable' | null {
+  const upper = args.toUpperCase();
+  const text = /(?:FROM|TO|CC|BCC|SUBJECT|BODY|TEXT|HEADER|LARGER|SMALLER)/.test(upper);
+  const flag =
+    /(?:\bSEEN\b|\bUNSEEN\b|\bFLAGGED\b|\bUNFLAGGED\b|\bANSWERED\b|\bDELETED\b|\bDRAFT\b|\bKEYWORD\b)/.test(
+      upper,
+    );
+  const notUid = /NOT\s+UID\b/.test(upper) || /(?:^|\s)NOT\s+\d/.test(upper);
+  if (/NOT/.test(upper) && text && (flag || notUid || /\bUID\b/.test(upper))) {
+    return 'unavailable';
+  }
+  if (notUid) {
+    return 'empty';
+  }
+  return null;
 }
 
 function searchUids(args: string, messages: ScriptedMessage[]): number[] {

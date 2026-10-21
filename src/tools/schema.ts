@@ -27,7 +27,7 @@ const uids = z
   .array(uid)
   .min(1)
   .describe(
-    'IMAP UIDs to change. The server limit is limits.maxBulk (default 200). Each UID is applied separately so a failure does not hide the others when the tool returns per-item results.',
+    'IMAP UIDs to change. The server limit is limits.maxBulk (default 200). Each chunk is one IMAP command. complete is false and remaining lists UIDs not attempted when the time budget or cancellation stops the call. A failure on one UID does not hide the others.',
   );
 
 const uidValidity = z

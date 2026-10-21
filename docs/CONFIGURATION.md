@@ -25,6 +25,7 @@ The file may contain `//` and `/* */` comments and trailing commas. Strings may 
     "maxMessageBytes": 36700160,
     "maxSortCandidates": 5000,
     "maxBulk": 200,
+    "bulkBudgetMs": 20000,
   },
   "accounts": {
     "work": {
@@ -61,7 +62,7 @@ A complete three-account file (iCloud with two identities, Gmail, generic IMAP) 
 | `connectHost`, `connectPort` | TCP address when it differs, such as a local SSH forward. Certificate checks still use `host`.                                                                                                                                                                                                                               |
 | `secure`                     | `true` for implicit TLS (typically 993 or 465).                                                                                                                                                                                                                                                                              |
 | `starttls`                   | `required` (default when `secure` is false), `optional`, or `disabled`. `optional` stays on cleartext when the server does not offer STARTTLS. `disabled` is cleartext and must be explicit. `secure: true` forces `disabled`. The process logs a warning when `optional` is set and when `tls.rejectUnauthorized` is false. |
-| `timeoutMs`                  | Connect and command budget, default 30000.                                                                                                                                                                                                                                                                                   |
+| `timeoutMs`                  | Connect and command budget, default 30000, maximum 50000. A larger value is rejected so one call stays inside a 60 second client limit.                                                                                                                                                                                      |
 | `tls.rejectUnauthorized`     | Default `true`. `false` skips certificate checks. Unsafe except for a local bridge you trust. A tunnel does not turn this off.                                                                                                                                                                                               |
 | `tls.caFile`                 | PEM file of extra CAs.                                                                                                                                                                                                                                                                                                       |
 | `tls.servername`             | SNI / certificate name when it differs from `host`.                                                                                                                                                                                                                                                                          |
@@ -108,8 +109,9 @@ A top-level `password` is shorthand for password auth.
 | `maxMessageBytes`    | 36700160 |
 | `maxSortCandidates`  | 5000     |
 | `maxBulk`            | 200      |
+| `bulkBudgetMs`       | 20000    |
 
-Account `limits` override the root object per key. Summary pages cannot exceed the lower of `maxPageSize` and 200. Pages that include bodies are capped at 20.
+Account `limits` override the root object per key. Summary pages cannot exceed the lower of `maxPageSize` and 200. Pages that include bodies are capped at 20. `bulkBudgetMs` is the wall-clock budget for one bulk flag, copy, move, delete, label, or modify-by-search call. It includes waiting for a connection and the modify-by-search folder scan. The call stops before the next chunk of 25 and returns `complete`, `remaining`, and `stopped` (`budget`, `cancelled`, `connection`, or null). The maximum is 50000, so the call finishes inside a 60 second request limit. Pass `remaining` back with the same action to continue. A move without MOVE expunges only UIDs confirmed by UIDPLUS `COPYUID`. MOVE and UIDPLUS are available when advertised, or when IMAP4rev2 is active.
 
 ## Folder scope
 

@@ -390,7 +390,7 @@ Annotations: readOnlyHint=true, destructiveHint=false, idempotentHint=true, open
 
 Search messages
 
-Search with the full structured IMAP SEARCH grammar (from, to, cc, bcc, subject, body, text, header, internal and sent dates, larger/smaller, flags and keywords, UID and sequence sets, NOT/OR/AND, MODSEQ, and Gmail X-GM-RAW / thread id / labels when the server supports them). Same paging and summaries as mail_list_messages. Use this tool, not mail_list_messages, when the user describes what to find. An empty search object is rejected. ESEARCH is used internally when ImapFlow can; the result you see is always a paged list plus total.
+Search with the full structured IMAP SEARCH grammar (from, to, cc, bcc, subject, body, text, header, internal and sent dates, larger/smaller, flags and keywords, UID and sequence sets, NOT/OR/AND, MODSEQ, and Gmail X-GM-RAW / thread id / labels when the server supports them). Same paging and summaries as mail_list_messages. Use this tool, not mail_list_messages, when the user describes what to find. An empty search object is rejected. ESEARCH is used internally when the server advertises it. A response that contains `*`, or that is not a fully explicit UID list, is PROTOCOL_ERROR and no message is changed. An explicit list is returned as a paged list plus total. A `(MODSEQ n)` modifier on the response is not a match.
 
 Annotations: readOnlyHint=true, destructiveHint=false, idempotentHint=true, openWorldHint=true.
 
@@ -640,7 +640,7 @@ Annotations: readOnlyHint=true, destructiveHint=false, idempotentHint=true, open
 
 Add, remove, or replace flags
 
-Change flags or keywords on one or more UIDs. operation add is +FLAGS, remove is -FLAGS, set replaces the whole flag set (FLAGS). Adding or removing \Deleted, and a set that would clear \Deleted, require allowDelete. System flags may be written "\\Seen" or "seen". Custom keywords must not contain spaces. unchangedSince is the CONDSTORE UNCHANGEDSINCE mod-sequence; omit it when the server has no CONDSTORE. Blocked when the account is readOnly. Does not expunge. ok is false when any UID failed; uids lists only the UIDs that changed.
+Change flags or keywords on one or more UIDs. operation add is +FLAGS, remove is -FLAGS, set replaces the whole flag set (FLAGS). The UIDs go out as UID STORE sets, in chunks, not one command per UID. Adding or removing \Deleted, and a set that would clear \Deleted, require allowDelete. System flags may be written "\\Seen" or "seen". Custom keywords must not contain spaces. unchangedSince is the CONDSTORE UNCHANGEDSINCE mod-sequence; omit it when the server has no CONDSTORE. Blocked when the account is readOnly. Does not expunge. ok is false when any UID failed or the call stopped early; uids lists only the UIDs that changed. complete, remaining, and stopped say whether the caller must resume.
 
 Annotations: readOnlyHint=false, destructiveHint=false, idempotentHint=true, openWorldHint=true.
 
@@ -649,7 +649,7 @@ Annotations: readOnlyHint=false, destructiveHint=false, idempotentHint=true, ope
 - `account` (optional): Account id from mail_list_accounts. Omit to use the configured default account. Example: "work".
 - `mailbox`: Mailbox path as returned by mail_list_mailboxes, in Unicode (not modified UTF-7). Nested folders use the server delimiter, often "/" or ".". Examples: "INBOX", "Projects/2026", "Entwürfe".
 - `uidValidity` (optional): Expected UIDVALIDITY decimal string from mail_get_mailbox_status or a previous list. When set, the call fails with UIDVALIDITY_CHANGED if the mailbox was recreated.
-- `uids`: IMAP UIDs to change. The server limit is limits.maxBulk (default 200). Each UID is applied separately so a failure does not hide the others when the tool returns per-item results.
+- `uids`: IMAP UIDs to change. The server limit is limits.maxBulk (default 200). Each chunk is one IMAP command. complete is false and remaining lists UIDs not attempted when the time budget or cancellation stops the call. A failure on one UID does not hide the others.
 - `flags`: Flags or keywords. Examples: ["\\Seen"], ["\\Flagged","$Forwarded"].
 - `operation`: add, remove, or replace.
 - `unchangedSince` (optional): CONDSTORE mod-sequence. The update is skipped by the server when the message changed since this value.
@@ -664,7 +664,7 @@ Annotations: readOnlyHint=false, destructiveHint=false, idempotentHint=true, ope
 
 Copy messages
 
-COPY UIDs to another mailbox, leaving the originals. Requires the destination to exist. Returns per-UID results and, when UIDPLUS is available, the new UID. Blocked when readOnly. Prefer mail_move_messages when the original should disappear.
+COPY UIDs to another mailbox as one UID COPY per chunk, leaving the originals. Requires the destination to exist. Returns per-UID results and, when UIDPLUS is available, the new UID. complete is false and remaining lists UIDs not attempted when the time budget elapses, the connection drops, or the client cancels. Blocked when readOnly. Prefer mail_move_messages when the original should disappear.
 
 Annotations: readOnlyHint=false, destructiveHint=false, idempotentHint=false, openWorldHint=true.
 
@@ -673,7 +673,7 @@ Annotations: readOnlyHint=false, destructiveHint=false, idempotentHint=false, op
 - `account` (optional): Account id from mail_list_accounts. Omit to use the configured default account. Example: "work".
 - `mailbox`: Mailbox path as returned by mail_list_mailboxes, in Unicode (not modified UTF-7). Nested folders use the server delimiter, often "/" or ".". Examples: "INBOX", "Projects/2026", "Entwürfe".
 - `uidValidity` (optional): Expected UIDVALIDITY decimal string from mail_get_mailbox_status or a previous list. When set, the call fails with UIDVALIDITY_CHANGED if the mailbox was recreated.
-- `uids`: IMAP UIDs to change. The server limit is limits.maxBulk (default 200). Each UID is applied separately so a failure does not hide the others when the tool returns per-item results.
+- `uids`: IMAP UIDs to change. The server limit is limits.maxBulk (default 200). Each chunk is one IMAP command. complete is false and remaining lists UIDs not attempted when the time budget or cancellation stops the call. A failure on one UID does not hide the others.
 - `destination`: Destination mailbox path. It must already exist.
 
 ### Examples
@@ -686,7 +686,7 @@ Annotations: readOnlyHint=false, destructiveHint=false, idempotentHint=false, op
 
 Move messages
 
-Move UIDs to another mailbox. Uses MOVE when the server advertises it. Otherwise copies, sets \Deleted, and UID EXPUNGEs, which requires UIDPLUS. Without MOVE and UIDPLUS the call is refused, because a plain EXPUNGE would remove every \Deleted message. allowPermanentDelete does not permit that. Requires allowDelete. Destination must exist.
+Move UIDs to another mailbox in chunks. Uses UID MOVE when the server advertises MOVE or IMAP4rev2 is active. Otherwise UID COPY, then UID EXPUNGE of only the UIDs named by COPYUID. UIDPLUS is decided the same way: advertised, or IMAP4rev2 active. A bare IMAP4rev2 token next to IMAP4rev1 is not enough. A UID the server does not confirm is left in place and reported; a duplicate in the destination is acceptable, losing the original is not. Without MOVE and UIDPLUS the call is refused, because a plain EXPUNGE would remove every \Deleted message. allowPermanentDelete does not permit that. Requires allowDelete. Destination must exist. complete is false and remaining lists UIDs not attempted when the time budget elapses, the connection drops, or the client cancels.
 
 Annotations: readOnlyHint=false, destructiveHint=true, idempotentHint=false, openWorldHint=true.
 
@@ -695,7 +695,7 @@ Annotations: readOnlyHint=false, destructiveHint=true, idempotentHint=false, ope
 - `account` (optional): Account id from mail_list_accounts. Omit to use the configured default account. Example: "work".
 - `mailbox`: Mailbox path as returned by mail_list_mailboxes, in Unicode (not modified UTF-7). Nested folders use the server delimiter, often "/" or ".". Examples: "INBOX", "Projects/2026", "Entwürfe".
 - `uidValidity` (optional): Expected UIDVALIDITY decimal string from mail_get_mailbox_status or a previous list. When set, the call fails with UIDVALIDITY_CHANGED if the mailbox was recreated.
-- `uids`: IMAP UIDs to change. The server limit is limits.maxBulk (default 200). Each UID is applied separately so a failure does not hide the others when the tool returns per-item results.
+- `uids`: IMAP UIDs to change. The server limit is limits.maxBulk (default 200). Each chunk is one IMAP command. complete is false and remaining lists UIDs not attempted when the time budget or cancellation stops the call. A failure on one UID does not hide the others.
 - `destination`: Destination mailbox path.
 
 ### Examples
@@ -708,7 +708,7 @@ Annotations: readOnlyHint=false, destructiveHint=true, idempotentHint=false, ope
 
 Delete messages
 
-Delete UIDs. By default they are moved to the resolved Trash mailbox (special-use, config, or a well-known name). permanent true UID EXPUNGEs only those UIDs and requires both allowPermanentDelete and UIDPLUS. Without UIDPLUS the call is refused rather than expunging every \Deleted message. Deleting messages that are already in Trash requires permanent true. Requires allowDelete. Adding \Deleted via mail_set_flags is the same delete permission. Use mail_expunge_mailbox only when you intend to purge every \Deleted message in a mailbox.
+Delete UIDs. By default they are moved to the resolved Trash mailbox (special-use, config, or a well-known name). permanent true UID EXPUNGEs only those UIDs and requires both allowPermanentDelete and UIDPLUS. UIDPLUS counts when it is advertised or when IMAP4rev2 is active. Without it the call is refused rather than expunging every \Deleted message. Deleting messages that are already in Trash requires permanent true. Requires allowDelete. Adding \Deleted via mail_set_flags is the same delete permission. Use mail_expunge_mailbox only when you intend to purge every \Deleted message in a mailbox. complete is false and remaining lists UIDs not attempted when the time budget elapses, the connection drops, or the client cancels.
 
 Annotations: readOnlyHint=false, destructiveHint=true, idempotentHint=false, openWorldHint=true.
 
@@ -717,7 +717,7 @@ Annotations: readOnlyHint=false, destructiveHint=true, idempotentHint=false, ope
 - `account` (optional): Account id from mail_list_accounts. Omit to use the configured default account. Example: "work".
 - `mailbox`: Mailbox path as returned by mail_list_mailboxes, in Unicode (not modified UTF-7). Nested folders use the server delimiter, often "/" or ".". Examples: "INBOX", "Projects/2026", "Entwürfe".
 - `uidValidity` (optional): Expected UIDVALIDITY decimal string from mail_get_mailbox_status or a previous list. When set, the call fails with UIDVALIDITY_CHANGED if the mailbox was recreated.
-- `uids`: IMAP UIDs to change. The server limit is limits.maxBulk (default 200). Each UID is applied separately so a failure does not hide the others when the tool returns per-item results.
+- `uids`: IMAP UIDs to change. The server limit is limits.maxBulk (default 200). Each chunk is one IMAP command. complete is false and remaining lists UIDs not attempted when the time budget or cancellation stops the call. A failure on one UID does not hide the others.
 - `permanent` (optional): true expunges immediately. Default false moves to Trash. Requires allowPermanentDelete and UIDPLUS.
 
 ### Examples
@@ -799,7 +799,7 @@ Annotations: readOnlyHint=false, destructiveHint=false, idempotentHint=true, ope
 - `account` (optional): Account id from mail_list_accounts. Omit to use the configured default account. Example: "work".
 - `mailbox`: Mailbox path as returned by mail_list_mailboxes, in Unicode (not modified UTF-7). Nested folders use the server delimiter, often "/" or ".". Examples: "INBOX", "Projects/2026", "Entwürfe".
 - `uidValidity` (optional): Expected UIDVALIDITY decimal string from mail_get_mailbox_status or a previous list. When set, the call fails with UIDVALIDITY_CHANGED if the mailbox was recreated.
-- `uids`: IMAP UIDs to change. The server limit is limits.maxBulk (default 200). Each UID is applied separately so a failure does not hide the others when the tool returns per-item results.
+- `uids`: IMAP UIDs to change. The server limit is limits.maxBulk (default 200). Each chunk is one IMAP command. complete is false and remaining lists UIDs not attempted when the time budget or cancellation stops the call. A failure on one UID does not hide the others.
 - `labels`: Gmail label names.
 - `operation`: add labels, remove labels, or replace the whole label set.
 
@@ -813,7 +813,7 @@ Annotations: readOnlyHint=false, destructiveHint=false, idempotentHint=true, ope
 
 Bulk modify messages
 
-Apply one action to many UIDs and return a per-UID result. Actions: addFlags, removeFlags, setFlags, copy, move, delete, addLabels, removeLabels. delete uses the Trash move unless permanent is true. copy and move need destination. Flag actions need flags. Label actions need labels and Gmail. The call itself succeeds when the batch was attempted; inspect results[].ok. UIDs above maxBulk are rejected up front.
+Apply one action to many UIDs and return a per-UID result. UIDs are sent as set commands in chunks (UID STORE, UID COPY, UID MOVE, or UID EXPUNGE), not one round trip per message. Actions: addFlags, removeFlags, setFlags, copy, move, delete, addLabels, removeLabels. delete uses the Trash move unless permanent is true. A move without MOVE copies and expunges only UIDs confirmed by COPYUID. MOVE and UIDPLUS count as available when advertised, or when IMAP4rev2 is active. copy and move need destination. Flag actions need flags. Label actions need labels and Gmail. ok is false when any UID failed or the call stopped early. complete is false and remaining lists UIDs not attempted when the time budget elapses, the connection drops, or the client cancels. A dropped connection sets stopped to connection. Pass remaining back to resume. UIDs above maxBulk are rejected up front.
 
 Annotations: readOnlyHint=false, destructiveHint=true, idempotentHint=false, openWorldHint=true.
 
@@ -822,7 +822,7 @@ Annotations: readOnlyHint=false, destructiveHint=true, idempotentHint=false, ope
 - `account` (optional): Account id from mail_list_accounts. Omit to use the configured default account. Example: "work".
 - `mailbox`: Mailbox path as returned by mail_list_mailboxes, in Unicode (not modified UTF-7). Nested folders use the server delimiter, often "/" or ".". Examples: "INBOX", "Projects/2026", "Entwürfe".
 - `uidValidity` (optional): Expected UIDVALIDITY decimal string from mail_get_mailbox_status or a previous list. When set, the call fails with UIDVALIDITY_CHANGED if the mailbox was recreated.
-- `uids`: IMAP UIDs to change. The server limit is limits.maxBulk (default 200). Each UID is applied separately so a failure does not hide the others when the tool returns per-item results.
+- `uids`: IMAP UIDs to change. The server limit is limits.maxBulk (default 200). Each chunk is one IMAP command. complete is false and remaining lists UIDs not attempted when the time budget or cancellation stops the call. A failure on one UID does not hide the others.
 - `action`: The single operation applied to every UID.
 - `flags` (optional): Flags for addFlags, removeFlags, and setFlags. Example: ["\\Seen"].
 - `labels` (optional): Gmail labels for addLabels and removeLabels.
@@ -1391,7 +1391,7 @@ Annotations: readOnlyHint=true, destructiveHint=false, idempotentHint=true, open
 
 Modify messages that match a search
 
-Apply addFlags, removeFlags, move, or archive to every message in a folder scope that matches search. dryRun defaults to true and only pages a preview. A real run is refused with SIZE_LIMIT, and changes nothing, when the match count exceeds limits.maxBulk or any folder is truncated or not fully loaded. move and archive require allowDelete. Adding or removing \Deleted does too. There is no permanent delete here. The preview uses the shared snapshot cursor. The tool is a write: a readOnly account does not advertise it.
+Apply addFlags, removeFlags, move, or archive to every message in a folder scope that matches search. dryRun defaults to true and only pages a preview. A real run is refused with SIZE_LIMIT, and changes nothing, when the match count exceeds limits.maxBulk or any folder is truncated or not fully loaded. The change uses the same chunked UID sets as the other bulk tools. limits.bulkBudgetMs covers waiting for a connection, the folder scan, and the chunks. The call stops before the next chunk when that budget elapses, the connection drops, or the client cancels. complete is false and remaining lists mailbox and UID pairs that were found and not attempted. When the scan stops before every folder, remaining is empty, nothing is changed, and stopped is budget: repeat the same search. A partial list is not returned, because resuming it would skip folders that were not scanned. When the scan finishes and the budget stops before a chunk, remaining lists every match. An empty remaining with stopped budget means repeat the same search. move and archive require allowDelete. Adding or removing \Deleted does too. A move without MOVE expunges only COPYUID-confirmed UIDs. MOVE and UIDPLUS count as available when advertised, or when IMAP4rev2 is active. There is no permanent delete here. The preview uses the shared snapshot cursor. The tool is a write: a readOnly account does not advertise it.
 
 Annotations: readOnlyHint=false, destructiveHint=true, idempotentHint=false, openWorldHint=true.
 

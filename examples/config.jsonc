@@ -12,6 +12,7 @@
     "maxMessageBytes": 36700160,
     "maxSortCandidates": 5000,
     "maxBulk": 200,
+    "bulkBudgetMs": 20000,
   },
   "accounts": {
     "icloud": {

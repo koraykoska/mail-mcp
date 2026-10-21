@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { ZodError } from 'zod';
 import { MailError } from '../errors.js';
-import { accountSchema, configFileSchema, limitsSchema } from './schema.js';
+import { accountSchema, boundedCommandTimeout, configFileSchema, limitsSchema } from './schema.js';
 import type {
   AppConfig,
   AuthSettings,
@@ -451,7 +451,7 @@ function resolveEndpoint(
     port,
     secure,
     starttls,
-    timeoutMs: raw?.timeoutMs ?? 30_000,
+    timeoutMs: boundedCommandTimeout(raw?.timeoutMs ?? 30_000),
     tls,
   };
   if (raw?.connectHost) {

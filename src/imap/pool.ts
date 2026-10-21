@@ -8,6 +8,12 @@ export interface ImapPool {
     accountId: string,
     fn: (session: ImapSession) => Promise<T>,
     timeoutMs?: number,
+    /**
+     * Absolute time when both the wait for a session and the work must have finished.
+     * When set, acquire and the command share this clock. When omitted, each phase
+     * may use `timeoutMs` on its own.
+     */
+    deadlineMs?: number,
   ): Promise<T>;
   /**
    * Run `fn` on another session when one is free. Returns undefined instead of
@@ -59,9 +65,12 @@ export class ImapConnectionPool implements ImapPool {
     accountId: string,
     fn: (session: ImapSession) => Promise<T>,
     timeoutMs?: number,
+    deadlineMs?: number,
   ): Promise<T> {
-    const session = await this.acquire(accountId, timeoutMs);
-    return this.finishUse(accountId, session, fn, timeoutMs);
+    const acquireMs = deadlineMs === undefined ? timeoutMs : Math.max(1, deadlineMs - Date.now());
+    const session = await this.acquire(accountId, acquireMs);
+    const workMs = deadlineMs === undefined ? timeoutMs : Math.max(1, deadlineMs - Date.now());
+    return this.finishUse(accountId, session, fn, workMs);
   }
 
   async tryUse<T>(

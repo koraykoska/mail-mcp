@@ -41,9 +41,9 @@ Tool definitions live in `src/tools/catalog.ts`. That module is the source for b
 
 Mutating tools are not registered when every account forbids that operation. If at least one account allows it, the tool is registered and the selected account is checked again at call time.
 
-Search criteria are compiled to the object ImapFlow sends. `OR` and `AND` groups become IMAP `NOT`/`OR` trees. SORT and THREAD are used when the server advertises them and the query is "all messages"; otherwise the server sorts or threads on the client from fetched summaries, capped by `limits.maxSortCandidates`.
+Search criteria are compiled to the object ImapFlow sends. Keys that can share one SEARCH are placed side by side, which is how IMAP expresses AND. A `NOT` of a UID set, a sequence set, or more than one criterion is not sent: the client searches for the positive set and for every message, then subtracts. SORT and THREAD are used when the server advertises them and the query is one server SEARCH. A client-side AND, OR, or complement is sorted from fetched summaries, capped by `limits.maxSortCandidates`.
 
-MOVE without the MOVE extension is refused when the server also lacks UIDPLUS and the account has not opted into permanent delete, because the COPY+EXPUNGE fallback would expunge every `\Deleted` message. ImapFlow performs the fallback when it is allowed.
+A move uses `UID MOVE` when the server advertises MOVE, or when IMAP4rev2 is active (`ENABLE IMAP4REV2` took effect, or the session advertises IMAP4rev2 and not IMAP4rev1). A bare IMAP4rev2 token next to IMAP4rev1 is not enough. Otherwise, and only when UIDPLUS is available the same way, the client copies and expunges the UIDs named by `COPYUID`. UIDs the server does not confirm stay in the source mailbox. A server with neither extension is refused. `allowPermanentDelete` does not permit expunging every `\Deleted` message to finish that move. Flag, copy, move, delete, and label changes go out as UID sets in chunks of 25. `limits.bulkBudgetMs` covers the wait for a connection, the modify-by-search scan, and the chunks. The call stops before the next chunk when that budget elapses, the connection drops, or the request is cancelled.
 
 Gmail accounts skip the Sent APPEND in `appendSent: "auto"` because Gmail stores the sent copy itself.
 

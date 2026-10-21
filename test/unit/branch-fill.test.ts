@@ -208,13 +208,14 @@ describe('remaining service and helper branches', () => {
       service.saveDraft({ subject: 'd', text: 't', allowEmptyRecipients: true }),
     ).rejects.toMatchObject({ code: 'NOT_FOUND' });
     await session.append('INBOX', simpleMessage(), []);
-    const bulk = await service.bulk({
-      mailbox: 'INBOX',
-      uids: [1],
-      action: 'addLabels',
-      labels: ['Work'],
-    });
-    expect((bulk.results as Array<{ ok: boolean }>)[0]?.ok).toBe(false);
+    await expect(
+      service.bulk({
+        mailbox: 'INBOX',
+        uids: [1],
+        action: 'addLabels',
+        labels: ['Work'],
+      }),
+    ).rejects.toMatchObject({ code: 'CAPABILITY_UNSUPPORTED' });
 
     session.structure = {
       type: 'text',
@@ -335,7 +336,8 @@ describe('remaining service and helper branches', () => {
     expect(addressToAscii('ada@example.com')).toBe('ada@example.com');
     expect(() => parseAddress('nodomain')).toThrow(/domain/);
     const bounded = andSearchUid({ query: { from: 'ada' }, requires: [] }, '1:4');
-    expect(bounded.query.not).toBeTruthy();
+    expect(bounded.query).toEqual({ from: 'ada', uid: '1:4' });
+    expect(bounded.query.not).toBeUndefined();
     expect(
       compileSearch({ uid: '1:4', seq: '1', keyword: 'foo', unkeyword: 'bar' }).query,
     ).toMatchObject({ uid: '1:4' });
