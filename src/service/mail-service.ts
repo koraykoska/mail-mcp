@@ -790,103 +790,147 @@ export class MailService {
       assertMutation(account, 'message-write');
     }
     this.assertBulk(input.uids, account.limits.maxBulk);
-    return this.withBulk(account, (session, plan) =>
-      session.withMailbox(input.mailbox, 'write', async (box) => {
-        this.assertUid(box, input.uidValidity);
-        if (replaceMayClearDeleted) {
-          const summaries = await box.fetchSummaries(input.uids, {
-            snippet: false,
-            snippetChars: 0,
+    const paused = (): Record<string, unknown> => ({
+      ...budgetPaused(input.uids),
+      account: account.id,
+      mailbox: input.mailbox,
+      uids: [],
+      operation: input.operation,
+      flags,
+    });
+    return this.withBulk(
+      account,
+      (session, plan) => {
+        if (Date.now() >= plan.budgetDeadline) {
+          return Promise.resolve(paused());
+        }
+        return session.withMailbox(input.mailbox, 'write', async (box) => {
+          this.assertUid(box, input.uidValidity);
+          if (replaceMayClearDeleted) {
+            const summaries = await box.fetchSummaries(input.uids, {
+              snippet: false,
+              snippetChars: 0,
+            });
+            const clearsDeleted = summaries.some((item) =>
+              item.flags.some((flag) => flag.toLowerCase() === '\\deleted'),
+            );
+            assertMutation(account, clearsDeleted ? 'delete' : 'message-write');
+          }
+          if (input.unchangedSince && !session.condstoreEnabled()) {
+            throw new MailError(
+              'CAPABILITY_UNSUPPORTED',
+              'unchangedSince requires CONDSTORE to be enabled.',
+              'Omit unchangedSince, or use a server that enables CONDSTORE.',
+            );
+          }
+          if (Date.now() >= plan.budgetDeadline) {
+            return paused();
+          }
+          const progress = await runInChunks({
+            uids: input.uids,
+            budgetMs: Math.max(0, plan.budgetDeadline - Date.now()),
+            signal: currentRequestSignal(),
+            beforeChunk: () => this.armChunk(session, account, plan, plan.budgetDeadline),
+            onChunk: (chunk) =>
+              continueChunk(chunk, async () => {
+                const update = await box.setFlags(
+                  chunk,
+                  flags,
+                  input.operation,
+                  input.unchangedSince,
+                );
+                return flagResults(chunk, update);
+              }),
           });
-          const clearsDeleted = summaries.some((item) =>
-            item.flags.some((flag) => flag.toLowerCase() === '\\deleted'),
-          );
-          assertMutation(account, clearsDeleted ? 'delete' : 'message-write');
-        }
-        if (input.unchangedSince && !session.condstoreEnabled()) {
-          throw new MailError(
-            'CAPABILITY_UNSUPPORTED',
-            'unchangedSince requires CONDSTORE to be enabled.',
-            'Omit unchangedSince, or use a server that enables CONDSTORE.',
-          );
-        }
-        const deadline = Date.now() + plan.budgetMs;
-        const progress = await runInChunks({
-          uids: input.uids,
-          budgetMs: plan.budgetMs,
-          signal: currentRequestSignal(),
-          beforeChunk: () => this.armChunk(session, account, plan, deadline),
-          onChunk: async (chunk) => {
-            const update = await box.setFlags(chunk, flags, input.operation, input.unchangedSince);
-            return flagResults(chunk, update);
-          },
+          return {
+            ...progressFields(progress),
+            account: account.id,
+            mailbox: input.mailbox,
+            uids: progress.results.filter((item) => item.ok).map((item) => item.uid),
+            operation: input.operation,
+            flags,
+            results: progress.results,
+          };
         });
-        return {
-          ...progressFields(progress),
-          account: account.id,
-          mailbox: input.mailbox,
-          uids: progress.results.filter((item) => item.ok).map((item) => item.uid),
-          operation: input.operation,
-          flags,
-          results: progress.results,
-        };
-      }),
+      },
+      { onTimeout: paused },
     );
   }
 
-  async copyOrMove(input: TransferInput, move: boolean): Promise<Record<string, unknown>> {
+  async copyOrMove(
+    input: TransferInput,
+    move: boolean,
+    window?: BulkWindow,
+  ): Promise<Record<string, unknown>> {
     const account = this.account(input.account);
     assertMutation(account, move ? 'delete' : 'message-write');
     this.assertBulk(input.uids, account.limits.maxBulk);
-    return this.withBulk(account, (session, plan) =>
-      session.withMailbox(input.mailbox, 'write', async (box) => {
-        this.assertUid(box, input.uidValidity);
-        if (move && !session.hasCapability('MOVE') && !session.hasCapability('UIDPLUS')) {
-          throw new MailError(
-            'CAPABILITY_UNSUPPORTED',
-            'This server has neither MOVE nor UIDPLUS. Copying and then expunging would remove every \\Deleted message, not only the requested UIDs.',
-            'Use a server with MOVE or UIDPLUS. allowPermanentDelete is not consent to expunge unrelated messages.',
-          );
+    const paused = (): Record<string, unknown> => ({
+      ...budgetPaused(input.uids),
+      account: account.id,
+      mailbox: input.mailbox,
+      destination: input.destination,
+      move,
+    });
+    return this.withBulk(
+      account,
+      (session, plan) => {
+        if (Date.now() >= plan.budgetDeadline) {
+          return Promise.resolve(paused());
         }
-        const deadline = Date.now() + plan.budgetMs;
-        const progress = await runInChunks({
-          uids: input.uids,
-          budgetMs: plan.budgetMs,
-          signal: currentRequestSignal(),
-          beforeChunk: () => this.armChunk(session, account, plan, deadline),
-          onChunk: async (chunk) => {
-            if (!move) {
-              const map = await box.copy(chunk, input.destination);
-              return chunk.map((uid) => ({
-                uid,
-                ok: true,
-                value: map[String(uid)] ?? null,
-              }));
-            }
-            const moved = await box.move(chunk, input.destination);
-            return chunk.map((uid) => {
-              if (moved.kept.includes(uid)) {
-                return {
-                  uid,
-                  ok: false,
-                  code: 'PROTOCOL_ERROR',
-                  message:
-                    'The copy was not confirmed with COPYUID, so the original was left in place.',
-                };
-              }
-              return { uid, ok: true, value: moved.map[String(uid)] ?? null };
-            });
-          },
+        return session.withMailbox(input.mailbox, 'write', async (box) => {
+          this.assertUid(box, input.uidValidity);
+          if (move && !session.moveSupported() && !session.uidPlusSupported()) {
+            throw new MailError(
+              'CAPABILITY_UNSUPPORTED',
+              'This server has neither MOVE nor UIDPLUS. Copying and then expunging would remove every \\Deleted message, not only the requested UIDs.',
+              'Use a server with MOVE or UIDPLUS. allowPermanentDelete is not consent to expunge unrelated messages.',
+            );
+          }
+          if (Date.now() >= plan.budgetDeadline) {
+            return paused();
+          }
+          const progress = await runInChunks({
+            uids: input.uids,
+            budgetMs: Math.max(0, plan.budgetDeadline - Date.now()),
+            signal: currentRequestSignal(),
+            beforeChunk: () => this.armChunk(session, account, plan, plan.budgetDeadline),
+            onChunk: (chunk) =>
+              continueChunk(chunk, async () => {
+                if (!move) {
+                  const map = await box.copy(chunk, input.destination);
+                  return chunk.map((uid) => ({
+                    uid,
+                    ok: true,
+                    value: map[String(uid)] ?? null,
+                  }));
+                }
+                const moved = await box.move(chunk, input.destination);
+                return chunk.map((uid) => {
+                  if (moved.kept.includes(uid)) {
+                    return {
+                      uid,
+                      ok: false,
+                      code: 'PROTOCOL_ERROR',
+                      message:
+                        'The copy was not confirmed with COPYUID, so the original was left in place.',
+                    };
+                  }
+                  return { uid, ok: true, value: moved.map[String(uid)] ?? null };
+                });
+              }),
+          });
+          return {
+            ...progressFields(progress),
+            account: account.id,
+            mailbox: input.mailbox,
+            destination: input.destination,
+            move,
+            results: progress.results,
+          };
         });
-        return {
-          ...progressFields(progress),
-          account: account.id,
-          mailbox: input.mailbox,
-          destination: input.destination,
-          move,
-          results: progress.results,
-        };
-      }),
+      },
+      { onTimeout: paused, ...(window ? { window } : {}) },
     );
   }
 
@@ -894,43 +938,77 @@ export class MailService {
     const account = this.account(input.account);
     if (input.permanent) {
       assertMutation(account, 'permanent');
-      return this.withBulk(account, (session, plan) =>
-        session.withMailbox(input.mailbox, 'write', async (box) => {
-          this.assertUid(box, input.uidValidity);
-          if (!session.hasCapability('UIDPLUS')) {
-            throw new MailError(
-              'CAPABILITY_UNSUPPORTED',
-              'Permanent delete of specific UIDs requires UIDPLUS. Without it, EXPUNGE removes every \\Deleted message in the mailbox.',
-              'Move the messages to Trash, or use a server that advertises UIDPLUS.',
-            );
+      const paused = (): Record<string, unknown> => ({
+        ...budgetPaused(input.uids),
+        account: account.id,
+        mailbox: input.mailbox,
+        permanent: true,
+        uids: [],
+      });
+      return this.withBulk(
+        account,
+        (session, plan) => {
+          if (Date.now() >= plan.budgetDeadline) {
+            return Promise.resolve(paused());
           }
-          const deadline = Date.now() + plan.budgetMs;
-          const progress = await runInChunks({
-            uids: input.uids,
-            budgetMs: plan.budgetMs,
-            signal: currentRequestSignal(),
-            beforeChunk: () => this.armChunk(session, account, plan, deadline),
-            onChunk: async (chunk) => {
-              await box.expunge(chunk);
-              return chunk.map((uid) => ({ uid, ok: true, value: true }));
-            },
+          return session.withMailbox(input.mailbox, 'write', async (box) => {
+            this.assertUid(box, input.uidValidity);
+            if (!session.uidPlusSupported()) {
+              throw new MailError(
+                'CAPABILITY_UNSUPPORTED',
+                'Permanent delete of specific UIDs requires UIDPLUS. Without it, EXPUNGE removes every \\Deleted message in the mailbox.',
+                'Move the messages to Trash, or use a server that advertises UIDPLUS.',
+              );
+            }
+            if (Date.now() >= plan.budgetDeadline) {
+              return paused();
+            }
+            const progress = await runInChunks({
+              uids: input.uids,
+              budgetMs: Math.max(0, plan.budgetDeadline - Date.now()),
+              signal: currentRequestSignal(),
+              beforeChunk: () => this.armChunk(session, account, plan, plan.budgetDeadline),
+              onChunk: (chunk) =>
+                continueChunk(chunk, async () => {
+                  await box.expunge(chunk);
+                  return chunk.map((uid) => ({ uid, ok: true, value: true }));
+                }),
+            });
+            return {
+              ...progressFields(progress),
+              account: account.id,
+              mailbox: input.mailbox,
+              permanent: true,
+              uids: progress.results.filter((item) => item.ok).map((item) => item.uid),
+              results: progress.results,
+            };
           });
-          return {
-            ...progressFields(progress),
-            account: account.id,
-            mailbox: input.mailbox,
-            permanent: true,
-            uids: progress.results.filter((item) => item.ok).map((item) => item.uid),
-            results: progress.results,
-          };
-        }),
+        },
+        { onTimeout: paused },
       );
     }
     assertMutation(account, 'delete');
-    const trash = await this.withImap(
-      account,
-      async (session) => (await this.special(account, session)).trash,
-    );
+    const window = this.bulkWindow(account);
+    const pausedMove = (): Record<string, unknown> => ({
+      ...budgetPaused(input.uids),
+      account: account.id,
+      mailbox: input.mailbox,
+      move: true,
+    });
+    let trash: string | undefined;
+    try {
+      trash = await this.withImap(
+        account,
+        async (session) => (await this.special(account, session)).trash,
+        undefined,
+        window.poolDeadline,
+      );
+    } catch (error) {
+      if (error instanceof MailError && error.code === 'TIMEOUT') {
+        return pausedMove();
+      }
+      throw error;
+    }
     if (!trash) {
       throw new MailError(
         'NOT_FOUND',
@@ -944,7 +1022,7 @@ export class MailService {
         'These messages are already in Trash. Pass permanent true to expunge them.',
       );
     }
-    return this.copyOrMove({ ...input, destination: trash }, true);
+    return this.copyOrMove({ ...input, destination: trash }, true, window);
   }
 
   async expunge(accountId: string | undefined, mailbox: string): Promise<Record<string, unknown>> {
@@ -980,53 +1058,70 @@ export class MailService {
     const account = this.account(input.account);
     assertMutation(account, 'message-write');
     this.assertBulk(input.uids, account.limits.maxBulk);
-    return this.withBulk(account, (session, plan) =>
-      session.withMailbox(input.mailbox, 'write', async (box) => {
-        this.assertUid(box, input.uidValidity);
-        const deadline = Date.now() + plan.budgetMs;
-        const progress = await runInChunks({
-          uids: input.uids,
-          budgetMs: plan.budgetMs,
-          signal: currentRequestSignal(),
-          beforeChunk: () => this.armChunk(session, account, plan, deadline),
-          onChunk: (chunk) =>
-            isolateNotFound(chunk, async (slice) => {
-              try {
-                await box.setLabels(slice, input.labels, input.operation);
-                return slice.map((uid) => ({ uid, ok: true }));
-              } catch (error) {
-                const mapped =
-                  error instanceof MailError
-                    ? error
-                    : new MailError('PROTOCOL_ERROR', 'The UID operation failed.');
-                if (mapped.code === 'CAPABILITY_UNSUPPORTED') {
-                  throw mapped;
+    const paused = (): Record<string, unknown> => ({
+      ...budgetPaused(input.uids),
+      account: account.id,
+      mailbox: input.mailbox,
+      uids: [],
+      labels: input.labels,
+      operation: input.operation,
+    });
+    return this.withBulk(
+      account,
+      (session, plan) => {
+        if (Date.now() >= plan.budgetDeadline) {
+          return Promise.resolve(paused());
+        }
+        return session.withMailbox(input.mailbox, 'write', async (box) => {
+          this.assertUid(box, input.uidValidity);
+          if (Date.now() >= plan.budgetDeadline) {
+            return paused();
+          }
+          const progress = await runInChunks({
+            uids: input.uids,
+            budgetMs: Math.max(0, plan.budgetDeadline - Date.now()),
+            signal: currentRequestSignal(),
+            beforeChunk: () => this.armChunk(session, account, plan, plan.budgetDeadline),
+            onChunk: (chunk) =>
+              isolateNotFound(chunk, async (slice) => {
+                try {
+                  await box.setLabels(slice, input.labels, input.operation);
+                  return slice.map((uid) => ({ uid, ok: true }));
+                } catch (error) {
+                  const mapped =
+                    error instanceof MailError
+                      ? error
+                      : new MailError('PROTOCOL_ERROR', 'The UID operation failed.');
+                  if (mapped.code === 'CAPABILITY_UNSUPPORTED') {
+                    throw mapped;
+                  }
+                  if (mapped.code === 'TIMEOUT' || mapped.code === 'CONNECTION_FAILED') {
+                    throw mapped;
+                  }
+                  if (mapped.code === 'NOT_FOUND' && slice.length > 1) {
+                    throw mapped;
+                  }
+                  return slice.map((uid) => ({
+                    uid,
+                    ok: false,
+                    code: mapped.code,
+                    message: mapped.message,
+                  }));
                 }
-                if (mapped.code === 'TIMEOUT' || mapped.code === 'CONNECTION_FAILED') {
-                  throw mapped;
-                }
-                if (mapped.code === 'NOT_FOUND' && slice.length > 1) {
-                  throw mapped;
-                }
-                return slice.map((uid) => ({
-                  uid,
-                  ok: false,
-                  code: mapped.code,
-                  message: mapped.message,
-                }));
-              }
-            }),
+              }),
+          });
+          return {
+            ...progressFields(progress),
+            account: account.id,
+            mailbox: input.mailbox,
+            uids: progress.results.filter((item) => item.ok).map((item) => item.uid),
+            labels: input.labels,
+            operation: input.operation,
+            results: progress.results,
+          };
         });
-        return {
-          ...progressFields(progress),
-          account: account.id,
-          mailbox: input.mailbox,
-          uids: progress.results.filter((item) => item.ok).map((item) => item.uid),
-          labels: input.labels,
-          operation: input.operation,
-          results: progress.results,
-        };
-      }),
+      },
+      { onTimeout: paused },
     );
   }
 
@@ -1036,13 +1131,29 @@ export class MailService {
     if ((input.action === 'copy' || input.action === 'move') && !input.destination) {
       throw new MailError('INVALID_ARGUMENT', 'destination is required for copy and move.');
     }
-    const trash =
-      input.action === 'delete' && !input.permanent
-        ? await this.withImap(
-            account,
-            async (session) => (await this.special(account, session)).trash,
-          )
-        : undefined;
+    const window = this.bulkWindow(account);
+    const paused = (): Record<string, unknown> => ({
+      ...budgetPaused(input.uids),
+      account: account.id,
+      mailbox: input.mailbox,
+      action: input.action,
+    });
+    let trash: string | undefined;
+    if (input.action === 'delete' && !input.permanent) {
+      try {
+        trash = await this.withImap(
+          account,
+          async (session) => (await this.special(account, session)).trash,
+          undefined,
+          window.poolDeadline,
+        );
+      } catch (error) {
+        if (error instanceof MailError && error.code === 'TIMEOUT') {
+          return paused();
+        }
+        throw error;
+      }
+    }
     if (input.action === 'delete' && !input.permanent) {
       assertMutation(account, 'delete');
       if (!trash) {
@@ -1077,51 +1188,60 @@ export class MailService {
         assertMutation(account, 'message-write');
       }
     }
-    return this.withBulk(account, (session, plan) =>
-      session.withMailbox(input.mailbox, 'write', async (box) => {
-        this.assertUid(box, input.uidValidity);
-        if (input.action === 'setFlags' && !touchesDeleted(normalizeFlags(input.flags ?? []))) {
-          const summaries = await box.fetchSummaries(input.uids, {
-            snippet: false,
-            snippetChars: 0,
+    return this.withBulk(
+      account,
+      (session, plan) => {
+        if (Date.now() >= plan.budgetDeadline) {
+          return Promise.resolve(paused());
+        }
+        return session.withMailbox(input.mailbox, 'write', async (box) => {
+          this.assertUid(box, input.uidValidity);
+          if (input.action === 'setFlags' && !touchesDeleted(normalizeFlags(input.flags ?? []))) {
+            const summaries = await box.fetchSummaries(input.uids, {
+              snippet: false,
+              snippetChars: 0,
+            });
+            const clearsDeleted = summaries.some((item) =>
+              item.flags.some((flag) => flag.toLowerCase() === '\\deleted'),
+            );
+            assertMutation(account, clearsDeleted ? 'delete' : 'message-write');
+          }
+          if (
+            (input.action === 'move' || (input.action === 'delete' && !input.permanent)) &&
+            !session.moveSupported() &&
+            !session.uidPlusSupported()
+          ) {
+            throw new MailError(
+              'CAPABILITY_UNSUPPORTED',
+              'This server has neither MOVE nor UIDPLUS. Copying and then expunging would remove every \\Deleted message, not only the requested UIDs.',
+            );
+          }
+          if (input.action === 'delete' && input.permanent && !session.uidPlusSupported()) {
+            throw new MailError(
+              'CAPABILITY_UNSUPPORTED',
+              'Permanent delete of specific UIDs requires UIDPLUS.',
+            );
+          }
+          if (Date.now() >= plan.budgetDeadline) {
+            return paused();
+          }
+          const progress = await runInChunks({
+            uids: input.uids,
+            budgetMs: Math.max(0, plan.budgetDeadline - Date.now()),
+            signal: currentRequestSignal(),
+            beforeChunk: () => this.armChunk(session, account, plan, plan.budgetDeadline),
+            onChunk: (chunk) => this.bulkChunk(input, box, session, chunk, trash),
           });
-          const clearsDeleted = summaries.some((item) =>
-            item.flags.some((flag) => flag.toLowerCase() === '\\deleted'),
-          );
-          assertMutation(account, clearsDeleted ? 'delete' : 'message-write');
-        }
-        if (
-          (input.action === 'move' || (input.action === 'delete' && !input.permanent)) &&
-          !session.hasCapability('MOVE') &&
-          !session.hasCapability('UIDPLUS')
-        ) {
-          throw new MailError(
-            'CAPABILITY_UNSUPPORTED',
-            'This server has neither MOVE nor UIDPLUS. Copying and then expunging would remove every \\Deleted message, not only the requested UIDs.',
-          );
-        }
-        if (input.action === 'delete' && input.permanent && !session.hasCapability('UIDPLUS')) {
-          throw new MailError(
-            'CAPABILITY_UNSUPPORTED',
-            'Permanent delete of specific UIDs requires UIDPLUS.',
-          );
-        }
-        const deadline = Date.now() + plan.budgetMs;
-        const progress = await runInChunks({
-          uids: input.uids,
-          budgetMs: plan.budgetMs,
-          signal: currentRequestSignal(),
-          beforeChunk: () => this.armChunk(session, account, plan, deadline),
-          onChunk: (chunk) => this.bulkChunk(input, box, session, chunk, trash),
+          return {
+            ...progressFields(progress),
+            account: account.id,
+            mailbox: input.mailbox,
+            action: input.action,
+            results: progress.results,
+          };
         });
-        return {
-          ...progressFields(progress),
-          account: account.id,
-          mailbox: input.mailbox,
-          action: input.action,
-          results: progress.results,
-        };
-      }),
+      },
+      { onTimeout: paused, window },
     );
   }
 
@@ -2199,156 +2319,199 @@ export class MailService {
         assertMutation(account, 'message-write');
       }
     }
-    const plan = this.chunkPlan(account);
-    return this.withImap(
-      account,
-      async (session) => {
-        const paths = await this.folderPaths(account, session, input);
-        const compiled = compileSearch(input.search);
-        assertSearchCapabilities(compiled.requires, (name) => session.hasCapability(name));
-        const scope = scopeFor(paths, input.search, maxPerFolder, `bulk:${input.action}`);
-        const { scans } = await scanFolders(session, paths, {
-          compiled,
-          keys,
-          order,
-          ...(cursor ? { cursor } : {}),
-          maxPerFolder,
-          materialize: true,
-        });
-        const matched = scans.reduce((sum, scan) => sum + scan.matched, 0);
-        const incomplete = scans.some(
-          (scan) => scan.truncated || scan.summaries.length < scan.matched,
-        );
-        if (!dryRun && (incomplete || matched > account.limits.maxBulk)) {
-          throw new MailError(
-            'SIZE_LIMIT',
-            incomplete
-              ? `The search matches ${matched} messages and this run did not load every one of them.`
-              : `The search matches ${matched} messages and the bulk maximum is ${account.limits.maxBulk}.`,
-            'Narrow the search or raise the cap. Nothing was changed. A dry run can preview them.',
+    const plan = this.bulkWindow(account);
+    const bare = (): Record<string, unknown> => ({
+      ok: false,
+      account: account.id,
+      dryRun,
+      action: input.action,
+      matched: 0,
+      complete: false,
+      remaining: [],
+      stopped: 'budget' as const,
+      results: [],
+      items: [],
+      nextCursor: null,
+      total: 0,
+      offset: 0,
+      truncated: false,
+      order,
+      snapshot: snapshotOf([]),
+    });
+    try {
+      return await this.withImap(
+        account,
+        async (session) => {
+          if (!dryRun && Date.now() >= plan.budgetDeadline) {
+            return bare();
+          }
+          const paths = await this.folderPaths(account, session, input);
+          const compiled = compileSearch(input.search);
+          assertSearchCapabilities(compiled.requires, (name) => session.hasCapability(name));
+          const scope = scopeFor(paths, input.search, maxPerFolder, `bulk:${input.action}`);
+          const { scans, incomplete: scanCut } = await scanFolders(session, paths, {
+            compiled,
+            keys,
+            order,
+            ...(cursor ? { cursor } : {}),
+            maxPerFolder,
+            materialize: true,
+            ...(!dryRun ? { deadlineMs: plan.budgetDeadline } : {}),
+          });
+          const matched = scans.reduce((sum, scan) => sum + scan.matched, 0);
+          const folderIncomplete = scans.some(
+            (scan) => scan.truncated || scan.summaries.length < scan.matched,
           );
-        }
-        const rows = rowsFromScans(scans);
-        const applied: Array<{
-          mailbox: string;
-          uid: number;
-          ok: boolean;
-          code?: string;
-          message?: string;
-        }> = [];
-        const remaining: Array<{ mailbox: string; uid: number }> = [];
-        let stopped: 'budget' | 'cancelled' | null = null;
-        if (!dryRun) {
-          const destination =
-            input.action === 'archive'
-              ? (input.destination ?? (await this.special(account, session)).archive)
-              : input.destination;
-          if ((input.action === 'move' || input.action === 'archive') && !destination) {
-            throw new MailError('NOT_FOUND', 'No destination mailbox could be resolved.');
+          if (!dryRun && !scanCut && (folderIncomplete || matched > account.limits.maxBulk)) {
+            throw new MailError(
+              'SIZE_LIMIT',
+              folderIncomplete
+                ? `The search matches ${matched} messages and this run did not load every one of them.`
+                : `The search matches ${matched} messages and the bulk maximum is ${account.limits.maxBulk}.`,
+              'Narrow the search or raise the cap. Nothing was changed. A dry run can preview them.',
+            );
           }
-          const deadline = Date.now() + plan.budgetMs;
-          for (const scan of scans) {
-            const uids = scan.summaries.map((item) => item.uid);
-            if (uids.length === 0) {
-              continue;
+          const rows = rowsFromScans(scans);
+          const applied: Array<{
+            mailbox: string;
+            uid: number;
+            ok: boolean;
+            code?: string;
+            message?: string;
+          }> = [];
+          const remaining: Array<{ mailbox: string; uid: number }> = [];
+          let stopped: ChunkProgress['stopped'] = null;
+          const budgetGone = !dryRun && (scanCut || Date.now() >= plan.budgetDeadline);
+          if (budgetGone) {
+            stopped = 'budget';
+            for (const scan of scans) {
+              remaining.push(
+                ...scan.summaries.map((item) => ({ mailbox: scan.mailbox, uid: item.uid })),
+              );
             }
-            if (stopped) {
-              remaining.push(...uids.map((uid) => ({ mailbox: scan.mailbox, uid })));
-              continue;
+          } else if (!dryRun) {
+            const destination =
+              input.action === 'archive'
+                ? (input.destination ?? (await this.special(account, session)).archive)
+                : input.destination;
+            if ((input.action === 'move' || input.action === 'archive') && !destination) {
+              throw new MailError('NOT_FOUND', 'No destination mailbox could be resolved.');
             }
-            await session.withMailbox(scan.mailbox, 'write', async (box) => {
-              const progress = await runInChunks({
-                uids,
-                budgetMs: Math.max(1, deadline - Date.now()),
-                signal: currentRequestSignal(),
-                beforeChunk: () => this.armChunk(session, account, plan, deadline),
-                onChunk: async (chunk) => {
-                  if (input.action === 'addFlags' || input.action === 'removeFlags') {
-                    const update = await box.setFlags(
-                      chunk,
-                      normalizeFlags(input.flags ?? []),
-                      input.action === 'addFlags' ? 'add' : 'remove',
-                    );
-                    return flagResults(chunk, update);
-                  }
-                  if (!destination) {
-                    throw new MailError('NOT_FOUND', 'No destination mailbox could be resolved.');
-                  }
-                  if (!session.hasCapability('MOVE') && !session.hasCapability('UIDPLUS')) {
-                    throw new MailError(
-                      'CAPABILITY_UNSUPPORTED',
-                      'This server has neither MOVE nor UIDPLUS. Copying and then expunging would remove every \\Deleted message, not only the requested UIDs.',
-                    );
-                  }
-                  const moved = await box.move(chunk, destination);
-                  return chunk.map((uid) => {
-                    if (moved.kept.includes(uid)) {
-                      return {
-                        uid,
-                        ok: false,
-                        code: 'PROTOCOL_ERROR',
-                        message:
-                          'The copy was not confirmed with COPYUID, so the original was left in place.',
-                      };
-                    }
-                    return { uid, ok: true, value: moved.map[String(uid)] ?? null };
-                  });
-                },
-              });
-              for (const row of progress.results) {
-                applied.push({
-                  mailbox: scan.mailbox,
-                  uid: row.uid,
-                  ok: row.ok,
-                  ...(row.code ? { code: row.code } : {}),
-                  ...(row.message ? { message: row.message } : {}),
+            for (const scan of scans) {
+              const uids = scan.summaries.map((item) => item.uid);
+              if (uids.length === 0) {
+                continue;
+              }
+              if (stopped) {
+                remaining.push(...uids.map((uid) => ({ mailbox: scan.mailbox, uid })));
+                continue;
+              }
+              await session.withMailbox(scan.mailbox, 'write', async (box) => {
+                const progress = await runInChunks({
+                  uids,
+                  budgetMs: Math.max(0, plan.budgetDeadline - Date.now()),
+                  signal: currentRequestSignal(),
+                  beforeChunk: () => this.armChunk(session, account, plan, plan.budgetDeadline),
+                  onChunk: (chunk) =>
+                    continueChunk(chunk, async () => {
+                      if (input.action === 'addFlags' || input.action === 'removeFlags') {
+                        const update = await box.setFlags(
+                          chunk,
+                          normalizeFlags(input.flags ?? []),
+                          input.action === 'addFlags' ? 'add' : 'remove',
+                        );
+                        return flagResults(chunk, update);
+                      }
+                      if (!destination) {
+                        throw new MailError(
+                          'NOT_FOUND',
+                          'No destination mailbox could be resolved.',
+                        );
+                      }
+                      if (!session.moveSupported() && !session.uidPlusSupported()) {
+                        throw new MailError(
+                          'CAPABILITY_UNSUPPORTED',
+                          'This server has neither MOVE nor UIDPLUS. Copying and then expunging would remove every \\Deleted message, not only the requested UIDs.',
+                        );
+                      }
+                      const moved = await box.move(chunk, destination);
+                      return chunk.map((uid) => {
+                        if (moved.kept.includes(uid)) {
+                          return {
+                            uid,
+                            ok: false,
+                            code: 'PROTOCOL_ERROR',
+                            message:
+                              'The copy was not confirmed with COPYUID, so the original was left in place.',
+                          };
+                        }
+                        return { uid, ok: true, value: moved.map[String(uid)] ?? null };
+                      });
+                    }),
                 });
-              }
-              remaining.push(...progress.remaining.map((uid) => ({ mailbox: scan.mailbox, uid })));
-              if (progress.stopped) {
-                stopped = progress.stopped;
-              }
-            });
+                for (const row of progress.results) {
+                  applied.push({
+                    mailbox: scan.mailbox,
+                    uid: row.uid,
+                    ok: row.ok,
+                    ...(row.code ? { code: row.code } : {}),
+                    ...(row.message ? { message: row.message } : {}),
+                  });
+                }
+                remaining.push(
+                  ...progress.remaining.map((uid) => ({ mailbox: scan.mailbox, uid })),
+                );
+                if (progress.stopped) {
+                  stopped = progress.stopped;
+                }
+              });
+            }
           }
-        }
-        const page = pageSummaryRows(rows, {
-          limit,
-          keys,
-          order,
-          ...(cursor ? { cursor } : {}),
-          scope,
-          folders: folderPayload(scans),
-        });
-        const items = page.items.map((row) => ({
-          mailbox: row.mailbox,
-          uid: row.uid,
-          uidValidity: row.uidValidity,
-          subject: row.summary.subject ?? null,
-          date: row.date ?? row.arrival ?? null,
-        }));
-        session.setCommandTimeout?.(account.imap.timeoutMs);
-        const applyComplete = dryRun || (remaining.length === 0 && stopped === null);
-        return {
-          ok: applyComplete && applied.every((item) => item.ok),
-          account: account.id,
-          dryRun,
-          action: input.action,
-          matched,
-          complete: applyComplete,
-          remaining,
-          stopped,
-          results: applied,
-          items,
-          nextCursor: dryRun ? page.nextCursor : null,
-          total: page.total,
-          offset: page.offset,
-          truncated: scans.some((scan) => scan.truncated),
-          order,
-          snapshot: snapshotOf(scans),
-        };
-      },
-      Math.min(58_000, account.imap.timeoutMs + plan.budgetMs),
-    );
+          const page = pageSummaryRows(rows, {
+            limit,
+            keys,
+            order,
+            ...(cursor ? { cursor } : {}),
+            scope,
+            folders: folderPayload(scans),
+          });
+          const items = page.items.map((row) => ({
+            mailbox: row.mailbox,
+            uid: row.uid,
+            uidValidity: row.uidValidity,
+            subject: row.summary.subject ?? null,
+            date: row.date ?? row.arrival ?? null,
+          }));
+          session.setCommandTimeout?.(account.imap.timeoutMs);
+          const applyComplete = dryRun || (remaining.length === 0 && stopped === null);
+          return {
+            ok: applyComplete && applied.every((item) => item.ok),
+            account: account.id,
+            dryRun,
+            action: input.action,
+            matched,
+            complete: applyComplete,
+            remaining,
+            stopped,
+            results: applied,
+            items,
+            nextCursor: dryRun ? page.nextCursor : null,
+            total: page.total,
+            offset: page.offset,
+            truncated: scans.some((scan) => scan.truncated),
+            order,
+            snapshot: snapshotOf(scans),
+          };
+        },
+        undefined,
+        plan.poolDeadline,
+      );
+    } catch (error) {
+      if (!dryRun && error instanceof MailError && error.code === 'TIMEOUT') {
+        return bare();
+      }
+      throw error;
+    }
   }
 
   async close(): Promise<void> {
@@ -3111,8 +3274,14 @@ export class MailService {
     account: ResolvedAccount,
     fn: (session: ImapSession) => Promise<T>,
     timeoutMs?: number,
+    deadlineMs?: number,
   ): Promise<T> {
-    return this.pool.use(account.id, (session) => fn(session), timeoutMs ?? account.imap.timeoutMs);
+    return this.pool.use(
+      account.id,
+      (session) => fn(session),
+      timeoutMs ?? account.imap.timeoutMs,
+      deadlineMs,
+    );
   }
 
   private async withMailbox<T>(
@@ -3414,48 +3583,62 @@ export class MailService {
     }
   }
 
-  private chunkPlan(account: ResolvedAccount): {
-    budgetMs: number;
-    poolMs: number;
-    commandMs: number;
-  } {
+  private bulkWindow(account: ResolvedAccount): BulkWindow {
     const budgetMs = Math.min(account.limits.bulkBudgetMs, MAX_BULK_BUDGET_MS);
-    const room = Math.max(1_000, 58_000 - budgetMs);
-    const commandMs = Math.min(account.imap.timeoutMs, room);
-    return { budgetMs, poolMs: Math.min(58_000, budgetMs + commandMs), commandMs };
+    const start = Date.now();
+    const budgetDeadline = start + budgetMs;
+    // Acquire and the work share one clock. The pool waits a little past the
+    // budget so an in-flight command can return a partial result before the
+    // socket is closed, and the whole call stays under 60 seconds.
+    const poolDeadline = Math.min(start + 55_000, budgetDeadline + 8_000);
+    const slack = Math.max(1_000, poolDeadline - budgetDeadline);
+    const commandMs = Math.min(account.imap.timeoutMs, slack);
+    return { budgetMs, budgetDeadline, poolDeadline, commandMs };
   }
 
   private armChunk(
     session: ImapSession,
     account: ResolvedAccount,
-    plan: { commandMs: number },
+    plan: BulkWindow,
     deadline: number,
   ): void {
-    const left = deadline + 5_000 - Date.now();
+    const left = Math.min(deadline + 5_000, plan.poolDeadline - 500) - Date.now();
     session.setCommandTimeout?.(
-      Math.max(1_000, Math.min(account.imap.timeoutMs, plan.commandMs, left)),
+      Math.max(1_000, Math.min(account.imap.timeoutMs, plan.commandMs, Math.max(1_000, left))),
     );
   }
 
   private async withBulk<T>(
     account: ResolvedAccount,
-    fn: (
-      session: ImapSession,
-      plan: { budgetMs: number; poolMs: number; commandMs: number },
-    ) => Promise<T>,
+    fn: (session: ImapSession, plan: BulkWindow) => Promise<T>,
+    options?: { onTimeout?: () => T; window?: BulkWindow },
   ): Promise<T> {
-    const plan = this.chunkPlan(account);
-    return this.withImap(
-      account,
-      async (session) => {
-        try {
-          return await fn(session, plan);
-        } finally {
-          session.setCommandTimeout?.(account.imap.timeoutMs);
-        }
-      },
-      plan.poolMs,
-    );
+    const plan = options?.window ?? this.bulkWindow(account);
+    if (Date.now() >= plan.budgetDeadline) {
+      if (options?.onTimeout) {
+        return options.onTimeout();
+      }
+      throw new MailError('TIMEOUT', 'The bulk time budget elapsed before the call started.');
+    }
+    try {
+      return await this.withImap(
+        account,
+        async (session) => {
+          try {
+            return await fn(session, plan);
+          } finally {
+            session.setCommandTimeout?.(account.imap.timeoutMs);
+          }
+        },
+        undefined,
+        plan.poolDeadline,
+      );
+    } catch (error) {
+      if (options?.onTimeout && error instanceof MailError && error.code === 'TIMEOUT') {
+        return options.onTimeout();
+      }
+      throw error;
+    }
   }
 
   private async bulkChunk(
@@ -3502,7 +3685,7 @@ export class MailService {
         });
       }
       if (input.action === 'delete' && input.permanent) {
-        if (!session.hasCapability('UIDPLUS')) {
+        if (!session.uidPlusSupported()) {
           throw new MailError(
             'CAPABILITY_UNSUPPORTED',
             'Permanent delete of specific UIDs requires UIDPLUS.',
@@ -3791,11 +3974,59 @@ function andFlag(
   return andSearchQuery(compiled, { [flag]: value });
 }
 
+interface BulkWindow {
+  budgetMs: number;
+  budgetDeadline: number;
+  poolDeadline: number;
+  commandMs: number;
+}
+
+function budgetPaused(uids: number[]): {
+  ok: false;
+  complete: false;
+  remaining: number[];
+  stopped: 'budget';
+  results: [];
+} {
+  return {
+    ok: false,
+    complete: false,
+    remaining: uids,
+    stopped: 'budget',
+    results: [],
+  };
+}
+
+async function continueChunk(
+  chunk: number[],
+  run: () => Promise<
+    Array<{ uid: number; ok: boolean; code?: string; message?: string; value?: unknown }>
+  >,
+): Promise<Array<{ uid: number; ok: boolean; code?: string; message?: string; value?: unknown }>> {
+  try {
+    return await run();
+  } catch (error) {
+    const mapped =
+      error instanceof MailError
+        ? error
+        : new MailError('PROTOCOL_ERROR', 'The UID operation failed.');
+    if (mapped.code !== 'PROTOCOL_ERROR') {
+      throw mapped;
+    }
+    return chunk.map((uid) => ({
+      uid,
+      ok: false,
+      code: mapped.code,
+      message: mapped.message,
+    }));
+  }
+}
+
 function progressFields(progress: ChunkProgress): {
   ok: boolean;
   complete: boolean;
   remaining: number[];
-  stopped: 'budget' | 'cancelled' | null;
+  stopped: ChunkProgress['stopped'];
 } {
   return {
     ok: progress.complete && progress.results.every((item) => item.ok),

@@ -111,7 +111,7 @@ A top-level `password` is shorthand for password auth.
 | `maxBulk`            | 200      |
 | `bulkBudgetMs`       | 20000    |
 
-Account `limits` override the root object per key. Summary pages cannot exceed the lower of `maxPageSize` and 200. Pages that include bodies are capped at 20. `bulkBudgetMs` is the wall-clock budget for one bulk flag, copy, move, delete, label, or modify-by-search call. The call stops between chunks of 25 and returns `complete`, `remaining`, and `stopped`. The maximum is 50000, so the call finishes inside a 60 second request limit. Pass `remaining` back with the same action to continue. A move without MOVE expunges only UIDs confirmed by UIDPLUS `COPYUID`.
+Account `limits` override the root object per key. Summary pages cannot exceed the lower of `maxPageSize` and 200. Pages that include bodies are capped at 20. `bulkBudgetMs` is the wall-clock budget for one bulk flag, copy, move, delete, label, or modify-by-search call. It includes waiting for a connection and the modify-by-search folder scan. The call stops before the next chunk of 25 and returns `complete`, `remaining`, and `stopped` (`budget`, `cancelled`, `connection`, or null). The maximum is 50000, so the call finishes inside a 60 second request limit. Pass `remaining` back with the same action to continue. A move without MOVE expunges only UIDs confirmed by UIDPLUS `COPYUID`. MOVE and UIDPLUS are available when advertised, or when IMAP4rev2 is active.
 
 ## Folder scope
 

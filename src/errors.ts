@@ -186,7 +186,7 @@ export function mapTransportError(error: unknown): MailError {
   }
 
   if (
-    /econnrefused|econnreset|ehostunreach|enetunreach|epipe|socket hang up|connection closed|not connected|econnectionclosed/.test(
+    /econnrefused|econnreset|ehostunreach|enetunreach|epipe|socket hang up|connection closed|not connected|econnectionclosed|connection not available|socket is already closed|noconnection/.test(
       lower,
     ) ||
     [
@@ -196,6 +196,8 @@ export function mapTransportError(error: unknown): MailError {
       'ENETUNREACH',
       'EPIPE',
       'ECONNECTIONCLOSED',
+      'NoConnection',
+      'EConnectionClosed',
     ].includes(code)
   ) {
     return new MailError(

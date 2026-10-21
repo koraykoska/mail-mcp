@@ -664,7 +664,7 @@ Annotations: readOnlyHint=false, destructiveHint=false, idempotentHint=true, ope
 
 Copy messages
 
-COPY UIDs to another mailbox as one UID COPY per chunk, leaving the originals. Requires the destination to exist. Returns per-UID results and, when UIDPLUS is available, the new UID. complete is false and remaining lists UIDs not attempted when the time budget or cancellation stops the call. Blocked when readOnly. Prefer mail_move_messages when the original should disappear.
+COPY UIDs to another mailbox as one UID COPY per chunk, leaving the originals. Requires the destination to exist. Returns per-UID results and, when UIDPLUS is available, the new UID. complete is false and remaining lists UIDs not attempted when the time budget elapses, the connection drops, or the client cancels. Blocked when readOnly. Prefer mail_move_messages when the original should disappear.
 
 Annotations: readOnlyHint=false, destructiveHint=false, idempotentHint=false, openWorldHint=true.
 
@@ -686,7 +686,7 @@ Annotations: readOnlyHint=false, destructiveHint=false, idempotentHint=false, op
 
 Move messages
 
-Move UIDs to another mailbox in chunks. Uses UID MOVE when the server advertises MOVE. Otherwise UID COPY, then UID EXPUNGE of only the UIDs named by COPYUID. A UID the server does not confirm is left in place and reported; a duplicate in the destination is acceptable, losing the original is not. Without MOVE and UIDPLUS the call is refused, because a plain EXPUNGE would remove every \Deleted message. allowPermanentDelete does not permit that. Requires allowDelete. Destination must exist. complete is false and remaining lists UIDs not attempted when the time budget or cancellation stops the call.
+Move UIDs to another mailbox in chunks. Uses UID MOVE when the server advertises MOVE or IMAP4rev2 is active. Otherwise UID COPY, then UID EXPUNGE of only the UIDs named by COPYUID. UIDPLUS is decided the same way: advertised, or IMAP4rev2 active. A bare IMAP4rev2 token next to IMAP4rev1 is not enough. A UID the server does not confirm is left in place and reported; a duplicate in the destination is acceptable, losing the original is not. Without MOVE and UIDPLUS the call is refused, because a plain EXPUNGE would remove every \Deleted message. allowPermanentDelete does not permit that. Requires allowDelete. Destination must exist. complete is false and remaining lists UIDs not attempted when the time budget elapses, the connection drops, or the client cancels.
 
 Annotations: readOnlyHint=false, destructiveHint=true, idempotentHint=false, openWorldHint=true.
 
@@ -708,7 +708,7 @@ Annotations: readOnlyHint=false, destructiveHint=true, idempotentHint=false, ope
 
 Delete messages
 
-Delete UIDs. By default they are moved to the resolved Trash mailbox (special-use, config, or a well-known name). permanent true UID EXPUNGEs only those UIDs and requires both allowPermanentDelete and UIDPLUS. Without UIDPLUS the call is refused rather than expunging every \Deleted message. Deleting messages that are already in Trash requires permanent true. Requires allowDelete. Adding \Deleted via mail_set_flags is the same delete permission. Use mail_expunge_mailbox only when you intend to purge every \Deleted message in a mailbox.
+Delete UIDs. By default they are moved to the resolved Trash mailbox (special-use, config, or a well-known name). permanent true UID EXPUNGEs only those UIDs and requires both allowPermanentDelete and UIDPLUS. UIDPLUS counts when it is advertised or when IMAP4rev2 is active. Without it the call is refused rather than expunging every \Deleted message. Deleting messages that are already in Trash requires permanent true. Requires allowDelete. Adding \Deleted via mail_set_flags is the same delete permission. Use mail_expunge_mailbox only when you intend to purge every \Deleted message in a mailbox. complete is false and remaining lists UIDs not attempted when the time budget elapses, the connection drops, or the client cancels.
 
 Annotations: readOnlyHint=false, destructiveHint=true, idempotentHint=false, openWorldHint=true.
 
@@ -813,7 +813,7 @@ Annotations: readOnlyHint=false, destructiveHint=false, idempotentHint=true, ope
 
 Bulk modify messages
 
-Apply one action to many UIDs and return a per-UID result. UIDs are sent as set commands in chunks (UID STORE, UID COPY, UID MOVE, or UID EXPUNGE), not one round trip per message. Actions: addFlags, removeFlags, setFlags, copy, move, delete, addLabels, removeLabels. delete uses the Trash move unless permanent is true. A move without the MOVE extension copies and expunges only UIDs confirmed by COPYUID. copy and move need destination. Flag actions need flags. Label actions need labels and Gmail. The call itself succeeds when the batch was attempted; inspect results[].ok. complete is false and remaining lists UIDs not attempted when limits.bulkBudgetMs elapses or the client cancels. Pass remaining back to resume. UIDs above maxBulk are rejected up front.
+Apply one action to many UIDs and return a per-UID result. UIDs are sent as set commands in chunks (UID STORE, UID COPY, UID MOVE, or UID EXPUNGE), not one round trip per message. Actions: addFlags, removeFlags, setFlags, copy, move, delete, addLabels, removeLabels. delete uses the Trash move unless permanent is true. A move without MOVE copies and expunges only UIDs confirmed by COPYUID. MOVE and UIDPLUS count as available when advertised, or when IMAP4rev2 is active. copy and move need destination. Flag actions need flags. Label actions need labels and Gmail. ok is false when any UID failed or the call stopped early. complete is false and remaining lists UIDs not attempted when the time budget elapses, the connection drops, or the client cancels. A dropped connection sets stopped to connection. Pass remaining back to resume. UIDs above maxBulk are rejected up front.
 
 Annotations: readOnlyHint=false, destructiveHint=true, idempotentHint=false, openWorldHint=true.
 
@@ -1391,7 +1391,7 @@ Annotations: readOnlyHint=true, destructiveHint=false, idempotentHint=true, open
 
 Modify messages that match a search
 
-Apply addFlags, removeFlags, move, or archive to every message in a folder scope that matches search. dryRun defaults to true and only pages a preview. A real run is refused with SIZE_LIMIT, and changes nothing, when the match count exceeds limits.maxBulk or any folder is truncated or not fully loaded. The change uses the same chunked UID sets as the other bulk tools, and stops between chunks when limits.bulkBudgetMs elapses or the client cancels. complete is false and remaining lists mailbox and UID pairs not attempted. move and archive require allowDelete. Adding or removing \Deleted does too. A move without MOVE expunges only COPYUID-confirmed UIDs. There is no permanent delete here. The preview uses the shared snapshot cursor. The tool is a write: a readOnly account does not advertise it.
+Apply addFlags, removeFlags, move, or archive to every message in a folder scope that matches search. dryRun defaults to true and only pages a preview. A real run is refused with SIZE_LIMIT, and changes nothing, when the match count exceeds limits.maxBulk or any folder is truncated or not fully loaded. The change uses the same chunked UID sets as the other bulk tools. limits.bulkBudgetMs covers waiting for a connection, the folder scan, and the chunks. The call stops before the next chunk when that budget elapses, the connection drops, or the client cancels. complete is false and remaining lists mailbox and UID pairs that were found and not attempted. An empty remaining with stopped budget means the scan did not finish or the call ended before those matches were kept: repeat the same search. move and archive require allowDelete. Adding or removing \Deleted does too. A move without MOVE expunges only COPYUID-confirmed UIDs. MOVE and UIDPLUS count as available when advertised, or when IMAP4rev2 is active. There is no permanent delete here. The preview uses the shared snapshot cursor. The tool is a write: a readOnly account does not advertise it.
 
 Annotations: readOnlyHint=false, destructiveHint=true, idempotentHint=false, openWorldHint=true.
 

@@ -20,18 +20,21 @@ export interface UidResult {
   value?: unknown;
 }
 
+export type BulkStop = 'budget' | 'cancelled' | 'connection' | null;
+
 export interface ChunkProgress {
   results: UidResult[];
   remaining: number[];
   complete: boolean;
-  stopped: 'budget' | 'cancelled' | null;
+  stopped: BulkStop;
 }
 
 /**
  * Apply `onChunk` to successive UID slices until the list, the budget, or the
  * abort signal runs out. A chunk that is already running is allowed to finish.
- * Timeout and connection loss put that slice back into `remaining` so a retry
- * does not assume the server applied it.
+ * A timeout puts that slice back into `remaining` with `stopped: 'budget'`.
+ * A dropped connection does the same with `stopped: 'connection'`. A retry must
+ * not assume the server applied that slice.
  */
 export async function runInChunks(options: {
   uids: number[];
@@ -41,7 +44,7 @@ export async function runInChunks(options: {
   beforeChunk?: () => void;
   onChunk: (uids: number[]) => Promise<UidResult[]>;
 }): Promise<ChunkProgress> {
-  const budget = Math.min(Math.max(1, options.budgetMs), MAX_BULK_BUDGET_MS);
+  const budget = Math.min(Math.max(0, options.budgetMs), MAX_BULK_BUDGET_MS);
   const deadline = Date.now() + budget;
   const size = options.chunkSize ?? BULK_CHUNK_SIZE;
   const results: UidResult[] = [];
@@ -68,7 +71,7 @@ export async function runInChunks(options: {
           : new MailError('PROTOCOL_ERROR', 'The UID operation failed.');
       if (mapped.code === 'TIMEOUT' || mapped.code === 'CONNECTION_FAILED') {
         pending.unshift(...chunk);
-        stopped = 'budget';
+        stopped = mapped.code === 'CONNECTION_FAILED' ? 'connection' : 'budget';
         break;
       }
       if (!results.some((item) => item.ok)) {

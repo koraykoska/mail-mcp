@@ -187,6 +187,18 @@ export interface ImapSession {
   hasExactCapability(name: string): boolean;
   /** True only after ENABLE recorded CONDSTORE, not merely because it was advertised. */
   condstoreEnabled(): boolean;
+  /**
+   * UID MOVE is safe to send. True when MOVE is advertised, or IMAP4rev2 is active
+   * the way imapflow decides: ENABLE IMAP4REV2 took effect, or the session advertises
+   * IMAP4rev2 and not IMAP4rev1. A bare IMAP4rev2 token beside IMAP4rev1 is not enough.
+   */
+  moveSupported(): boolean;
+  /**
+   * UID EXPUNGE of specific UIDs is safe. True when UIDPLUS is advertised or IMAP4rev2
+   * is active. A bare IMAP4rev2 token beside IMAP4rev1 is not enough, because a plain
+   * EXPUNGE would remove every \\Deleted message.
+   */
+  uidPlusSupported(): boolean;
   serverId(): Record<string, string> | null;
   namespaces(): Promise<{
     personal: Array<{ prefix: string; delimiter: string | null }>;

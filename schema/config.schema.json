@@ -72,7 +72,7 @@
         },
         "bulkBudgetMs": {
           "default": 20000,
-          "description": "Wall-clock budget for one bulk change (flags, copy, move, delete, labels, modify-by-search). The call stops between chunks and returns the UIDs still to do. Capped at 50000 so the call finishes inside a 60 second request limit.",
+          "description": "Wall-clock budget for one bulk change (flags, copy, move, delete, labels, modify-by-search). It includes waiting for a connection and the modify-by-search folder scan. The call stops before the next chunk and returns the UIDs still to do. Capped at 50000 so the call finishes inside a 60 second request limit.",
           "type": "integer",
           "exclusiveMinimum": 0,
           "maximum": 50000
@@ -417,7 +417,7 @@
               },
               "bulkBudgetMs": {
                 "default": 20000,
-                "description": "Wall-clock budget for one bulk change (flags, copy, move, delete, labels, modify-by-search). The call stops between chunks and returns the UIDs still to do. Capped at 50000 so the call finishes inside a 60 second request limit.",
+                "description": "Wall-clock budget for one bulk change (flags, copy, move, delete, labels, modify-by-search). It includes waiting for a connection and the modify-by-search folder scan. The call stops before the next chunk and returns the UIDs still to do. Capped at 50000 so the call finishes inside a 60 second request limit.",
                 "type": "integer",
                 "exclusiveMinimum": 0,
                 "maximum": 50000

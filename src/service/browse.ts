@@ -113,11 +113,16 @@ export async function scanFolders(
      * cover the whole snapshot. A longer match is truncated and the counts are partial.
      */
     exactCap?: number;
+    /** Stop before the next folder once this absolute time has passed. */
+    deadlineMs?: number;
   },
-): Promise<{ scans: FolderScan[]; sortSource: 'server' | 'client' }> {
+): Promise<{ scans: FolderScan[]; sortSource: 'server' | 'client'; incomplete: boolean }> {
   const scans: FolderScan[] = [];
   let sortSource: 'server' | 'client' = 'client';
   for (const mailbox of paths) {
+    if (options.deadlineMs !== undefined && Date.now() >= options.deadlineMs) {
+      return { scans, sortSource, incomplete: true };
+    }
     const scan = await session.withMailbox(mailbox, 'read', async (box) => {
       if (
         options.singleUidValidity &&
@@ -222,7 +227,7 @@ export async function scanFolders(
   if (paths.length === 1 && scans[0]?.serverUids) {
     sortSource = 'server';
   }
-  return { scans, sortSource };
+  return { scans, sortSource, incomplete: false };
 }
 
 export async function fetchSummariesBatched(

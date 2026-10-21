@@ -113,7 +113,7 @@ export const limitsSchema = z
       .max(50_000)
       .default(20_000)
       .describe(
-        'Wall-clock budget for one bulk change (flags, copy, move, delete, labels, modify-by-search). The call stops between chunks and returns the UIDs still to do. Capped at 50000 so the call finishes inside a 60 second request limit.',
+        'Wall-clock budget for one bulk change (flags, copy, move, delete, labels, modify-by-search). It includes waiting for a connection and the modify-by-search folder scan. The call stops before the next chunk and returns the UIDs still to do. Capped at 50000 so the call finishes inside a 60 second request limit.',
       ),
   })
   .strict();

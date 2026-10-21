@@ -116,6 +116,14 @@ export class FakeSession implements ImapSession {
     return this.hasCapability('CONDSTORE') || this.hasCapability('QRESYNC');
   }
 
+  moveSupported(): boolean {
+    return this.hasCapability('MOVE');
+  }
+
+  uidPlusSupported(): boolean {
+    return this.hasCapability('UIDPLUS');
+  }
+
   serverId(): Record<string, string> | null {
     return this.hasCapability('ID') ? this.serverInfo : null;
   }
@@ -551,13 +559,13 @@ class FakeBox implements OpenMailbox {
     destination: string,
   ): Promise<{ map: Record<string, number>; kept: number[] }> {
     await this.session.pace();
-    if (this.session.hasCapability('MOVE')) {
+    if (this.session.moveSupported()) {
       const map = await this.copy(uids, destination);
       const moved = uids.filter((uid) => map[String(uid)] !== undefined);
       this.box.messages = this.box.messages.filter((message) => !moved.includes(message.uid));
       return { map, kept: uids.filter((uid) => map[String(uid)] === undefined) };
     }
-    if (!this.session.hasCapability('UIDPLUS')) {
+    if (!this.session.uidPlusSupported()) {
       throw new MailError('CAPABILITY_UNSUPPORTED', 'This server has neither MOVE nor UIDPLUS.');
     }
     const map = await this.copy(uids, destination);

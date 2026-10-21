@@ -40,6 +40,16 @@ export interface ScriptedOptions {
   icloud?: boolean;
   /** COPY stores the messages and answers OK without a COPYUID response code. */
   omitCopyUid?: boolean;
+  /**
+   * Drop the socket around one command. `nth` counts matches of `pattern` starting at 1.
+   * Without `apply`, the socket closes before that command runs.
+   * With `apply`, that command finishes and the next command closes the socket before it runs.
+   */
+  dropMatching?: { pattern: RegExp; nth?: number; apply?: boolean };
+  /** Advertised capabilities left out of the ENABLED response. The ENABLE command still succeeds. */
+  omitEnabled?: string[];
+  /** A UID SEARCH that matches every message answers ESEARCH ALL 1:* instead of listing UIDs. */
+  esearchAllStar?: boolean;
 }
 
 /**
@@ -56,6 +66,8 @@ export class ScriptedImap {
   private nextUid = 1;
   private clients = new Set<Socket>();
   readonly trace: string[] = [];
+  private dropHits = 0;
+  private dropNext = false;
   private readonly listening: Promise<void>;
 
   constructor(private readonly options: ScriptedOptions = {}) {
@@ -67,11 +79,40 @@ export class ScriptedImap {
       let commands = 0;
       let selected = false;
       let tlsUpgraded = false;
+      const enabled = new Set<string>();
       const write = (line: string): void => {
         if (!socket.destroyed) {
           socket.write(line);
         }
       };
+      const context = (): {
+        write: (line: string) => void;
+        selected: () => boolean;
+        select: () => void;
+        capabilities: string[];
+        tlsUpgraded: () => boolean;
+        markTls: () => void;
+        noteEnabled: (name: string) => void;
+        isRev2: () => boolean;
+      } => ({
+        write,
+        selected: () => selected,
+        select: () => {
+          selected = true;
+        },
+        capabilities,
+        tlsUpgraded: () => tlsUpgraded,
+        markTls: () => {
+          tlsUpgraded = true;
+        },
+        noteEnabled: (name: string) => {
+          enabled.add(name.toUpperCase());
+        },
+        isRev2: () =>
+          enabled.has('IMAP4REV2') ||
+          (capabilities.some((item) => item.toUpperCase() === 'IMAP4REV2') &&
+            !capabilities.some((item) => item.toUpperCase() === 'IMAP4REV1')),
+      });
       write('* OK scripted IMAP ready\r\n');
       const consume = (): void => {
         while (buffer.length > 0) {
@@ -93,18 +134,7 @@ export class ScriptedImap {
             if (buffer.subarray(0, 2).toString() === '\r\n') {
               buffer = buffer.subarray(2);
             }
-            this.handle(socket, line, data, {
-              write,
-              selected: () => selected,
-              select: () => {
-                selected = true;
-              },
-              capabilities,
-              tlsUpgraded: () => tlsUpgraded,
-              markTls: () => {
-                tlsUpgraded = true;
-              },
-            });
+            this.handle(socket, line, data, context());
             continue;
           }
           if (line.endsWith('}') && !line.includes('+')) {
@@ -115,18 +145,7 @@ export class ScriptedImap {
             socket.destroy();
             return;
           }
-          this.handle(socket, line, undefined, {
-            write,
-            selected: () => selected,
-            select: () => {
-              selected = true;
-            },
-            capabilities,
-            tlsUpgraded: () => tlsUpgraded,
-            markTls: () => {
-              tlsUpgraded = true;
-            },
-          });
+          this.handle(socket, line, undefined, context());
         }
       };
       socket.on('data', (chunk: Buffer) => {
@@ -160,6 +179,11 @@ export class ScriptedImap {
     return uid;
   }
 
+  /** Mailboxes that received a COPY or MOVE. */
+  copiedPaths(): string[] {
+    return [...this.copies.keys()];
+  }
+
   /** Messages currently in INBOX or a mailbox created by COPY. */
   messagesIn(path: string): ScriptedMessage[] {
     if (path.toUpperCase() === 'INBOX') {
@@ -189,6 +213,8 @@ export class ScriptedImap {
       capabilities: string[];
       tlsUpgraded: () => boolean;
       markTls: () => void;
+      noteEnabled: (name: string) => void;
+      isRev2: () => boolean;
     },
   ): void {
     const match = /^(\S+)\s+(.*)$/.exec(line.trim());
@@ -200,7 +226,28 @@ export class ScriptedImap {
     const [commandRaw, ...argParts] = splitCommand(rest);
     const command = (commandRaw ?? '').toUpperCase();
     const args = argParts.join(' ');
-    this.trace.push(`${command} ${args}`.trim());
+    const lineText = `${command} ${args}`.trim();
+    this.trace.push(lineText);
+    if (this.dropNext) {
+      this.dropNext = false;
+      socket.destroy();
+      return;
+    }
+    const drop = this.options.dropMatching;
+    if (drop) {
+      drop.pattern.lastIndex = 0;
+      if (drop.pattern.test(lineText)) {
+        this.dropHits += 1;
+        if (this.dropHits === (drop.nth ?? 1)) {
+          if (drop.apply) {
+            this.dropNext = true;
+          } else {
+            socket.destroy();
+            return;
+          }
+        }
+      }
+    }
     const ok = (text: string): void => ctx.write(`${tag} OK ${text}\r\n`);
     const bad = (text: string): void => ctx.write(`${tag} BAD ${text}\r\n`);
     const no = (text: string): void => ctx.write(`${tag} NO ${text}\r\n`);
@@ -349,9 +396,15 @@ export class ScriptedImap {
     }
     if (command === 'ENABLE') {
       const requested = args.split(/\s+/).filter(Boolean);
-      const enabled = requested.filter((item) =>
-        ctx.capabilities.some((capability) => capability.toUpperCase() === item.toUpperCase()),
+      const omitted = new Set((this.options.omitEnabled ?? []).map((item) => item.toUpperCase()));
+      const enabled = requested.filter(
+        (item) =>
+          ctx.capabilities.some((capability) => capability.toUpperCase() === item.toUpperCase()) &&
+          !omitted.has(item.toUpperCase()),
       );
+      for (const item of enabled) {
+        ctx.noteEnabled(item);
+      }
       if (enabled.length > 0) {
         ctx.write(`* ENABLED ${enabled.join(' ')}\r\n`);
       }
@@ -365,11 +418,15 @@ export class ScriptedImap {
       const sourceWanted = sectionId === '' && Boolean(section);
       const headerWanted = sectionId.toUpperCase().includes('HEADER');
       const partWanted = Boolean(section) && !sourceWanted && !headerWanted;
-      const uidFilter = /^\d+$/.test(argParts[1] ?? '') ? Number(argParts[1]) : undefined;
+      const uidToken = argParts[1] ?? '';
+      const allowed =
+        uidToken.length > 0 && uidToken !== '*'
+          ? new Set(parseUidSet(uidToken, this.messages))
+          : undefined;
       let sequence = 0;
       for (const message of this.messages) {
         sequence += 1;
-        if (uidFilter !== undefined && message.uid !== uidFilter) {
+        if (allowed && !allowed.has(message.uid)) {
           continue;
         }
         const source = Buffer.from(message.raw);
@@ -541,11 +598,35 @@ export class ScriptedImap {
       return;
     }
     if (command === 'UID' && args.toUpperCase().includes('MOVE')) {
-      if (!ctx.capabilities.includes('MOVE')) {
+      if (!ctx.capabilities.includes('MOVE') && !ctx.isRev2()) {
         bad('MOVE not supported');
         return;
       }
-      ok('MOVE completed');
+      const destination = unquote(argParts[argParts.length - 1] ?? '');
+      const sources = parseUidSet(argParts[1] ?? '', this.messages)
+        .map((uid) => this.messages.find((item) => item.uid === uid))
+        .filter((item): item is ScriptedMessage => Boolean(item));
+      if (!destination || sources.length === 0) {
+        no('MOVE failed');
+        return;
+      }
+      const copied = this.copies.get(destination) ?? [];
+      const sourceUids: number[] = [];
+      const newUids: number[] = [];
+      const moved = new Set<number>();
+      for (const source of sources) {
+        const newUid = this.nextUid;
+        this.nextUid += 1;
+        copied.push({ uid: newUid, raw: source.raw, flags: [...source.flags] });
+        sourceUids.push(source.uid);
+        newUids.push(newUid);
+        moved.add(source.uid);
+      }
+      this.copies.set(destination, copied);
+      this.messages = this.messages.filter((message) => !moved.has(message.uid));
+      ok(
+        `[COPYUID ${this.uidValidity} ${sourceUids.join(',')} ${newUids.join(',')}] MOVE completed`,
+      );
       return;
     }
     if (command === 'APPEND') {
@@ -605,7 +686,9 @@ export class ScriptedImap {
     uids: number[],
   ): void {
     if (args.toUpperCase().includes('RETURN')) {
-      const listed = uids.length > 0 ? ` ALL ${uids.join(',')}` : '';
+      const star =
+        this.options.esearchAllStar && uids.length > 0 && uids.length === this.messages.length;
+      const listed = uids.length > 0 ? ` ALL ${star ? '1:*' : uids.join(',')}` : '';
       ctx.write(`* ESEARCH (TAG "${tag}") UID COUNT ${uids.length}${listed}\r\n`);
       return;
     }
