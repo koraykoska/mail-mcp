@@ -66,14 +66,28 @@ async function appendRaw(
   return row.uid;
 }
 
+/**
+ * A mailbox list is one LIST per page. One mailbox per page does not finish when
+ * the server already has hundreds of folders. Keep several pages so a mailbox
+ * created after the first page stays outside the snapshot.
+ */
+function folderPageBounds(total: number): { pageLimit: number; maxPages: number } {
+  const count = Number.isFinite(total) && total > 0 ? Math.floor(total) : 1;
+  const pageLimit = Math.min(200, Math.max(1, Math.ceil(count / 4)));
+  return { pageLimit, maxPages: Math.ceil(count / pageLimit) + 5 };
+}
+
 async function walk(
   run: (cursor?: string) => Promise<Record<string, unknown>>,
   keyOf: (item: Record<string, unknown>) => string,
   between?: (page: number, items: Array<Record<string, unknown>>) => Promise<void>,
+  bounds?: { pageLimit?: number; maxPages?: number },
 ): Promise<string[]> {
+  const pageLimit = bounds?.pageLimit ?? 1;
+  const maxPages = bounds?.maxPages ?? 800;
   const keys: string[] = [];
   let cursor: string | undefined;
-  for (let page = 0; page < 800; page += 1) {
+  for (let page = 0; page < maxPages; page += 1) {
     const result = await run(cursor);
     for (const field of ENVELOPE) {
       expect(result, field).toHaveProperty(field);
@@ -85,7 +99,7 @@ async function walk(
     expect(result.snapshot).toEqual(expect.any(Object));
     const items = result.items as Array<Record<string, unknown>>;
     expect(Array.isArray(items)).toBe(true);
-    expect(items.length).toBeLessThanOrEqual(1);
+    expect(items.length).toBeLessThanOrEqual(pageLimit);
     for (const item of items) {
       const key = keyOf(item);
       expect(keys).not.toContain(key);
@@ -99,7 +113,7 @@ async function walk(
     }
     cursor = String(result.nextCursor);
   }
-  throw new Error('page walk did not finish');
+  throw new Error(`page walk did not finish after ${maxPages} pages`);
 }
 
 async function exercise(label: string, service: MailService, email: string): Promise<void> {
@@ -407,8 +421,13 @@ async function exercise(label: string, service: MailService, email: string): Pro
   expect(accountKeys).toContain('work');
 
   let created = '';
+  const mailboxSample = await boxes.run({ limit: 1 }, service);
+  const mailboxPages = folderPageBounds(
+    typeof mailboxSample.total === 'number' ? mailboxSample.total : 1,
+  );
   const mailboxKeys = await walk(
-    (cursor) => boxes.run({ limit: 1, ...(cursor ? { cursor } : {}) }, service),
+    (cursor) =>
+      boxes.run({ limit: mailboxPages.pageLimit, ...(cursor ? { cursor } : {}) }, service),
     (item) => String(item.path),
     async (page) => {
       if (page === 0) {
@@ -416,16 +435,23 @@ async function exercise(label: string, service: MailService, email: string): Pro
         await service.createMailbox(undefined, created);
       }
     },
+    mailboxPages,
   );
   called.add('mail_list_mailboxes');
+  expect(created).not.toBe('');
   expect(mailboxKeys).toContain(box);
   expect(mailboxKeys).not.toContain(created);
 
   await service.subscribe(undefined, one, true);
   await service.subscribe(undefined, two, true);
   let extraSub = '';
+  const subscribedSample = await subscribed.run({ limit: 1 }, service);
+  const subscribedPages = folderPageBounds(
+    typeof subscribedSample.total === 'number' ? subscribedSample.total : 1,
+  );
   const subs = await walk(
-    (cursor) => subscribed.run({ limit: 1, ...(cursor ? { cursor } : {}) }, service),
+    (cursor) =>
+      subscribed.run({ limit: subscribedPages.pageLimit, ...(cursor ? { cursor } : {}) }, service),
     (item) => String(item.path),
     async (page) => {
       if (page === 0) {
@@ -434,8 +460,10 @@ async function exercise(label: string, service: MailService, email: string): Pro
         await service.subscribe(undefined, extraSub, true);
       }
     },
+    subscribedPages,
   );
   called.add('mail_list_subscribed');
+  expect(extraSub).not.toBe('');
   expect(subs).toContain(one);
   expect(subs).not.toContain(extraSub);
 

@@ -342,6 +342,71 @@ describe('IMAP session branches', () => {
     await server.close();
   });
 
+  it('reads UIDVALIDITY with STATUS before a copy-then-expunge', async () => {
+    const stable = new ScriptedImap({ capabilities: ['IMAP4rev1', 'UIDPLUS', 'IDLE'] });
+    await stable.ready();
+    stable.addMessage(simpleMessage({ subject: 'Gone', text: 'original' }).toString('utf8'), []);
+    const removed = await connect(stable);
+    await removed.withMailbox('INBOX', 'write', (box) => box.move([1], 'Trash'));
+    expect(stable.messagesIn('INBOX')).toHaveLength(0);
+    expect(stable.messagesIn('INBOX/Trash')).toHaveLength(1);
+    const statusAt = stable.trace.findIndex((line) => line.includes('UIDVALIDITY'));
+    const expungeAt = stable.trace.findIndex((line) => line.includes('EXPUNGE'));
+    expect(statusAt).toBeGreaterThanOrEqual(0);
+    expect(expungeAt).toBeGreaterThan(statusAt);
+    await removed.close();
+    await stable.close();
+
+    const changed = new ScriptedImap({
+      capabilities: ['IMAP4rev1', 'UIDPLUS', 'IDLE'],
+      bumpUidValidityAfterCopy: true,
+    });
+    await changed.ready();
+    changed.addMessage(simpleMessage({ subject: 'Keep', text: 'original' }).toString('utf8'), []);
+    const kept = await connect(changed);
+    await expect(
+      kept.withMailbox('INBOX', 'write', (box) => box.move([1], 'Trash')),
+    ).rejects.toMatchObject({ code: 'UIDVALIDITY_CHANGED' });
+    expect(changed.messagesIn('INBOX')).toHaveLength(1);
+    expect(changed.messagesIn('INBOX/Trash')).toHaveLength(1);
+    expect(changed.trace.some((line) => line.includes('UIDVALIDITY'))).toBe(true);
+    expect(changed.trace.some((line) => line.includes('EXPUNGE'))).toBe(false);
+    await kept.close();
+    await changed.close();
+
+    const dropped = new ScriptedImap({
+      capabilities: ['IMAP4rev1', 'UIDPLUS', 'IDLE'],
+      dropMatching: { pattern: /^UID COPY/, apply: true },
+    });
+    await dropped.ready();
+    dropped.addMessage(simpleMessage({ subject: 'Stay', text: 'original' }).toString('utf8'), []);
+    const closed = await connect(dropped);
+    await expect(
+      closed.withMailbox('INBOX', 'write', (box) => box.move([1], 'Trash')),
+    ).rejects.toMatchObject({ code: 'CONNECTION_FAILED' });
+    expect(dropped.messagesIn('INBOX')).toHaveLength(1);
+    expect(dropped.trace.some((line) => line.includes('EXPUNGE'))).toBe(false);
+    await closed.close();
+    await dropped.close();
+
+    const silent = new ScriptedImap({
+      capabilities: ['IMAP4rev1', 'UIDPLUS', 'IDLE'],
+      omitStatusUidValidity: true,
+    });
+    await silent.ready();
+    silent.addMessage(simpleMessage({ subject: 'Quiet', text: 'original' }).toString('utf8'), []);
+    const unread = await connect(silent);
+    await expect(
+      unread.withMailbox('INBOX', 'write', (box) => box.move([1], 'Trash')),
+    ).rejects.toMatchObject({ code: 'UIDVALIDITY_CHANGED' });
+    expect(silent.messagesIn('INBOX')).toHaveLength(1);
+    expect(silent.messagesIn('INBOX/Trash')).toHaveLength(1);
+    expect(silent.trace.some((line) => line.includes('STATUS'))).toBe(true);
+    expect(silent.trace.some((line) => line.includes('EXPUNGE'))).toBe(false);
+    await unread.close();
+    await silent.close();
+  });
+
   it('parses thread nodes that are a bare uid or a nested list', () => {
     expect(parseThreadNode({ value: '4' }).uid).toBe(4);
     const nested = parseThreadNode({

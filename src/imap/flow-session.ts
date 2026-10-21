@@ -1384,6 +1384,7 @@ class FlowMailbox implements OpenMailbox {
 
   async expunge(uids?: number[]): Promise<void> {
     if (uids && uids.length > 0) {
+      await this.assertUidValidityStillSelected();
       this.session.clearRefusal();
       await this.commandResult(
         () => this.client.messageDelete(uidList(uids), { uid: true }),
@@ -1394,6 +1395,63 @@ class FlowMailbox implements OpenMailbox {
     const raw = this.client as unknown as RawClient;
     const response = await raw.exec('EXPUNGE', false);
     response.next();
+  }
+
+  /**
+   * RFC 9051 section 2.3.1.1 sends UIDVALIDITY in an untagged OK at mailbox
+   * selection. Section 7.1 says that response code indicates the validity value.
+   * imapflow writes the field only while handling SELECT, so it is the value
+   * from selection, not a later reading. STATUS asks for the UIDVALIDITY item
+   * in RFC 9051 section 6.3.11. RFC 3501 section 6.3.10 and RFC 9051 section
+   * 6.3.11 say a client SHOULD NOT STATUS the selected mailbox. RFC 9051
+   * section 6.3.11 requires the server to be able to execute that command.
+   * Dovecot answers OK [CLIENTBUG]. UID EXPUNGE is not sent when the reported
+   * value differs, when the server gives no value, or when the mailbox is no
+   * longer selected.
+   */
+  private async assertUidValidityStillSelected(): Promise<void> {
+    if (!this.client.mailbox || this.session.hasFailed()) {
+      throw this.unreadUidValidity();
+    }
+    let reported: string | undefined;
+    try {
+      const status = await this.client.status(this.path, { uidValidity: true });
+      reported = status ? bigintToString(status.uidValidity) : undefined;
+    } catch (error) {
+      throw error instanceof MailError
+        ? error
+        : this.session.failTransport(error, 'UIDVALIDITY could not be read.');
+    }
+    if (!reported) {
+      throw this.unreadUidValidity();
+    }
+    if (reported !== this.uidValidity) {
+      throw new MailError(
+        'UIDVALIDITY_CHANGED',
+        `UIDVALIDITY is ${reported}, not ${this.uidValidity}.`,
+        'The originals were left in place. Copies may remain in the destination.',
+      );
+    }
+  }
+
+  /**
+   * A missing reading on a live session is not a value we can expunge against.
+   * imapflow's STATUS returns false when the socket dies instead of throwing, so
+   * a logged break or a client that is already unusable is a dropped connection.
+   */
+  private unreadUidValidity(): MailError {
+    if (this.session.hasFailed() || !this.client.usable) {
+      return this.session.commandFailure('UIDVALIDITY could not be read.');
+    }
+    const failure = this.session.commandFailure('UIDVALIDITY could not be read.');
+    if (failure.code === 'CONNECTION_FAILED' || failure.code === 'TIMEOUT') {
+      return failure;
+    }
+    return new MailError(
+      'UIDVALIDITY_CHANGED',
+      `UIDVALIDITY is unknown, not ${this.uidValidity}.`,
+      'The originals were left in place. Copies may remain in the destination.',
+    );
   }
 
   async serverSort(

@@ -21,7 +21,7 @@
       "maximum": 8
     },
     "attachmentsDir": {
-      "description": "If set, mail_download_attachment can only write inside this directory.",
+      "description": "Directory attachment path reads and savePath writes must stay inside. Created at startup and before use when missing, mode 0700. Subdirectories of a caller path are not created.",
       "type": "string",
       "minLength": 1
     },

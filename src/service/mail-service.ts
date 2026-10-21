@@ -1,7 +1,7 @@
-import { mkdir, writeFile } from 'node:fs/promises';
+import { stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { MailError } from '../errors.js';
-import { confineToRoot, readBoundedFile } from '../fs-sandbox.js';
+import { confineToRoot, ensureAttachmentsDir, readBoundedFile } from '../fs-sandbox.js';
 import { redactText } from '../redact.js';
 import type { AppConfig, ResolvedAccount } from '../config/schema.js';
 import { requireAccount } from '../config/load.js';
@@ -630,12 +630,7 @@ export class MailService {
     file: { filename: string | null; contentType: string; content: Buffer },
   ): Promise<Record<string, unknown>> {
     if (input.savePath) {
-      const target = await confineToRoot(
-        input.savePath,
-        requireAttachmentsDir(this.config.attachmentsDir),
-      );
-      await mkdir(path.dirname(target), { recursive: true });
-      await writeFile(target, file.content);
+      const target = await this.writeInsideAttachments(input.savePath, file.content);
       return {
         ok: true as const,
         account: account.id,
@@ -1265,39 +1260,64 @@ export class MailService {
         'Set draftsMailbox or create a Drafts folder.',
       );
     }
-    const built = await this.outboundFromParts(account, { ...input, allowEmptyRecipients: true });
+    const prior =
+      replaceUid === undefined
+        ? undefined
+        : await this.preservedThreading(account, drafts, replaceUid, input.uidValidity);
+    const built = await this.outboundFromParts(account, {
+      ...input,
+      allowEmptyRecipients: true,
+      ...(prior?.threading ?? {}),
+    });
+    if (input.identityChoice) {
+      built.identity = input.identityChoice;
+      built.message.from = input.identityChoice.address;
+    }
     const raw = await buildRawMessage(built.message, {
       keepBcc: true,
     });
+    if (raw.length > account.limits.maxMessageBytes) {
+      throw new MailError('SIZE_LIMIT', `Message is ${raw.length} bytes, over maxMessageBytes.`);
+    }
     const appended = await this.withImap(account, (session) =>
       session.append(drafts, raw, ['\\Draft']),
     );
-    if (replaceUid !== undefined) {
-      try {
-        await this.deleteMessages({
-          account: account.id,
-          mailbox: drafts,
-          uids: [replaceUid],
-          permanent: account.allowPermanentDelete,
-        });
-      } catch (error) {
-        if (appended.uid !== undefined) {
-          await this.deleteMessages({
-            account: account.id,
-            mailbox: drafts,
-            uids: [appended.uid],
-            permanent: account.allowPermanentDelete,
-          }).catch(() => undefined);
-        }
-        throw error;
-      }
+    if (replaceUid === undefined) {
+      return {
+        ok: true as const,
+        account: account.id,
+        mailbox: drafts,
+        ...appended,
+        replacedUid: null,
+        ...publicIdentity(built.identity),
+      };
     }
+    // The appended UID can equal the old UID when the mailbox was recreated and
+    // UIDVALIDITY changed. Deleting that number would remove the new draft.
+    if (appended.uid === replaceUid) {
+      return {
+        ok: false,
+        account: account.id,
+        mailbox: drafts,
+        ...appended,
+        replacedUid: null,
+        warning: `Draft UID ${replaceUid} is the message just appended, so it was not deleted. The new draft was kept as UID ${replaceUid}.`,
+        ...publicIdentity(built.identity),
+      };
+    }
+    const removal = await this.removeReplacedDraft(account, drafts, replaceUid, prior?.uidValidity);
+    const removed = removal === 'removed';
     return {
-      ok: true as const,
+      ok: removed,
       account: account.id,
       mailbox: drafts,
       ...appended,
-      replacedUid: replaceUid ?? null,
+      replacedUid: removed ? replaceUid : null,
+      ...(removed
+        ? {}
+        : {
+            warning: draftReplaceWarning(removal, drafts, replaceUid, appended.uid),
+          }),
       ...publicIdentity(built.identity),
     };
   }
@@ -1385,57 +1405,14 @@ export class MailService {
   }
 
   async reply(input: ReplyInput): Promise<Record<string, unknown>> {
-    const account = this.account(input.account);
-    const loaded = await this.loadParsed(account, input);
-    const own = ownAddressesOf(account.email, account.identities, account.user);
-    const original = {
-      from: asMail(loaded.parsed.from),
-      to: asMail(loaded.parsed.to),
-      cc: asMail(loaded.parsed.cc),
-      replyTo: asMail(loaded.parsed.replyTo),
-    };
-    const to = input.replyAll ? planReplyAll(original, own).to : planReply(original, own);
-    const cc = input.replyAll ? planReplyAll(original, own).cc : [];
-    if (to.length === 0) {
-      throw new MailError(
-        'INVALID_ARGUMENT',
-        'The original message has no reply address that is not this account.',
-      );
-    }
-    const label = formatAddress(original.from[0] ?? { address: 'unknown' });
-    const when = loaded.parsed.date ?? 'an unknown date';
-    const quoted = quotePlain(loaded.parsed.text || loaded.parsed.htmlAsText || '', label, when);
-    const text = `${input.text ?? ''}${input.text ? '\n\n' : ''}${quoted}`;
-    const originalHtml = loaded.parsed.html
-      ? quoteHtml(loaded.parsed.html, label, when)
-      : quoteHtml(textToHtml(loaded.parsed.text || ''), label, when);
-    const html = input.html ? `${input.html}${originalHtml}` : originalHtml;
-    const identity = selectIdentity({
-      identities: account.identities,
-      accountEmail: account.email,
-      allowFromDomains: account.allowFromDomains,
-      ...(input.from ? { requested: input.from } : {}),
-      ...(!input.from
-        ? { recipients: [...original.to, ...original.cc].map((item) => item.address) }
-        : {}),
-    });
+    const composed = await this.composeReply(input);
     const sent = await this.send({
-      account: account.id,
-      from: identity.address,
-      identityChoice: identity,
-      ...(input.replyTo ? { replyTo: input.replyTo } : {}),
-      to,
-      cc,
-      subject: input.subject ?? replySubject(loaded.parsed.subject),
-      text,
-      html,
-      attachments: input.attachments,
-      inReplyTo: loaded.parsed.messageId,
-      references: buildReferences(loaded.parsed.references, loaded.parsed.messageId),
+      ...composed.parts,
+      identityChoice: composed.identity,
       appendSent: input.appendSent,
     });
     await this.setFlags({
-      account: account.id,
+      account: composed.parts.account,
       mailbox: input.mailbox,
       uidValidity: input.uidValidity,
       uids: [input.uid],
@@ -1445,73 +1422,25 @@ export class MailService {
     return sent;
   }
 
+  async saveReplyDraft(input: ReplyDraftInput): Promise<Record<string, unknown>> {
+    const composed = await this.composeReply(input);
+    return this.saveDraft({
+      ...composed.parts,
+      identityChoice: composed.identity,
+      allowEmptyRecipients: true,
+      ...(input.draftsMailbox ? { mailbox: input.draftsMailbox } : {}),
+    });
+  }
+
   async forward(input: ForwardInput): Promise<Record<string, unknown>> {
-    const account = this.account(input.account);
-    const loaded = await this.loadParsed(account, input);
-    const label = formatAddress(asMail(loaded.parsed.from)[0] ?? { address: 'unknown' });
-    const when = loaded.parsed.date ?? 'an unknown date';
-    const quoted = quotePlain(loaded.parsed.text || loaded.parsed.htmlAsText || '', label, when);
-    const text = `${input.text ?? ''}${input.text ? '\n\n' : ''}---------- Forwarded message ----------\n${quoted}`;
-    const originalHtml = loaded.parsed.html
-      ? quoteHtml(loaded.parsed.html, label, when)
-      : quoteHtml(textToHtml(loaded.parsed.text || ''), label, when);
-    const html = input.html ? `${input.html}${originalHtml}` : originalHtml;
-    const source = await this.withMailbox(account, input.mailbox, 'read', async (box) => {
-      const limit = account.limits.maxMessageBytes;
-      const raw = await box.fetchSource(input.uid, limit + 1);
-      if (raw && raw.length > limit) {
-        throw new MailError('SIZE_LIMIT', `Message UID ${input.uid} exceeds maxMessageBytes.`);
-      }
-      return raw;
-    });
-    const attachments: OutboundAttachment[] = [...(input.attachments ?? [])];
-    if (source) {
-      attachments.push({
-        filename: 'forwarded.eml',
-        contentType: 'message/rfc822',
-        contentBase64: source.toString('base64'),
-      });
-    }
-    if (input.includeAttachments !== false) {
-      for (const attachment of loaded.parsed.attachments) {
-        if (!attachment.content || attachment.inline) {
-          continue;
-        }
-        attachments.push({
-          filename: attachment.filename,
-          contentType: attachment.contentType,
-          contentBase64: attachment.content.toString('base64'),
-        });
-      }
-    }
-    const original = {
-      to: asMail(loaded.parsed.to),
-      cc: asMail(loaded.parsed.cc),
-    };
-    const identity = selectIdentity({
-      identities: account.identities,
-      accountEmail: account.email,
-      allowFromDomains: account.allowFromDomains,
-      ...(input.from ? { requested: input.from } : {}),
-      ...(!input.from
-        ? { recipients: [...original.to, ...original.cc].map((item) => item.address) }
-        : {}),
-    });
+    const composed = await this.composeForward(input);
     const sent = await this.send({
-      account: account.id,
-      from: identity.address,
-      identityChoice: identity,
-      ...(input.replyTo ? { replyTo: input.replyTo } : {}),
-      to: input.to,
-      cc: input.cc,
-      subject: input.subject ?? forwardSubject(loaded.parsed.subject),
-      text,
-      html,
-      attachments,
+      ...composed.parts,
+      identityChoice: composed.identity,
       appendSent: input.appendSent,
     });
     await this.setFlags({
-      account: account.id,
+      account: composed.parts.account,
       mailbox: input.mailbox,
       uidValidity: input.uidValidity,
       uids: [input.uid],
@@ -1519,6 +1448,16 @@ export class MailService {
       operation: 'add',
     }).catch(() => undefined);
     return sent;
+  }
+
+  async saveForwardDraft(input: ForwardDraftInput): Promise<Record<string, unknown>> {
+    const composed = await this.composeForward(input);
+    return this.saveDraft({
+      ...composed.parts,
+      identityChoice: composed.identity,
+      allowEmptyRecipients: true,
+      ...(input.draftsMailbox ? { mailbox: input.draftsMailbox } : {}),
+    });
   }
 
   async sendDraft(
@@ -2412,6 +2351,7 @@ export class MailService {
                 continue;
               }
               await session.withMailbox(scan.mailbox, 'write', async (box) => {
+                this.assertUid(box, scan.uidValidity);
                 const progress = await runInChunks({
                   uids,
                   budgetMs: Math.max(0, plan.budgetDeadline - Date.now()),
@@ -3313,11 +3253,281 @@ export class MailService {
     }
   }
 
+  private async composeReply(
+    input: ReplyInput,
+  ): Promise<{ parts: ComposeParts; identity: IdentityChoice }> {
+    const account = this.account(input.account);
+    const loaded = await this.loadParsed(account, input);
+    const own = ownAddressesOf(account.email, account.identities, account.user);
+    const original = {
+      from: asMail(loaded.parsed.from),
+      to: asMail(loaded.parsed.to),
+      cc: asMail(loaded.parsed.cc),
+      replyTo: asMail(loaded.parsed.replyTo),
+    };
+    const planned = input.replyAll ? planReplyAll(original, own) : undefined;
+    const to = planned ? planned.to : planReply(original, own);
+    const cc = planned ? planned.cc : [];
+    if (to.length === 0) {
+      throw new MailError(
+        'INVALID_ARGUMENT',
+        'The original message has no reply address that is not this account.',
+      );
+    }
+    const label = formatAddress(original.from[0] ?? { address: 'unknown' });
+    const when = loaded.parsed.date ?? 'an unknown date';
+    const quoted = quotePlain(loaded.parsed.text || loaded.parsed.htmlAsText || '', label, when);
+    const text = `${input.text ?? ''}${input.text ? '\n\n' : ''}${quoted}`;
+    const originalHtml = loaded.parsed.html
+      ? quoteHtml(loaded.parsed.html, label, when)
+      : quoteHtml(textToHtml(loaded.parsed.text || ''), label, when);
+    const html = input.html ? `${input.html}${originalHtml}` : originalHtml;
+    const identity = selectIdentity({
+      identities: account.identities,
+      accountEmail: account.email,
+      allowFromDomains: account.allowFromDomains,
+      ...(input.from ? { requested: input.from } : {}),
+      ...(!input.from
+        ? { recipients: [...original.to, ...original.cc].map((item) => item.address) }
+        : {}),
+    });
+    const references = buildReferences(loaded.parsed.references, loaded.parsed.messageId);
+    const parts: ComposeParts = {
+      account: account.id,
+      from: identity.address,
+      ...(input.replyTo ? { replyTo: input.replyTo } : {}),
+      to,
+      cc,
+      subject: input.subject ?? replySubject(loaded.parsed.subject),
+      text,
+      html,
+      ...(input.attachments ? { attachments: input.attachments } : {}),
+      ...(loaded.parsed.messageId ? { inReplyTo: loaded.parsed.messageId } : {}),
+      ...(references ? { references } : {}),
+    };
+    return { parts, identity };
+  }
+
+  private async composeForward(
+    input: ForwardInput,
+  ): Promise<{ parts: ComposeParts; identity: IdentityChoice }> {
+    const account = this.account(input.account);
+    const loaded = await this.loadParsed(account, input);
+    const label = formatAddress(asMail(loaded.parsed.from)[0] ?? { address: 'unknown' });
+    const when = loaded.parsed.date ?? 'an unknown date';
+    const quoted = quotePlain(loaded.parsed.text || loaded.parsed.htmlAsText || '', label, when);
+    const text = `${input.text ?? ''}${input.text ? '\n\n' : ''}---------- Forwarded message ----------\n${quoted}`;
+    const originalHtml = loaded.parsed.html
+      ? quoteHtml(loaded.parsed.html, label, when)
+      : quoteHtml(textToHtml(loaded.parsed.text || ''), label, when);
+    const html = input.html ? `${input.html}${originalHtml}` : originalHtml;
+    const source = await this.withMailbox(account, input.mailbox, 'read', async (box) => {
+      const limit = account.limits.maxMessageBytes;
+      const raw = await box.fetchSource(input.uid, limit + 1);
+      if (raw && raw.length > limit) {
+        throw new MailError('SIZE_LIMIT', `Message UID ${input.uid} exceeds maxMessageBytes.`);
+      }
+      return raw;
+    });
+    const attachments: OutboundAttachment[] = [...(input.attachments ?? [])];
+    if (source) {
+      attachments.push({
+        filename: 'forwarded.eml',
+        contentType: 'message/rfc822',
+        contentBase64: source.toString('base64'),
+      });
+    }
+    if (input.includeAttachments !== false) {
+      for (const attachment of loaded.parsed.attachments) {
+        if (!attachment.content || attachment.inline) {
+          continue;
+        }
+        attachments.push({
+          ...(attachment.filename ? { filename: attachment.filename } : {}),
+          contentType: attachment.contentType,
+          contentBase64: attachment.content.toString('base64'),
+        });
+      }
+    }
+    const original = {
+      to: asMail(loaded.parsed.to),
+      cc: asMail(loaded.parsed.cc),
+    };
+    const identity = selectIdentity({
+      identities: account.identities,
+      accountEmail: account.email,
+      allowFromDomains: account.allowFromDomains,
+      ...(input.from ? { requested: input.from } : {}),
+      ...(!input.from
+        ? { recipients: [...original.to, ...original.cc].map((item) => item.address) }
+        : {}),
+    });
+    const parts: ComposeParts = {
+      account: account.id,
+      from: identity.address,
+      ...(input.replyTo ? { replyTo: input.replyTo } : {}),
+      to: input.to,
+      ...(input.cc ? { cc: input.cc } : {}),
+      subject: input.subject ?? forwardSubject(loaded.parsed.subject),
+      text,
+      html,
+      attachments,
+    };
+    return { parts, identity };
+  }
+
+  /**
+   * Remove the draft that was replaced. The new UID is never deleted. A later
+   * read can show that the old UID is still present, but that does not prove the
+   * old body is intact, so a duplicate is kept instead of removing the replacement.
+   * The old UID is reported removed only when the delete result says so, or a
+   * later read shows it is gone. It is reported present only when that later
+   * read succeeds and sees it. A failed delete is not proof the old UID is
+   * still there: a protocol error can be raised after the message was already
+   * moved. The UIDVALIDITY from the pre-append read is the expected value for
+   * both. When the later read fails, the new draft stays and the result does
+   * not claim the old UID was removed.
+   */
+  private async removeReplacedDraft(
+    account: ResolvedAccount,
+    mailbox: string,
+    uid: number,
+    uidValidity?: string,
+  ): Promise<'removed' | 'present' | 'unknown'> {
+    try {
+      const result = await this.deleteMessages({
+        account: account.id,
+        mailbox,
+        uids: [uid],
+        permanent: account.allowPermanentDelete,
+        ...(uidValidity ? { uidValidity } : {}),
+      });
+      if (classifyRemoval(result, uid) === 'removed') {
+        return 'removed';
+      }
+    } catch {
+      // The delete threw. A later read decides whether the old UID is still there.
+    }
+    const seen = await this.draftPresence(account, mailbox, uid, uidValidity);
+    if (seen === 'absent') {
+      return 'removed';
+    }
+    if (seen === 'present') {
+      return 'present';
+    }
+    return 'unknown';
+  }
+
+  private async draftPresence(
+    account: ResolvedAccount,
+    mailbox: string,
+    uid: number,
+    uidValidity?: string,
+  ): Promise<'present' | 'absent' | 'unknown'> {
+    try {
+      await this.withMailbox(account, mailbox, 'read', async (box) => {
+        this.assertUid(box, uidValidity);
+        await this.requireSummary(box, uid);
+      });
+      return 'present';
+    } catch (error) {
+      if (error instanceof MailError && error.code === 'NOT_FOUND') {
+        return 'absent';
+      }
+      return 'unknown';
+    }
+  }
+
+  /**
+   * Threading headers already stored on a draft. An update copies these onto the
+   * replacement and cannot drop them. Read fails before the new copy is appended.
+   */
+  private async preservedThreading(
+    account: ResolvedAccount,
+    mailbox: string,
+    uid: number,
+    uidValidity?: string,
+  ): Promise<{
+    threading: { inReplyTo?: string; references?: string };
+    uidValidity: string;
+  }> {
+    const existing = await this.loadParsed(account, {
+      account: account.id,
+      mailbox,
+      uid,
+      ...(uidValidity ? { uidValidity } : {}),
+    });
+    const threading: { inReplyTo?: string; references?: string } = {};
+    if (existing.parsed.inReplyTo) {
+      threading.inReplyTo = existing.parsed.inReplyTo;
+    }
+    const references = buildReferences(existing.parsed.references, undefined);
+    if (references) {
+      threading.references = references;
+    }
+    return { threading, uidValidity: existing.uidValidity };
+  }
+
+  private async attachmentsRoot(): Promise<string> {
+    const root = this.config.attachmentsDir;
+    if (!root) {
+      throw new MailError(
+        'PERMISSION_DENIED',
+        'Attachment paths require attachmentsDir to be configured.',
+        'Set the attachmentsDir config key to the directory attachment files are read from and saved to.',
+      );
+    }
+    return ensureAttachmentsDir(root);
+  }
+
+  /** Write `content` at a caller path inside attachmentsDir. Never creates a caller directory. */
+  private async writeInsideAttachments(requested: string, content: Buffer): Promise<string> {
+    const root = await this.attachmentsRoot();
+    const target = await confineToRoot(requested, root);
+    const parent = path.dirname(target);
+    try {
+      const parentInfo = await stat(parent);
+      if (!parentInfo.isDirectory()) {
+        throw new MailError('INVALID_ARGUMENT', `savePath parent "${parent}" is not a directory.`);
+      }
+    } catch (error) {
+      if (error instanceof MailError) {
+        throw error;
+      }
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        throw new MailError(
+          'NOT_FOUND',
+          `Directory "${parent}" does not exist.`,
+          'mail-mcp creates only the configured attachmentsDir. It does not create a directory from savePath. Save the file directly in attachmentsDir, or create the directory yourself.',
+        );
+      }
+      throw new MailError('INVALID_ARGUMENT', 'savePath could not be resolved.');
+    }
+    try {
+      await writeFile(target, content);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT') {
+        throw new MailError(
+          'NOT_FOUND',
+          `Directory "${parent}" does not exist.`,
+          'mail-mcp creates only the configured attachmentsDir. It does not create a directory from savePath.',
+        );
+      }
+      if (code === 'EISDIR') {
+        throw new MailError('INVALID_ARGUMENT', 'savePath is a directory, not a file.');
+      }
+      throw error;
+    }
+    return target;
+  }
+
   private async confineAttachments(
     account: ResolvedAccount,
     attachments: OutboundAttachment[],
   ): Promise<OutboundAttachment[]> {
-    const root = this.config.attachmentsDir;
+    const needsRoot = attachments.some((attachment) => attachment.path);
+    const root = needsRoot ? await this.attachmentsRoot() : undefined;
     const out: OutboundAttachment[] = [];
     for (const attachment of attachments) {
       if (!attachment.path) {
@@ -3330,11 +3540,16 @@ export class MailService {
           'Attachment path reads require attachmentsDir to be configured.',
         );
       }
-      const file = await confineToRoot(attachment.path, root);
+      const requested = attachment.path;
+      const file = await confineToRoot(requested, root);
       const content = await readBoundedFile(file, account.limits.maxMessageBytes);
+      const named = attachment.filename?.trim();
+      const base = path.basename(requested);
+      const filename = named || (base && base !== '.' && base !== '..' ? base : undefined);
       const next: OutboundAttachment = {
         ...attachment,
         contentBase64: content.toString('base64'),
+        ...(filename ? { filename } : {}),
       };
       delete next.path;
       out.push(next);
@@ -3382,7 +3597,7 @@ export class MailService {
   private async loadParsed(
     account: ResolvedAccount,
     input: UidInput,
-  ): Promise<{ parsed: ParsedMessage; summary: MessageSummary }> {
+  ): Promise<{ parsed: ParsedMessage; summary: MessageSummary; uidValidity: string }> {
     return this.withMailbox(account, input.mailbox, 'read', async (box) => {
       this.assertUid(box, input.uidValidity);
       const summary = await this.requireSummary(box, input.uid);
@@ -3397,7 +3612,7 @@ export class MailService {
       if (!source) {
         throw new MailError('NOT_FOUND', `Message UID ${input.uid} was not found.`);
       }
-      return { parsed: await parseRawMessage(source), summary };
+      return { parsed: await parseRawMessage(source), summary, uidValidity: box.uidValidity };
     });
   }
 
@@ -3908,13 +4123,6 @@ export function resolveSavePath(requested: string, root?: string): string {
   return absolute;
 }
 
-function requireAttachmentsDir(root: string | undefined): string {
-  if (!root) {
-    throw new MailError('PERMISSION_DENIED', 'savePath requires attachmentsDir to be configured.');
-  }
-  return root;
-}
-
 function stripCid(value: string): string {
   return value.trim().replace(/^<|>$/g, '').toLowerCase();
 }
@@ -4021,6 +4229,36 @@ async function continueChunk(
       message: mapped.message,
     }));
   }
+}
+
+function classifyRemoval(result: Record<string, unknown>, uid: number): 'removed' | 'unknown' {
+  const results = Array.isArray(result.results) ? result.results : [];
+  const row = results.find(
+    (item): item is { uid?: number; ok?: boolean } =>
+      Boolean(item) && typeof item === 'object' && (item as { uid?: unknown }).uid === uid,
+  );
+  const stopped = result.stopped;
+  const finished = result.complete === true && (stopped === null || stopped === undefined);
+  if (!finished || !row || row.ok !== true) {
+    // ok false is not presence. PROTOCOL_ERROR is reported that way after a MOVE
+    // has already taken the message out of the mailbox.
+    return 'unknown';
+  }
+  return 'removed';
+}
+
+function draftReplaceWarning(
+  removal: 'present' | 'unknown',
+  mailbox: string,
+  oldUid: number,
+  newUid: number | undefined,
+): string {
+  const kept =
+    newUid === undefined ? 'The new draft was kept.' : `The new draft was kept as UID ${newUid}.`;
+  if (removal === 'present') {
+    return `Draft UID ${oldUid} is still in ${mailbox}. ${kept}`;
+  }
+  return `Could not confirm that draft UID ${oldUid} was removed from ${mailbox}. ${kept} The old draft was left in place if it is still there.`;
 }
 
 function progressFields(progress: ChunkProgress): {
@@ -4518,6 +4756,11 @@ export interface ReplyInput {
   appendSent?: boolean;
 }
 
+export interface ReplyDraftInput extends Omit<ReplyInput, 'appendSent'> {
+  /** Drafts mailbox override. `mailbox` stays the source folder. */
+  draftsMailbox?: string;
+}
+
 export interface ForwardInput {
   account?: string;
   mailbox: string;
@@ -4535,6 +4778,15 @@ export interface ForwardInput {
   appendSent?: boolean;
 }
 
+export interface ForwardDraftInput extends Omit<ForwardInput, 'appendSent'> {
+  /** Drafts mailbox override. `mailbox` stays the source folder. */
+  draftsMailbox?: string;
+}
+
 export interface DraftInput extends ComposeParts {
   mailbox?: string;
+  /** Checked against the Drafts mailbox before the old draft is read or removed. */
+  uidValidity?: string;
+  /** Set by reply and forward draft saves so the reported reason matches a send. */
+  identityChoice?: IdentityChoice;
 }

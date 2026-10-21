@@ -41,6 +41,13 @@ export interface ScriptedOptions {
   /** COPY stores the messages and answers OK without a COPYUID response code. */
   omitCopyUid?: boolean;
   /**
+   * After a successful UID COPY, increment UIDVALIDITY while the mailbox stays
+   * selected. The COPYUID response still carries the value from before the copy.
+   */
+  bumpUidValidityAfterCopy?: boolean;
+  /** STATUS completes and omits UIDVALIDITY. The mailbox stays selected. */
+  omitStatusUidValidity?: boolean;
+  /**
    * Drop the socket around one command. `nth` counts matches of `pattern` starting at 1.
    * Without `apply`, the socket closes before that command runs.
    * With `apply`, that command finishes and the next command closes the socket before it runs.
@@ -379,8 +386,9 @@ export class ScriptedImap {
       return;
     }
     if (command === 'STATUS') {
+      const validity = this.options.omitStatusUidValidity ? '' : ` UIDVALIDITY ${this.uidValidity}`;
       ctx.write(
-        `* STATUS "INBOX" (MESSAGES ${this.messages.length} RECENT 0 UNSEEN ${this.messages.length} UIDNEXT ${this.nextUid} UIDVALIDITY ${this.uidValidity})\r\n`,
+        `* STATUS "INBOX" (MESSAGES ${this.messages.length} RECENT 0 UNSEEN ${this.messages.length} UIDNEXT ${this.nextUid}${validity})\r\n`,
       );
       ok('STATUS completed');
       return;
@@ -621,11 +629,14 @@ export class ScriptedImap {
       this.copies.set(destination, copied);
       if (this.options.omitCopyUid) {
         ok('COPY completed');
-        return;
+      } else {
+        ok(
+          `[COPYUID ${this.uidValidity} ${sourceUids.join(',')} ${newUids.join(',')}] COPY completed`,
+        );
       }
-      ok(
-        `[COPYUID ${this.uidValidity} ${sourceUids.join(',')} ${newUids.join(',')}] COPY completed`,
-      );
+      if (this.options.bumpUidValidityAfterCopy) {
+        this.uidValidity += 1;
+      }
       return;
     }
     if (command === 'UID' && args.toUpperCase().includes('MOVE')) {

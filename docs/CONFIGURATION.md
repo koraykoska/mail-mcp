@@ -83,18 +83,18 @@ A top-level `password` is shorthand for password auth.
 
 ## Safety
 
-| Field                                          | Default  | Effect                                                                                                                           |
-| ---------------------------------------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| `readOnly`                                     | false    | No mailbox or message changes, no send.                                                                                          |
-| `allowSend`                                    | true     | `false` blocks every SMTP submission tool.                                                                                       |
-| `allowDelete`                                  | true     | `false` blocks delete, move, and mailbox deletion.                                                                               |
-| `allowPermanentDelete`                         | false    | `true` allows expunge and permanent UID delete, and registers `mail_expunge_mailbox`.                                            |
-| `recipientDomainAllowList`                     | empty    | Empty allows every domain. Otherwise recipients must match a listed domain or its subdomain.                                     |
-| `allowFromDomains`                             | empty    | Empty means From must be a configured identity. When set, any address at these domains is also allowed. TLS checks stay enabled. |
-| `sendRateLimit`                                | unset    | Sliding window, `max` messages per `windowMs`.                                                                                   |
-| `appendSent`                                   | `"auto"` | `true` always APPEND to Sent, `false` never, `"auto"` skips Gmail.                                                               |
-| `sentMailbox`, `trashMailbox`, `draftsMailbox` | unset    | Override special-use resolution.                                                                                                 |
-| `attachmentsDir`                               | unset    | Required for `savePath` writes and attachment `path` reads. Both must stay inside this directory.                                |
+| Field                                          | Default  | Effect                                                                                                                                                                                                                                    |
+| ---------------------------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `readOnly`                                     | false    | No mailbox or message changes, no send.                                                                                                                                                                                                   |
+| `allowSend`                                    | true     | `false` blocks every SMTP submission tool.                                                                                                                                                                                                |
+| `allowDelete`                                  | true     | `false` blocks delete, move, and mailbox deletion.                                                                                                                                                                                        |
+| `allowPermanentDelete`                         | false    | `true` allows expunge and permanent UID delete, and registers `mail_expunge_mailbox`.                                                                                                                                                     |
+| `recipientDomainAllowList`                     | empty    | Empty allows every domain. Otherwise recipients must match a listed domain or its subdomain.                                                                                                                                              |
+| `allowFromDomains`                             | empty    | Empty means From must be a configured identity. When set, any address at these domains is also allowed. TLS checks stay enabled.                                                                                                          |
+| `sendRateLimit`                                | unset    | Sliding window, `max` messages per `windowMs`.                                                                                                                                                                                            |
+| `appendSent`                                   | `"auto"` | `true` always APPEND to Sent, `false` never, `"auto"` skips Gmail.                                                                                                                                                                        |
+| `sentMailbox`, `trashMailbox`, `draftsMailbox` | unset    | Override special-use resolution.                                                                                                                                                                                                          |
+| `attachmentsDir`                               | unset    | Required for `savePath` writes and attachment `path` reads. mail-mcp creates this directory when it is missing (mode `0700`) and does not create a subdirectory from a caller path. A missing file or directory inside it is `NOT_FOUND`. |
 
 `readOnly` together with `allowPermanentDelete` is rejected at startup.
 
