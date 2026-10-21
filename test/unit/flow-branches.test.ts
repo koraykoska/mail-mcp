@@ -383,11 +383,28 @@ describe('IMAP session branches', () => {
     const closed = await connect(dropped);
     await expect(
       closed.withMailbox('INBOX', 'write', (box) => box.move([1], 'Trash')),
-    ).rejects.toBeInstanceOf(MailError);
+    ).rejects.toMatchObject({ code: 'CONNECTION_FAILED' });
     expect(dropped.messagesIn('INBOX')).toHaveLength(1);
     expect(dropped.trace.some((line) => line.includes('EXPUNGE'))).toBe(false);
     await closed.close();
     await dropped.close();
+
+    const silent = new ScriptedImap({
+      capabilities: ['IMAP4rev1', 'UIDPLUS', 'IDLE'],
+      omitStatusUidValidity: true,
+    });
+    await silent.ready();
+    silent.addMessage(simpleMessage({ subject: 'Quiet', text: 'original' }).toString('utf8'), []);
+    const unread = await connect(silent);
+    await expect(
+      unread.withMailbox('INBOX', 'write', (box) => box.move([1], 'Trash')),
+    ).rejects.toMatchObject({ code: 'UIDVALIDITY_CHANGED' });
+    expect(silent.messagesIn('INBOX')).toHaveLength(1);
+    expect(silent.messagesIn('INBOX/Trash')).toHaveLength(1);
+    expect(silent.trace.some((line) => line.includes('STATUS'))).toBe(true);
+    expect(silent.trace.some((line) => line.includes('EXPUNGE'))).toBe(false);
+    await unread.close();
+    await silent.close();
   });
 
   it('parses thread nodes that are a bare uid or a nested list', () => {

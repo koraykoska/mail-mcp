@@ -1406,12 +1406,8 @@ class FlowMailbox implements OpenMailbox {
    * longer selected.
    */
   private async assertUidValidityStillSelected(): Promise<void> {
-    if (!this.client.mailbox) {
-      throw new MailError(
-        'UIDVALIDITY_CHANGED',
-        `UIDVALIDITY is unknown, not ${this.uidValidity}.`,
-        'The originals were left in place. Copies may remain in the destination.',
-      );
+    if (!this.client.mailbox || this.session.hasFailed()) {
+      throw this.unreadUidValidity();
     }
     let reported: string | undefined;
     try {
@@ -1422,13 +1418,36 @@ class FlowMailbox implements OpenMailbox {
         ? error
         : this.session.failTransport(error, 'UIDVALIDITY could not be read.');
     }
-    if (!reported || reported !== this.uidValidity) {
+    if (!reported) {
+      throw this.unreadUidValidity();
+    }
+    if (reported !== this.uidValidity) {
       throw new MailError(
         'UIDVALIDITY_CHANGED',
-        `UIDVALIDITY is ${reported ?? 'unknown'}, not ${this.uidValidity}.`,
+        `UIDVALIDITY is ${reported}, not ${this.uidValidity}.`,
         'The originals were left in place. Copies may remain in the destination.',
       );
     }
+  }
+
+  /**
+   * A missing reading on a live session is not a value we can expunge against.
+   * imapflow's STATUS returns false when the socket dies instead of throwing, so
+   * a logged break or a client that is already unusable is a dropped connection.
+   */
+  private unreadUidValidity(): MailError {
+    if (this.session.hasFailed() || !this.client.usable) {
+      return this.session.commandFailure('UIDVALIDITY could not be read.');
+    }
+    const failure = this.session.commandFailure('UIDVALIDITY could not be read.');
+    if (failure.code === 'CONNECTION_FAILED' || failure.code === 'TIMEOUT') {
+      return failure;
+    }
+    return new MailError(
+      'UIDVALIDITY_CHANGED',
+      `UIDVALIDITY is unknown, not ${this.uidValidity}.`,
+      'The originals were left in place. Copies may remain in the destination.',
+    );
   }
 
   async serverSort(

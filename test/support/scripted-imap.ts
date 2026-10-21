@@ -45,6 +45,8 @@ export interface ScriptedOptions {
    * selected. The COPYUID response still carries the value from before the copy.
    */
   bumpUidValidityAfterCopy?: boolean;
+  /** STATUS completes and omits UIDVALIDITY. The mailbox stays selected. */
+  omitStatusUidValidity?: boolean;
   /**
    * Drop the socket around one command. `nth` counts matches of `pattern` starting at 1.
    * Without `apply`, the socket closes before that command runs.
@@ -384,8 +386,9 @@ export class ScriptedImap {
       return;
     }
     if (command === 'STATUS') {
+      const validity = this.options.omitStatusUidValidity ? '' : ` UIDVALIDITY ${this.uidValidity}`;
       ctx.write(
-        `* STATUS "INBOX" (MESSAGES ${this.messages.length} RECENT 0 UNSEEN ${this.messages.length} UIDNEXT ${this.nextUid} UIDVALIDITY ${this.uidValidity})\r\n`,
+        `* STATUS "INBOX" (MESSAGES ${this.messages.length} RECENT 0 UNSEEN ${this.messages.length} UIDNEXT ${this.nextUid}${validity})\r\n`,
       );
       ok('STATUS completed');
       return;
