@@ -1384,7 +1384,7 @@ class FlowMailbox implements OpenMailbox {
 
   async expunge(uids?: number[]): Promise<void> {
     if (uids && uids.length > 0) {
-      this.assertSelectedUidValidity();
+      await this.assertUidValidityStillSelected();
       this.session.clearRefusal();
       await this.commandResult(
         () => this.client.messageDelete(uidList(uids), { uid: true }),
@@ -1397,14 +1397,35 @@ class FlowMailbox implements OpenMailbox {
     response.next();
   }
 
-  /** UID expunge must use the UIDVALIDITY observed when the mailbox was selected. */
-  private assertSelectedUidValidity(): void {
-    const mailbox = this.client.mailbox;
-    const live = mailbox ? bigintToString(mailbox.uidValidity) : undefined;
-    if (!live || live !== this.uidValidity) {
+  /**
+   * RFC 9051 section 6.4.4.1 allows a server to send a new UIDVALIDITY while the
+   * mailbox stays selected. imapflow writes that value only while handling SELECT,
+   * so the field on the open mailbox is the value from selection, not a later
+   * reading. STATUS asks the server. UID EXPUNGE is not sent when the reported
+   * value differs, when the server gives no value, or when the mailbox is no
+   * longer selected.
+   */
+  private async assertUidValidityStillSelected(): Promise<void> {
+    if (!this.client.mailbox) {
       throw new MailError(
         'UIDVALIDITY_CHANGED',
-        `UIDVALIDITY is ${live ?? 'unknown'}, not ${this.uidValidity}.`,
+        `UIDVALIDITY is unknown, not ${this.uidValidity}.`,
+        'The originals were left in place. Copies may remain in the destination.',
+      );
+    }
+    let reported: string | undefined;
+    try {
+      const status = await this.client.status(this.path, { uidValidity: true });
+      reported = status ? bigintToString(status.uidValidity) : undefined;
+    } catch (error) {
+      throw error instanceof MailError
+        ? error
+        : this.session.failTransport(error, 'UIDVALIDITY could not be read.');
+    }
+    if (!reported || reported !== this.uidValidity) {
+      throw new MailError(
+        'UIDVALIDITY_CHANGED',
+        `UIDVALIDITY is ${reported ?? 'unknown'}, not ${this.uidValidity}.`,
         'The originals were left in place. Copies may remain in the destination.',
       );
     }

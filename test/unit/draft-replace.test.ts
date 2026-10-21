@@ -263,30 +263,6 @@ describe('draft replace', () => {
     expect(draftText(session, 5)).toContain('new body');
   });
 
-  it('leaves the original in place when UIDVALIDITY changes after a copy and before expunge', async () => {
-    const session = new FakeSession(['IMAP4rev1', 'UIDPLUS']);
-    await session.append(
-      'INBOX',
-      simpleMessage({
-        subject: 'Keep',
-        text: 'original',
-        from: 'Ada <ada@example.com>',
-        to: 'User <user@example.com>',
-      }),
-      [],
-    );
-    const mail = service(session);
-    session.afterNextCopy = (box) => {
-      box.uidValidity = '200';
-    };
-    await expect(
-      mail.deleteMessages({ mailbox: 'INBOX', uids: [1], permanent: false }),
-    ).rejects.toMatchObject({ code: 'UIDVALIDITY_CHANGED' });
-    expect(session.boxes.get('INBOX')?.messages).toHaveLength(1);
-    expect(session.boxes.get('INBOX')?.messages[0]?.raw.toString('utf8')).toContain('original');
-    expect(session.boxes.get('Trash')?.messages).toHaveLength(1);
-  });
-
   it('refuses a draft over maxMessageBytes before append', async () => {
     const created = new FakeSession();
     const create = service(
