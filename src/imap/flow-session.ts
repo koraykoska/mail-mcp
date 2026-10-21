@@ -1398,10 +1398,14 @@ class FlowMailbox implements OpenMailbox {
   }
 
   /**
-   * RFC 9051 section 6.4.4.1 allows a server to send a new UIDVALIDITY while the
-   * mailbox stays selected. imapflow writes that value only while handling SELECT,
-   * so the field on the open mailbox is the value from selection, not a later
-   * reading. STATUS asks the server. UID EXPUNGE is not sent when the reported
+   * RFC 9051 section 2.3.1.1 sends UIDVALIDITY in an untagged OK at mailbox
+   * selection. Section 7.1 says that response code indicates the validity value.
+   * imapflow writes the field only while handling SELECT, so it is the value
+   * from selection, not a later reading. STATUS asks for the UIDVALIDITY item
+   * in RFC 9051 section 6.3.11. RFC 3501 section 6.3.10 and RFC 9051 section
+   * 6.3.11 say a client SHOULD NOT STATUS the selected mailbox. RFC 9051
+   * section 6.3.11 requires the server to be able to execute that command.
+   * Dovecot answers OK [CLIENTBUG]. UID EXPUNGE is not sent when the reported
    * value differs, when the server gives no value, or when the mailbox is no
    * longer selected.
    */
