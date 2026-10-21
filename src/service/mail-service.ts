@@ -3381,9 +3381,12 @@ export class MailService {
    * read can show that the old UID is still present, but that does not prove the
    * old body is intact, so a duplicate is kept instead of removing the replacement.
    * The old UID is reported removed only when the delete result says so, or a
-   * later read shows it is gone. The UIDVALIDITY from the pre-append read is
-   * the expected value for both. When that read fails, the new draft stays and
-   * the result does not claim the old UID was removed.
+   * later read shows it is gone. It is reported present only when that later
+   * read succeeds and sees it. A failed delete is not proof the old UID is
+   * still there: a protocol error can be raised after the message was already
+   * moved. The UIDVALIDITY from the pre-append read is the expected value for
+   * both. When the later read fails, the new draft stays and the result does
+   * not claim the old UID was removed.
    */
   private async removeReplacedDraft(
     account: ResolvedAccount,
@@ -3391,7 +3394,6 @@ export class MailService {
     uid: number,
     uidValidity?: string,
   ): Promise<'removed' | 'present' | 'unknown'> {
-    let reported: 'removed' | 'present' | 'unknown';
     try {
       const result = await this.deleteMessages({
         account: account.id,
@@ -3400,12 +3402,11 @@ export class MailService {
         permanent: account.allowPermanentDelete,
         ...(uidValidity ? { uidValidity } : {}),
       });
-      reported = classifyRemoval(result, uid);
-      if (reported === 'removed') {
+      if (classifyRemoval(result, uid) === 'removed') {
         return 'removed';
       }
     } catch {
-      reported = 'unknown';
+      // The delete threw. A later read decides whether the old UID is still there.
     }
     const seen = await this.draftPresence(account, mailbox, uid, uidValidity);
     if (seen === 'absent') {
@@ -3414,7 +3415,7 @@ export class MailService {
     if (seen === 'present') {
       return 'present';
     }
-    return reported === 'present' ? 'present' : 'unknown';
+    return 'unknown';
   }
 
   private async draftPresence(
@@ -4230,10 +4231,7 @@ async function continueChunk(
   }
 }
 
-function classifyRemoval(
-  result: Record<string, unknown>,
-  uid: number,
-): 'removed' | 'present' | 'unknown' {
+function classifyRemoval(result: Record<string, unknown>, uid: number): 'removed' | 'unknown' {
   const results = Array.isArray(result.results) ? result.results : [];
   const row = results.find(
     (item): item is { uid?: number; ok?: boolean } =>
@@ -4241,10 +4239,12 @@ function classifyRemoval(
   );
   const stopped = result.stopped;
   const finished = result.complete === true && (stopped === null || stopped === undefined);
-  if (!finished || !row) {
+  if (!finished || !row || row.ok !== true) {
+    // ok false is not presence. PROTOCOL_ERROR is reported that way after a MOVE
+    // has already taken the message out of the mailbox.
     return 'unknown';
   }
-  return row.ok === true ? 'removed' : 'present';
+  return 'removed';
 }
 
 function draftReplaceWarning(

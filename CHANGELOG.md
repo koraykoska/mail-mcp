@@ -10,6 +10,8 @@
 - A draft over `maxMessageBytes` is `SIZE_LIMIT` before APPEND, including a reply or forward draft.
 - Reply subjects treat `Re`, `Aw`, `Sv`, and `Antw` as prefixes, including a bracketed number such as `Re[2]:`. Forward subjects treat `Fwd`, `Fw`, `Wg`, `Tr`, and `Rv`.
 - A `Message-ID`, `In-Reply-To`, or `References` id that cannot fit on one 998-octet line is omitted. Folding an id would leave a space in it. An omitted `Message-ID` is replaced by the composer. Ids that fit stay, and a list is folded on the spaces between them.
+- `mail_update_draft` says the old UID is still in the mailbox only when a later read succeeds and sees it. A failed delete, including a protocol error after the old UID was already removed, says the removal could not be confirmed when that read also fails.
+- A `Subject`, `Comments`, or `Keywords` value that cannot fit on one 998-octet line is encoded as RFC 2047 encoded-words, so a draft and a sent message with a long subject stay within the line limit. A header line that is still too long is rejected, and the error names that header.
 
 ## 0.3.0
 

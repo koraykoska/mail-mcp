@@ -135,6 +135,51 @@ describe('mime fixtures', () => {
   });
 });
 
+function expectHeaderLines(raw: Buffer): void {
+  const text = raw.toString('binary');
+  const headerEnd = text.indexOf('\r\n\r\n');
+  const block = headerEnd === -1 ? text : text.slice(0, headerEnd);
+  for (const line of block.split('\r\n')) {
+    expect(Buffer.byteLength(line)).toBeLessThanOrEqual(998);
+  }
+}
+
+/** Unfold one header and decode the UTF-8 Base64 words this builder emits. */
+function decodedHeader(raw: Buffer, name: string): string {
+  const text = raw.toString('binary');
+  const headerEnd = text.indexOf('\r\n\r\n');
+  const block = headerEnd === -1 ? text : text.slice(0, headerEnd);
+  const lines = block.split('\r\n');
+  const collected: string[] = [];
+  const prefix = `${name.toLowerCase()}:`;
+  let capture = false;
+  for (const line of lines) {
+    if (line.startsWith(' ') || line.startsWith('\t')) {
+      if (capture) {
+        collected.push(line);
+      }
+      continue;
+    }
+    capture = line.toLowerCase().startsWith(prefix);
+    if (capture) {
+      collected.push(line);
+    }
+  }
+  const unfolded = collected
+    .join('\r\n')
+    .replace(/\r\n([ \t])/g, '$1')
+    .slice(name.length + 1)
+    .trim();
+  return unfolded.replace(
+    /(=\?UTF-8\?B\?[A-Za-z0-9+/=]*\?=)(?:[ \t]+(=\?UTF-8\?B\?[A-Za-z0-9+/=]*\?=))*/g,
+    (group) =>
+      group
+        .split(/[ \t]+/)
+        .map((word) => Buffer.from(word.slice('=?UTF-8?B?'.length, -2), 'base64').toString('utf8'))
+        .join(''),
+  );
+}
+
 describe('message builder', () => {
   it('builds alternative bodies, inline images, and encoded subjects', async () => {
     const raw = await buildRawMessage({
@@ -209,6 +254,79 @@ describe('message builder', () => {
     for (const line of keptBlock.split('\r\n')) {
       expect(Buffer.byteLength(line)).toBeLessThanOrEqual(998);
     }
+  });
+
+  it('encodes a subject, Comments, and Keywords that cannot fit on one line', async () => {
+    for (const length of [998, 5000]) {
+      const subject = 'a'.repeat(length);
+      const comments = 'c'.repeat(length);
+      const keywords = 'k'.repeat(length);
+      const raw = await buildRawMessage({
+        from: { address: 'a@example.com' },
+        to: [{ address: 'b@example.com' }],
+        subject,
+        text: 'y',
+        headers: { Comments: comments, Keywords: keywords },
+      });
+      expectHeaderLines(raw);
+      const parsed = await parseRawMessage(raw);
+      expect(parsed.subject).toBe(subject);
+      expect(decodedHeader(raw, 'Comments')).toBe(comments);
+      expect(decodedHeader(raw, 'Keywords')).toBe(keywords);
+    }
+
+    const viaFields = await buildRawMessage({
+      from: { address: 'a@example.com' },
+      to: [{ address: 'b@example.com' }],
+      subject: 'a'.repeat(998),
+      text: 'y',
+      headerFields: [{ name: 'Comments', value: 'c'.repeat(5000) }],
+    });
+    expectHeaderLines(viaFields);
+    expect(decodedHeader(viaFields, 'Comments')).toBe('c'.repeat(5000));
+    expect((await parseRawMessage(viaFields)).subject).toBe('a'.repeat(998));
+  });
+
+  it('keeps a subject that fits on one line as itself', async () => {
+    const subject = 'a'.repeat(989);
+    const raw = await buildRawMessage({
+      from: { address: 'a@example.com' },
+      to: [{ address: 'b@example.com' }],
+      subject,
+      text: 'y',
+    });
+    expectHeaderLines(raw);
+    expect(raw.toString('utf8')).toContain(subject);
+    expect(raw.toString('utf8')).not.toContain('=?UTF-8?B?');
+    expect((await parseRawMessage(raw)).subject).toBe(subject);
+  });
+
+  it('round-trips a long subject that contains multibyte characters', async () => {
+    const subject = `${'é'.repeat(600)}${'😀'.repeat(20)}`;
+    const raw = await buildRawMessage({
+      from: { address: 'a@example.com' },
+      to: [{ address: 'b@example.com' }],
+      subject,
+      text: 'y',
+    });
+    expectHeaderLines(raw);
+    expect((await parseRawMessage(raw)).subject).toBe(subject);
+  });
+
+  it('names the header when a line is still over 998 octets', async () => {
+    await expect(
+      buildRawMessage({
+        from: { address: 'a@example.com' },
+        to: [{ address: 'b@example.com' }],
+        subject: 'x',
+        text: 'y',
+        headers: { 'X-Long': 'z'.repeat(1200) },
+      }),
+    ).rejects.toMatchObject({
+      code: 'INVALID_ARGUMENT',
+      message: expect.stringMatching(/The X-Long header has a line of \d+ octets/),
+      hint: expect.stringContaining('X-Long'),
+    });
   });
 
   it('rejects an empty message', async () => {

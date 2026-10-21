@@ -7,6 +7,7 @@ import type { SmtpSender } from '../../src/smtp/client.js';
 import { account, appConfig } from '../support/config.js';
 import { FakePool, FakeSession } from '../support/fake-session.js';
 import { simpleMessage } from '../fixtures/messages.js';
+import { parseRawMessage } from '../../src/mime/parse.js';
 
 function service(session = new FakeSession(), config = appConfig()) {
   const smtp: SmtpSender = {
@@ -109,6 +110,30 @@ describe('draft replace', () => {
     expect(updated.replacedUid).toBeNull();
     expect(String(updated.warning)).toContain(`Draft UID ${uid} is still in Drafts`);
     expect(draftUids(session)).toEqual([uid, Number(updated.uid)]);
+  });
+
+  it('does not claim the old draft is still there when the move fails after removal and the probe fails', async () => {
+    const session = new FakeSession();
+    const mail = service(session);
+    const uid = await seedDraft(mail);
+    session.moveFaultAfterRemove = new MailError(
+      'PROTOCOL_ERROR',
+      'response lost after the move removed the draft',
+    );
+    session.summaryFault = new MailError('CONNECTION_FAILED', 'probe failed');
+    session.summaryFaultSkips = 1;
+    const updated = await mail.saveDraft(replacement, uid);
+    expect(updated.ok).toBe(false);
+    expect(updated.replacedUid).toBeNull();
+    expect(updated.warning).toBe(
+      `Could not confirm that draft UID ${uid} was removed from Drafts. The new draft was kept as UID ${updated.uid}. The old draft was left in place if it is still there.`,
+    );
+    expect(String(updated.warning)).not.toContain('is still in Drafts');
+    expect(draftUids(session)).toEqual([Number(updated.uid)]);
+    expect(draftText(session, Number(updated.uid))).toContain('new body');
+    const trash = session.boxes.get('Trash')?.messages ?? [];
+    expect(trash.some((message) => message.raw.toString('utf8').includes('old body'))).toBe(true);
+    expect(trash.some((message) => message.raw.toString('utf8').includes('new body'))).toBe(false);
   });
 
   it('does not claim the old draft is gone when removal cannot be confirmed', async () => {
@@ -333,4 +358,39 @@ describe('draft replace', () => {
     expect(draftUids(existing)).toEqual([uid]);
     expect(draftText(existing, uid)).toContain('old body');
   });
+
+  it('saves and sends a 998-character subject and a 5000-character subject', async () => {
+    const session = new FakeSession();
+    const mail = service(session);
+    for (const length of [998, 5000]) {
+      const subject = 'a'.repeat(length);
+      const draft = await mail.saveDraft({
+        to: ['ada@example.com'],
+        subject,
+        text: 'body',
+        allowEmptyRecipients: true,
+      });
+      const stored = session.boxes
+        .get('Drafts')
+        ?.messages.find((message) => message.uid === draft.uid);
+      expect(stored).toBeTruthy();
+      expectHeaderLines(stored?.raw ?? Buffer.alloc(0));
+      expect((await parseRawMessage(stored?.raw ?? Buffer.alloc(0))).subject).toBe(subject);
+
+      const sent = await mail.send({ to: ['ada@example.com'], subject, text: 'body' });
+      expect(sent.ok).toBe(true);
+      const submitted = session.boxes.get('Sent')?.messages.at(-1)?.raw ?? Buffer.alloc(0);
+      expectHeaderLines(submitted);
+      expect((await parseRawMessage(submitted)).subject).toBe(subject);
+    }
+  });
 });
+
+function expectHeaderLines(raw: Buffer): void {
+  const text = raw.toString('binary');
+  const headerEnd = text.indexOf('\r\n\r\n');
+  const block = headerEnd === -1 ? text : text.slice(0, headerEnd);
+  for (const line of block.split('\r\n')) {
+    expect(Buffer.byteLength(line)).toBeLessThanOrEqual(998);
+  }
+}

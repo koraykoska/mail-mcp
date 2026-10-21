@@ -83,11 +83,17 @@ export async function buildRawMessage(
       'A message needs text, html, or at least one attachment.',
     );
   }
-  const record: Record<string, string> = { ...(message.headers ?? {}) };
+  const record: Record<string, string> = {};
+  for (const [key, value] of Object.entries(message.headers ?? {})) {
+    record[key] = fitFreeTextHeader(key, value);
+  }
   if (message.readReceipt) {
     record['Disposition-Notification-To'] = formatAddress(message.from);
   }
-  const fields = message.headerFields ?? [];
+  const fields = (message.headerFields ?? []).map((field) => ({
+    name: field.name,
+    value: fitFreeTextHeader(field.name, field.value),
+  }));
   const headers: Record<string, string> | Array<{ key: string; value: string }> =
     fields.length > 0
       ? [
@@ -100,7 +106,7 @@ export async function buildRawMessage(
   const mail: ComposerMail = {
     from: fromList.map((item) => formatAddress(asciiAddress(item))).join(', '),
     to: message.to.map((item) => formatAddress(asciiAddress(item))).join(', '),
-    subject: message.subject,
+    subject: fitUnstructured('Subject', message.subject),
     headers,
   };
   if (message.sender && message.sender.length > 0) {
@@ -233,16 +239,78 @@ function idFits(name: string, id: string): boolean {
   return Buffer.byteLength(`${name}: ${id}`) <= MAX_HEADER_LINE_OCTETS;
 }
 
+/** Unstructured fields this builder emits as free text. Structured headers are left alone. */
+const FREE_TEXT_HEADERS = new Set(['comments', 'keywords']);
+
+/**
+ * A whitespace-delimited token that cannot sit on one line next to its header
+ * name is encoded with the whole value. RFC 2047 drops the whitespace between
+ * adjacent encoded-words, so the decoded text keeps the original characters,
+ * including spaces that were inside the value. A token that fits is left for
+ * the composer, which already encodes non-ASCII text.
+ */
+function fitFreeTextHeader(name: string, value: string): string {
+  const canonical = canonicalHeaderName(name);
+  if (!FREE_TEXT_HEADERS.has(canonical)) {
+    return value;
+  }
+  return fitUnstructured(name, value);
+}
+
+function fitUnstructured(name: string, value: string): string {
+  const overflows = value
+    .split(/\s+/)
+    .some(
+      (token) =>
+        token.length > 0 && Buffer.byteLength(`${name}: ${token}`) > MAX_HEADER_LINE_OCTETS,
+    );
+  if (!overflows) {
+    return value;
+  }
+  return encodeUtf8Words(value);
+}
+
+/**
+ * RFC 2047 encoded-words, each at most 75 characters. 45 UTF-8 bytes become 60
+ * Base64 characters. Words are separated by a space so folding breaks
+ * between them and never inside a word. A chunk never splits a UTF-8 sequence.
+ */
+function encodeUtf8Words(value: string): string {
+  const bytes = Buffer.from(value, 'utf8');
+  const words: string[] = [];
+  let offset = 0;
+  while (offset < bytes.length) {
+    let end = Math.min(offset + 45, bytes.length);
+    while (end > offset && end < bytes.length && (bytes[end]! & 0xc0) === 0x80) {
+      end -= 1;
+    }
+    if (end === offset) {
+      end = Math.min(offset + 45, bytes.length);
+    }
+    words.push(`=?UTF-8?B?${bytes.subarray(offset, end).toString('base64')}?=`);
+    offset = end;
+  }
+  return words.join(' ');
+}
+
 function assertHeaderLines(raw: Buffer): void {
   const text = raw.toString('binary');
   const headerEnd = text.indexOf('\r\n\r\n');
   const block = headerEnd === -1 ? text : text.slice(0, headerEnd);
+  let name = 'header';
   for (const line of block.split('\r\n')) {
-    if (Buffer.byteLength(line) > MAX_HEADER_LINE_OCTETS) {
+    if (line.length > 0 && line[0] !== ' ' && line[0] !== '\t') {
+      const colon = line.indexOf(':');
+      if (colon > 0) {
+        name = line.slice(0, colon);
+      }
+    }
+    const octets = Buffer.byteLength(line);
+    if (octets > MAX_HEADER_LINE_OCTETS) {
       throw new MailError(
         'INVALID_ARGUMENT',
-        `A header line is ${Buffer.byteLength(line)} octets, over the limit of ${MAX_HEADER_LINE_OCTETS}.`,
-        'Message-ID, In-Reply-To, and References ids that cannot fit on one line are omitted. A Message-ID that is omitted is replaced.',
+        `The ${name} header has a line of ${octets} octets, over the limit of ${MAX_HEADER_LINE_OCTETS}.`,
+        `${name} is longer than one line can hold. Subject, Comments, and Keywords are encoded to fit. Message-ID, In-Reply-To, and References ids that cannot fit on one line are omitted. A Message-ID that is omitted is replaced.`,
       );
     }
   }
