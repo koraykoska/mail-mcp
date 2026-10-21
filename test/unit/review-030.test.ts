@@ -368,10 +368,84 @@ describe('IMAP4rev2 move and UIDPLUS', () => {
 });
 
 describe('ESEARCH star and the bulk budget', () => {
-  it('resolves an ESEARCH ALL set that contains *', async () => {
+  async function expectStarRefused(
+    server: ScriptedImap,
+    search: { uid: string } | { not: { uid: string } } | { all: true },
+  ): Promise<void> {
+    const before = server.messagesIn('INBOX').map((item) => item.uid);
+    const runtime = runtimeFor(server.port);
+    await expect(
+      runtime.service.searchMessages({
+        mailbox: 'INBOX',
+        search,
+        limit: 20,
+        includeSnippet: false,
+      }),
+    ).rejects.toMatchObject({
+      code: 'PROTOCOL_ERROR',
+      message: expect.stringContaining('containing *') as unknown,
+    });
+    await expect(
+      runtime.service.modifyBySearch({
+        mailbox: 'INBOX',
+        search,
+        action: 'move',
+        destination: 'Archive',
+        dryRun: false,
+      }),
+    ).rejects.toMatchObject({ code: 'PROTOCOL_ERROR' });
+    expect(server.messagesIn('INBOX').map((item) => item.uid)).toEqual(before);
+    expect(server.trace.some((line) => /\b(COPY|MOVE|STORE|EXPUNGE)\b/.test(line))).toBe(false);
+    await runtime.close();
+  }
+
+  it('refuses a contiguous ESEARCH ALL 1:*', async () => {
     const server = new ScriptedImap({
       capabilities: ['IMAP4rev1', 'ESEARCH', 'UIDPLUS'],
       esearchAllStar: true,
+    });
+    await server.ready();
+    seed(server, 3);
+    await expectStarRefused(server, { not: { uid: '2' } });
+    await server.close();
+  });
+
+  it('refuses a bare ESEARCH star and a 1,* set', async () => {
+    const server = new ScriptedImap({
+      capabilities: ['IMAP4rev1', 'ESEARCH', 'UIDPLUS'],
+      esearchAll: (_args, uids) => {
+        if (uids.length === 1 && uids[0] === 2) {
+          return '*';
+        }
+        if (uids.join(',') === '1,2') {
+          return '1,*';
+        }
+        return undefined;
+      },
+    });
+    await server.ready();
+    seed(server, 3);
+    server.dropUid(3);
+    await expectStarRefused(server, { uid: '2' });
+    await expectStarRefused(server, { not: { uid: '2' } });
+    await server.close();
+  });
+
+  it('refuses an inverted ESEARCH 8:*', async () => {
+    const server = new ScriptedImap({
+      capabilities: ['IMAP4rev1', 'ESEARCH', 'UIDPLUS'],
+      selectUidNext: 5,
+      esearchAll: (_args, uids) => (uids.join(',') === '8,9,10' ? '8:*' : undefined),
+    });
+    await server.ready();
+    seed(server, 10);
+    await expectStarRefused(server, { uid: '8:10' });
+    await server.close();
+  });
+
+  it('uses an explicit ESEARCH list, including a NOT UID complement', async () => {
+    const server = new ScriptedImap({
+      capabilities: ['IMAP4rev1', 'ESEARCH', 'UIDPLUS'],
     });
     await server.ready();
     seed(server, 3);
@@ -382,50 +456,11 @@ describe('ESEARCH star and the bulk budget', () => {
       limit: 10,
       includeSnippet: false,
     });
-    const messages = found.messages as Array<{ uid: number }>;
-    expect(messages.map((item) => item.uid).sort((left, right) => left - right)).toEqual([1, 3]);
-    const searches = server.trace.filter((line) => /SEARCH/.test(line));
-    expect(searches.some((line) => /RETURN/i.test(line))).toBe(true);
-    expect(searches.some((line) => !/RETURN/i.test(line))).toBe(true);
-    await runtime.close();
-    await server.close();
-  });
-
-  it('keeps a bare ESEARCH star from naming an expunged UID', async () => {
-    const server = new ScriptedImap({
-      capabilities: ['IMAP4rev1', 'ESEARCH', 'UIDPLUS'],
-      esearchAll: (_args, uids) => {
-        if (uids.length === 1 && uids[0] === 2) {
-          return '*';
-        }
-        if (uids.length === 2) {
-          return '1,*';
-        }
-        return undefined;
-      },
-    });
-    await server.ready();
-    seed(server, 3);
-    server.dropUid(3);
-    const runtime = runtimeFor(server.port);
-    const positive = await runtime.service.searchMessages({
-      mailbox: 'INBOX',
-      search: { uid: '2' },
-      limit: 10,
-      includeSnippet: false,
-    });
-    expect((positive.messages as Array<{ uid: number }>).map((item) => item.uid)).toEqual([2]);
-    const excluded = await runtime.service.searchMessages({
-      mailbox: 'INBOX',
-      search: { not: { uid: '2' } },
-      limit: 10,
-      includeSnippet: false,
-    });
     expect(
-      (excluded.messages as Array<{ uid: number }>)
+      (found.messages as Array<{ uid: number }>)
         .map((item) => item.uid)
         .sort((left, right) => left - right),
-    ).toEqual([1]);
+    ).toEqual([1, 3]);
     const moved = await runtime.service.modifyBySearch({
       mailbox: 'INBOX',
       search: { not: { uid: '2' } },
@@ -435,96 +470,62 @@ describe('ESEARCH star and the bulk budget', () => {
     });
     expect(moved.ok).toBe(true);
     expect(server.messagesIn('INBOX').map((item) => item.uid)).toEqual([2]);
-    const acted = server.trace.filter((line) => /FETCH|COPY|MOVE|EXPUNGE/.test(line));
-    expect(acted.some((line) => /(^|[^0-9])3([^0-9]|$)/.test(line))).toBe(false);
     await runtime.close();
     await server.close();
   });
 
-  it('does not widen an inverted ESEARCH star from a stale UIDNEXT', async () => {
-    const server = new ScriptedImap({
-      capabilities: ['IMAP4rev1', 'ESEARCH', 'UIDPLUS'],
-      selectUidNext: 5,
-      esearchAll: (_args, uids) => (uids.join(',') === '8,9,10' ? '8:*' : undefined),
-    });
-    await server.ready();
-    seed(server, 10);
+  async function expectModseqMatchesOnlyUid2(server: ScriptedImap): Promise<void> {
+    seed(server, 20);
     const runtime = runtimeFor(server.port);
     const found = await runtime.service.searchMessages({
       mailbox: 'INBOX',
-      search: { uid: '8:10' },
-      limit: 10,
+      search: { uid: '2', modseq: '1' },
+      limit: 30,
       includeSnippet: false,
     });
-    expect(
-      (found.messages as Array<{ uid: number }>)
-        .map((item) => item.uid)
-        .sort((left, right) => left - right),
-    ).toEqual([8, 9, 10]);
+    expect((found.messages as Array<{ uid: number }>).map((item) => item.uid)).toEqual([2]);
     const moved = await runtime.service.modifyBySearch({
       mailbox: 'INBOX',
-      search: { uid: '8:10' },
+      search: { uid: '2', modseq: '1' },
       action: 'move',
       destination: 'Archive',
       dryRun: false,
     });
-    expect(moved.stopped).toBeNull();
-    expect(server.messagesIn('INBOX').map((item) => item.uid)).toEqual([1, 2, 3, 4, 5, 6, 7]);
-    expect(server.trace.some((line) => /8:4/.test(line))).toBe(false);
+    expect(moved.ok).toBe(true);
+    expect(server.messagesIn('INBOX').map((item) => item.uid)).toEqual(
+      uids(20).filter((uid) => uid !== 2),
+    );
+    const touched = server.trace.filter((line) => /\b(COPY|MOVE|STORE|EXPUNGE)\b/.test(line));
+    expect(touched.some((line) => /\b17\b/.test(line))).toBe(false);
+    expect(touched.some((line) => /\b2\b/.test(line))).toBe(true);
     await runtime.close();
-    await server.close();
-  });
+  }
 
-  it('does not use a search result when a message arrives while * is resolved', async () => {
-    let late = 0;
-    let arrive = (): string => '';
+  it('ignores a CONDSTORE modifier on a plain UID SEARCH', async () => {
     const server = new ScriptedImap({
-      capabilities: ['IMAP4rev1', 'ESEARCH', 'UIDPLUS'],
-      esearchAllStar: true,
-      beforePlainSearch: () => arrive(),
+      capabilities: ['IMAP4rev1', 'UIDPLUS', 'MOVE', 'ENABLE', 'CONDSTORE'],
+      searchModseq: 17,
     });
-    arrive = () => {
-      late += 1;
-      server.addMessage(
-        simpleMessage({
-          subject: `late ${late}`,
-          messageId: `<late-${late}@example.com>`,
-        }).toString('utf8'),
-        [],
-      );
-      return `* ${server.messagesIn('INBOX').length} EXISTS\r\n`;
-    };
     await server.ready();
-    seed(server, 3);
-    const runtime = runtimeFor(server.port);
-    await expect(
-      runtime.service.searchMessages({
-        mailbox: 'INBOX',
-        search: { all: true },
-        limit: 10,
-        includeSnippet: false,
-      }),
-    ).rejects.toMatchObject({ code: 'PROTOCOL_ERROR' });
-    await expect(
-      runtime.service.modifyBySearch({
-        mailbox: 'INBOX',
-        search: { all: true },
-        action: 'move',
-        destination: 'Archive',
-        dryRun: false,
-      }),
-    ).rejects.toMatchObject({ code: 'PROTOCOL_ERROR' });
-    expect(server.messagesIn('INBOX').length).toBeGreaterThan(3);
-    expect(server.trace.some((line) => /\b(COPY|MOVE|EXPUNGE)\b/.test(line))).toBe(false);
-    await runtime.close();
+    await expectModseqMatchesOnlyUid2(server);
     await server.close();
   });
 
-  it('fails closed when a plain search still answers with *', async () => {
+  it('ignores an ESEARCH MODSEQ item and a parallel SEARCH modifier', async () => {
+    const server = new ScriptedImap({
+      capabilities: ['IMAP4rev1', 'ESEARCH', 'UIDPLUS', 'MOVE', 'ENABLE', 'CONDSTORE'],
+      searchModseq: 17,
+    });
+    await server.ready();
+    await expectModseqMatchesOnlyUid2(server);
+    await server.close();
+  });
+
+  it('refuses one response that carries two different UID lists', async () => {
     const server = new ScriptedImap({
       capabilities: ['IMAP4rev1', 'ESEARCH', 'UIDPLUS'],
-      esearchAll: () => '*',
-      plainSearchStar: true,
+      esearchAll: () => '2',
+      alsoSearch: '1',
     });
     await server.ready();
     seed(server, 2);
@@ -532,14 +533,17 @@ describe('ESEARCH star and the bulk budget', () => {
     await expect(
       runtime.service.modifyBySearch({
         mailbox: 'INBOX',
-        search: { all: true },
+        search: { uid: '2' },
         action: 'move',
         destination: 'Archive',
         dryRun: false,
       }),
-    ).rejects.toMatchObject({ code: 'PROTOCOL_ERROR' });
-    expect(server.messagesIn('INBOX')).toHaveLength(2);
-    expect(server.trace.some((line) => /\b(COPY|MOVE|EXPUNGE|FETCH)\b/.test(line))).toBe(false);
+    ).rejects.toMatchObject({
+      code: 'PROTOCOL_ERROR',
+      message: expect.stringContaining('two different UID lists') as unknown,
+    });
+    expect(server.messagesIn('INBOX').map((item) => item.uid)).toEqual([1, 2]);
+    expect(server.trace.some((line) => /\b(COPY|MOVE|STORE|EXPUNGE)\b/.test(line))).toBe(false);
     await runtime.close();
     await server.close();
   });

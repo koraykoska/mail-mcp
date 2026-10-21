@@ -702,6 +702,62 @@ describe('Dovecot nested mailboxes', () => {
     );
     await runtime.close();
   }, 120_000);
+
+  it('searches with modseq and moves only the matching UID', async () => {
+    const runtime = runtimeFor(dovecot.imapPort);
+    const stamp = `modseq-${Date.now()}`;
+    const archive = `Archive-${stamp}`;
+    await runtime.service.createMailbox(undefined, stamp);
+    await runtime.service.createMailbox(undefined, archive);
+    for (const subject of ['One', 'Two', 'Three']) {
+      await runtime.service.append({
+        mailbox: stamp,
+        rawBase64: simpleMessage({
+          subject,
+          messageId: `<${subject}-${stamp}@example.com>`,
+        }).toString('base64'),
+      });
+    }
+    const listed = await runtime.service.listMessages({
+      mailbox: stamp,
+      limit: 10,
+      includeSnippet: false,
+    });
+    const present = (listed.messages as Array<{ uid: number }>)
+      .map((item) => item.uid)
+      .sort((left, right) => left - right);
+    expect(present).toHaveLength(3);
+    const target = present[1];
+    if (target === undefined) {
+      throw new Error('expected a middle UID');
+    }
+    const found = await runtime.service.searchMessages({
+      mailbox: stamp,
+      search: { uid: String(target), modseq: '1' },
+      limit: 10,
+      includeSnippet: false,
+    });
+    expect((found.messages as Array<{ uid: number }>).map((item) => item.uid)).toEqual([target]);
+    const moved = await runtime.service.modifyBySearch({
+      mailbox: stamp,
+      search: { uid: String(target), modseq: '1' },
+      action: 'move',
+      destination: archive,
+      dryRun: false,
+    });
+    expect(moved.ok).toBe(true);
+    const left = await runtime.service.listMessages({
+      mailbox: stamp,
+      limit: 10,
+      includeSnippet: false,
+    });
+    expect(
+      (left.messages as Array<{ uid: number }>)
+        .map((item) => item.uid)
+        .sort((leftUid, rightUid) => leftUid - rightUid),
+    ).toEqual(present.filter((uid) => uid !== target));
+    await runtime.close();
+  }, 120_000);
 });
 
 function listenForward(targetPort: number): Promise<{ port: number; close: () => Promise<void> }> {

@@ -114,7 +114,7 @@ Criteria in one search object are sent as one IMAP SEARCH, with the keys side by
 
 When the server answers `NO` or `BAD`, the tool error is `PROTOCOL_ERROR` and the message includes that response text. A connection that closes during connect, the greeting, login, or a command is `CONNECTION_FAILED`, not `PROTOCOL_ERROR`.
 
-An ESEARCH `ALL` value that contains `*` is not decoded. `*` means the highest UID that still exists, which is not `UIDNEXT - 1` after that message is expunged, and rewriting `8:*` from a stale `UIDNEXT` pulls in UIDs the server did not return. The same criteria are searched again as a plain `UID SEARCH`. That list is used only when it is explicit and the mailbox did not change during the command. Another `*`, or a change, is `PROTOCOL_ERROR` and no message is changed from that result.
+An ESEARCH `ALL` value that contains `*`, or any search response that is not a fully explicit UID list, is `PROTOCOL_ERROR`. The set is not decoded and no message is changed. Repeat the search. Two different UID lists in one response are refused the same way. An explicit list, which is what iCloud and Dovecot send, is used as-is. A CONDSTORE `(MODSEQ n)` modifier, and the ESEARCH `MODSEQ`, `COUNT`, `MIN`, and `MAX` items, are not matches.
 
 ### Bulk changes
 

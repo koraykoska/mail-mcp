@@ -896,14 +896,12 @@ class FlowMailbox implements OpenMailbox {
     this.session.clearRefusal();
     const hint =
       'The mailbox was not empty; the search itself failed. Narrow the criteria or check capabilities.';
+    if (esearch) {
+      return this.readSearchUids(query, hint);
+    }
     let result: Awaited<ReturnType<ImapFlow['search']>>;
     try {
-      result = esearch
-        ? await this.client.search(query as SearchObject, {
-            uid: true,
-            returnOptions: ['ALL', 'COUNT'],
-          })
-        : await this.client.search(query as SearchObject, { uid: true });
+      result = await this.client.search(query as SearchObject, { uid: true });
     } catch (error) {
       throw this.session.failTransport(error, 'The server refused the SEARCH command.', hint);
     }
@@ -922,27 +920,15 @@ class FlowMailbox implements OpenMailbox {
     if (Array.isArray(result)) {
       return result;
     }
-    if (result.all) {
-      // `*` is the highest UID that still exists. UIDNEXT-1 names a hole once
-      // that message is expunged, and a stale UIDNEXT turns `8:*` into a wider
-      // range. Neither substitution is safe for a complement, so it is not used.
-      if (result.all.includes('*')) {
-        return this.explicitUidSearch(query);
-      }
-      return parseSequenceSet(result.all);
-    }
     return [];
   }
 
   /**
-   * Read the same criteria again as a plain UID SEARCH. The numbers are used
-   * only when the answer is an explicit list and the mailbox did not change
-   * during the command. A second `*` or a change fails closed: the set is not
-   * guessed, and no message is changed from it.
+   * One UID SEARCH. `*` is not expanded and the command is not repeated.
+   * A second answer can name different messages while the mailbox size stays
+   * the same, so a starred or unreadable set is refused instead.
    */
-  private async explicitUidSearch(query: Record<string, unknown>): Promise<number[]> {
-    const hint =
-      'The mailbox was not empty; the search itself failed. Narrow the criteria or check capabilities.';
+  private async readSearchUids(query: Record<string, unknown>, hint: string): Promise<number[]> {
     if (!this.client.usable || !this.client.mailbox || this.session.hasFailed()) {
       throw new MailError(
         'CONNECTION_FAILED',
@@ -950,33 +936,46 @@ class FlowMailbox implements OpenMailbox {
         'The search did not finish on a selected mailbox, so no UID is reported missing.',
       );
     }
-    const before = mailboxStamp(this.client);
     const fromSearch: number[] = [];
     const fromEsearch: number[] = [];
     let sawSearch = false;
     let sawEsearchAll = false;
     let sawStar = false;
+    let count = 0;
+    const criteria = searchAttributes(this.client, { query, requires: [] });
     const raw = this.client as unknown as RawClient;
     try {
-      const compiled = searchAttributes(this.client, { query, requires: [] });
       const response = await raw.exec(
         'UID SEARCH',
-        Array.isArray(compiled) ? compiled : [compiled],
+        [
+          { type: 'ATOM', value: 'RETURN' },
+          [
+            { type: 'ATOM', value: 'ALL' },
+            { type: 'ATOM', value: 'COUNT' },
+          ],
+          ...(Array.isArray(criteria) ? criteria : [criteria]),
+        ],
         {
           untagged: {
             SEARCH: (untagged) => {
               sawSearch = true;
-              if (takeSearchNumbers(untagged, fromSearch)) {
+              const parsed = searchLineUids(untagged);
+              if (parsed.star) {
                 sawStar = true;
+                return;
               }
+              fromSearch.push(...parsed.uids);
             },
             ESEARCH: (untagged) => {
               const parsed = esearchUidList(untagged.attributes);
+              if (parsed.count !== undefined) {
+                count = parsed.count;
+              }
               if (!parsed.present) {
                 return;
               }
               sawEsearchAll = true;
-              if (parsed.star) {
+              if (!parsed.explicit) {
                 sawStar = true;
                 return;
               }
@@ -996,15 +995,10 @@ class FlowMailbox implements OpenMailbox {
         'The search did not finish on a selected mailbox, so no UID is reported missing.',
       );
     }
-    const after = mailboxStamp(this.client);
-    const changed = before.exists !== after.exists || before.uidNext !== after.uidNext;
-    if (sawStar || changed) {
+    if (sawStar) {
       throw new MailError(
         'PROTOCOL_ERROR',
-        sawStar
-          ? 'The server returned a UID set containing *, so the match list was not used.'
-          : 'The mailbox changed while the search result was read, so the match list was not used.',
-        'Repeat the search. No message was changed from this result.',
+        'The server answered with a UID set containing *, which cannot be resolved safely; no message was changed. Repeat the search.',
       );
     }
     const searchUids = normalizeUids(fromSearch);
@@ -1016,7 +1010,19 @@ class FlowMailbox implements OpenMailbox {
         'Repeat the search. No message was changed from this result.',
       );
     }
-    return sawEsearchAll && !sawSearch ? esearchUids : searchUids;
+    if (sawEsearchAll) {
+      return esearchUids;
+    }
+    if (sawSearch) {
+      return searchUids;
+    }
+    if (count > 0) {
+      throw new MailError(
+        'PROTOCOL_ERROR',
+        'The server answered with a UID set containing *, which cannot be resolved safely; no message was changed. Repeat the search.',
+      );
+    }
+    return [];
   }
 
   async fetchSummaries(
@@ -1444,9 +1450,20 @@ class FlowMailbox implements OpenMailbox {
           const response = await raw.exec('UID SORT', attempt.args, {
             untagged: {
               SORT: (untagged) => {
-                for (const attribute of untagged.attributes ?? []) {
-                  const value = Number(attribute.value);
-                  if (Number.isInteger(value)) {
+                const attributes = (untagged.attributes ?? []) as unknown[];
+                for (let index = 0; index < attributes.length; index += 1) {
+                  const attribute = attributes[index];
+                  // (MODSEQ n) is a parenthesized modifier. A bare MODSEQ atom is the same value.
+                  if (Array.isArray(attribute)) {
+                    continue;
+                  }
+                  const token = attrText(attribute);
+                  if (token.toUpperCase() === 'MODSEQ') {
+                    index += 1;
+                    continue;
+                  }
+                  const value = Number(token);
+                  if (Number.isInteger(value) && value > 0) {
                     numbers.push(value);
                   }
                 }
@@ -1596,10 +1613,21 @@ class FlowMailbox implements OpenMailbox {
                   }
                   for (let index = 0; index < nodes.length; index += 1) {
                     const node = nodes[index];
+                    if (Array.isArray(node)) {
+                      visit(node);
+                      continue;
+                    }
                     const token = String(node?.value ?? '').toUpperCase();
                     const next = nodes[index + 1];
-                    if (token === 'UID' && next?.value !== undefined) {
-                      uid = Number(next.value);
+                    if (token === 'MODSEQ') {
+                      index += 1;
+                      continue;
+                    }
+                    if (token === 'UID' && next?.value !== undefined && !Array.isArray(next)) {
+                      const parsed = Number(next.value);
+                      if (Number.isInteger(parsed) && parsed > 0) {
+                        uid = parsed;
+                      }
                     }
                     if (token === 'PREVIEW' && typeof next?.value === 'string') {
                       preview = next.value;
@@ -1959,8 +1987,15 @@ function esearchNumbers(attributes: ImapAttr[]): { uids: number[]; count?: numbe
       const token = String(node?.value ?? '').toUpperCase();
       const next = nodes[index + 1];
       const nextAttr = Array.isArray(next) ? undefined : (next as ImapAttr | undefined);
+      // MIN, MAX, and MODSEQ are one number each. None of them is the match list.
+      if (token === 'MIN' || token === 'MAX' || token === 'MODSEQ') {
+        continue;
+      }
       if (token === 'COUNT' && nextAttr?.value !== undefined) {
-        count = Number(nextAttr.value);
+        const parsed = Number(nextAttr.value);
+        if (Number.isInteger(parsed) && parsed >= 0) {
+          count = parsed;
+        }
       }
       if (token === 'ALL' && next !== undefined) {
         const text = sequenceText(next);
@@ -2073,82 +2108,118 @@ function refusalFromLog(entry: unknown): string {
   return serverRefusal(err);
 }
 
-function mailboxStamp(client: ImapFlow): { exists: number; uidNext: number } {
-  const box = client.mailbox as { exists?: number; uidNext?: number } | false | undefined;
-  if (!box) {
-    return { exists: -1, uidNext: -1 };
+const EXPLICIT_UID_SET = /^\d+(:\d+)?(,\d+(:\d+)?)*$/;
+
+function attrText(node: unknown): string {
+  if (!node || typeof node !== 'object' || Array.isArray(node)) {
+    return '';
   }
-  return {
-    exists: typeof box.exists === 'number' ? box.exists : -1,
-    uidNext: typeof box.uidNext === 'number' ? box.uidNext : -1,
-  };
+  const value = (node as ImapAttr).value;
+  return value === undefined ? '' : String(value);
 }
 
-function attributeValues(node: unknown): string[] {
-  const values: string[] = [];
-  const visit = (item: unknown): void => {
-    if (Array.isArray(item)) {
-      for (const child of item) {
-        visit(child);
-      }
-      return;
-    }
-    if (!item || typeof item !== 'object') {
-      return;
-    }
-    const record = item as { value?: unknown; attributes?: unknown };
-    if (Array.isArray(record.attributes)) {
-      visit(record.attributes);
-    }
-    if (typeof record.value === 'string' || typeof record.value === 'number') {
-      values.push(String(record.value));
-    }
-  };
-  visit(node);
-  return values;
-}
-
-/** True when the line contained `*`, which is not an explicit UID. */
-function takeSearchNumbers(
-  untagged: { attributes?: ImapAttr[]; numbers?: number[] },
-  target: number[],
-): boolean {
+/**
+ * UIDs from one untagged SEARCH line. A parenthesized `(MODSEQ n)` and a bare
+ * MODSEQ atom are the highest mod-sequence of the matches, not another UID.
+ * `*` is not expanded.
+ */
+function searchLineUids(untagged: { attributes?: ImapAttr[]; numbers?: number[] }): {
+  star: boolean;
+  uids: number[];
+} {
   if (Array.isArray(untagged.numbers)) {
-    for (const value of untagged.numbers) {
-      if (Number.isInteger(value) && value > 0) {
-        target.push(value);
-      }
-    }
-    return false;
+    return {
+      star: false,
+      uids: untagged.numbers.filter((value) => Number.isInteger(value) && value > 0),
+    };
   }
+  const uids: number[] = [];
   let star = false;
-  for (const value of attributeValues(untagged.attributes)) {
+  const attributes = (untagged.attributes ?? []) as unknown[];
+  for (let index = 0; index < attributes.length; index += 1) {
+    const attribute = attributes[index];
+    if (Array.isArray(attribute)) {
+      continue;
+    }
+    const value = attrText(attribute);
+    if (value.toUpperCase() === 'MODSEQ') {
+      index += 1;
+      continue;
+    }
     if (value.includes('*')) {
       star = true;
       continue;
     }
-    if (/^\d+$/.test(value)) {
-      target.push(Number(value));
+    if (EXPLICIT_UID_SET.test(value)) {
+      uids.push(...parseSequenceSet(value));
     }
   }
-  return star;
+  return { star, uids };
 }
 
 function esearchUidList(attributes: ImapAttr[] | undefined): {
   present: boolean;
   star: boolean;
+  explicit: boolean;
   uids: number[];
+  count?: number;
 } {
-  const values = attributeValues(attributes);
-  const index = values.findIndex((value) => value.toUpperCase() === 'ALL');
-  if (index < 0) {
-    return { present: false, star: false, uids: [] };
+  const nodes = (attributes ?? []) as unknown[];
+  let index = 0;
+  if (Array.isArray(nodes[0])) {
+    index += 1;
   }
-  const set = values[index + 1] ?? '';
-  if (set.includes('*')) {
-    return { present: true, star: true, uids: [] };
+  if (attrText(nodes[index]).toUpperCase() === 'UID') {
+    index += 1;
   }
-  return { present: true, star: false, uids: parseSequenceSet(set) };
+  let present = false;
+  let star = false;
+  let explicit = false;
+  const uids: number[] = [];
+  let count: number | undefined;
+  while (index < nodes.length) {
+    const key = attrText(nodes[index]).toUpperCase();
+    if (!key) {
+      index += 1;
+      continue;
+    }
+    const next = nodes[index + 1];
+    if (key === 'COUNT') {
+      const text = attrText(next);
+      if (/^\d+$/.test(text)) {
+        count = Number(text);
+      }
+      index += 2;
+      continue;
+    }
+    if (key === 'MIN' || key === 'MAX' || key === 'MODSEQ' || key === 'PARTIAL') {
+      index += 2;
+      continue;
+    }
+    if (key === 'ALL') {
+      present = true;
+      const set = attrText(next);
+      if (!EXPLICIT_UID_SET.test(set)) {
+        star = set.includes('*');
+        explicit = false;
+        uids.length = 0;
+      } else {
+        explicit = true;
+        star = false;
+        uids.push(...parseSequenceSet(set));
+      }
+      index += 2;
+      continue;
+    }
+    index += 2;
+  }
+  return {
+    present,
+    star,
+    explicit,
+    uids,
+    ...(count !== undefined ? { count } : {}),
+  };
 }
 
 function normalizeUids(uids: number[]): number[] {

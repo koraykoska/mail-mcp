@@ -603,7 +603,7 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_search_messages',
     title: 'Search messages',
     description:
-      'Search with the full structured IMAP SEARCH grammar (from, to, cc, bcc, subject, body, text, header, internal and sent dates, larger/smaller, flags and keywords, UID and sequence sets, NOT/OR/AND, MODSEQ, and Gmail X-GM-RAW / thread id / labels when the server supports them). Same paging and summaries as mail_list_messages. Use this tool, not mail_list_messages, when the user describes what to find. An empty search object is rejected. ESEARCH is used internally when ImapFlow can; the result you see is always a paged list plus total.',
+      'Search with the full structured IMAP SEARCH grammar (from, to, cc, bcc, subject, body, text, header, internal and sent dates, larger/smaller, flags and keywords, UID and sequence sets, NOT/OR/AND, MODSEQ, and Gmail X-GM-RAW / thread id / labels when the server supports them). Same paging and summaries as mail_list_messages. Use this tool, not mail_list_messages, when the user describes what to find. An empty search object is rejected. ESEARCH is used internally when the server advertises it. A response that contains `*`, or that is not a fully explicit UID list, is PROTOCOL_ERROR and no message is changed. An explicit list is returned as a paged list plus total. A `(MODSEQ n)` modifier on the response is not a match.',
     input: z.object({
       account: fields.account,
       mailbox: fields.mailbox.optional(),

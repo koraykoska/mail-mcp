@@ -59,6 +59,13 @@ export interface ScriptedOptions {
   beforePlainSearch?: () => string | undefined;
   /** A UID SEARCH without RETURN answers ESEARCH ALL * instead of a number list. */
   plainSearchStar?: boolean;
+  /** With RETURN, also send this `* SEARCH` line. Used when it disagrees with ALL. */
+  alsoSearch?: string;
+  /**
+   * Append a CONDSTORE modifier. A plain search answers `* SEARCH <uids> (MODSEQ n)`.
+   * An ESEARCH search answers `ALL <uids> MODSEQ n` and the same parenthesized SEARCH line.
+   */
+  searchModseq?: number;
   /** SELECT reports this UIDNEXT instead of the next UID the server will assign. */
   selectUidNext?: number;
   /** Write the greeting and then close the socket, before login. */
@@ -718,7 +725,15 @@ export class ScriptedImap {
         uids.length === this.messages.length;
       const all = custom ?? (star ? '1:*' : uids.length > 0 ? uids.join(',') : undefined);
       const listed = all ? ` ALL ${all}` : '';
-      ctx.write(`* ESEARCH (TAG "${tag}") UID COUNT ${uids.length}${listed}\r\n`);
+      const modseq =
+        this.options.searchModseq !== undefined ? ` MODSEQ ${this.options.searchModseq}` : '';
+      if (this.options.alsoSearch !== undefined) {
+        ctx.write(`* SEARCH ${this.options.alsoSearch}\r\n`);
+      } else if (this.options.searchModseq !== undefined) {
+        const list = uids.join(' ');
+        ctx.write(`* SEARCH ${list}${list ? ' ' : ''}(MODSEQ ${this.options.searchModseq})\r\n`);
+      }
+      ctx.write(`* ESEARCH (TAG "${tag}") UID COUNT ${uids.length}${listed}${modseq}\r\n`);
       return;
     }
     const banner = this.options.beforePlainSearch?.();
@@ -729,7 +744,10 @@ export class ScriptedImap {
       ctx.write(`* ESEARCH (TAG "${tag}") UID ALL *\r\n`);
       return;
     }
-    ctx.write(`* SEARCH ${uids.join(' ')}\r\n`);
+    const list = uids.join(' ');
+    const modseq =
+      this.options.searchModseq !== undefined ? `(MODSEQ ${this.options.searchModseq})` : '';
+    ctx.write(`* SEARCH ${[list, modseq].filter(Boolean).join(' ')}\r\n`);
   }
 }
 
