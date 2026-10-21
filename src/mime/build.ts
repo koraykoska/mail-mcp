@@ -121,17 +121,20 @@ export async function buildRawMessage(
   if (message.html !== undefined) {
     mail.html = message.html;
   }
-  if (message.inReplyTo) {
-    mail.inReplyTo = message.inReplyTo;
+  const inReplyTo = fitMessageIdHeader('In-Reply-To', message.inReplyTo);
+  if (inReplyTo) {
+    mail.inReplyTo = inReplyTo;
   }
-  if (message.references) {
-    mail.references = message.references;
+  const references = fitReferences(message.references);
+  if (references) {
+    mail.references = references;
   }
   if (message.priority) {
     mail.priority = message.priority;
   }
-  if (message.messageId) {
-    mail.messageId = message.messageId;
+  const messageId = fitMessageIdHeader('Message-ID', message.messageId);
+  if (messageId) {
+    mail.messageId = messageId;
   }
   const attachments = (message.attachments ?? []).map(toComposerAttachment);
   if (attachments.length > 0) {
@@ -157,8 +160,13 @@ export async function buildRawMessage(
     if (options?.keepBcc) {
       (compiled as { keepBcc?: boolean }).keepBcc = true;
     }
-    return await compiled.build();
+    const raw = await compiled.build();
+    assertHeaderLines(raw);
+    return raw;
   } catch (error) {
+    if (error instanceof MailError) {
+      throw error;
+    }
     const detail = error instanceof Error ? error.message : 'compose failed';
     throw new MailError('INVALID_ARGUMENT', `Could not build the message: ${detail}`);
   }
@@ -170,6 +178,74 @@ function asciiAddress(address: MailAddress): MailAddress {
     next.name = address.name;
   }
   return next;
+}
+
+/** RFC 5322: a line MUST be no more than 998 octets, excluding the CRLF. */
+const MAX_HEADER_LINE_OCTETS = 998;
+
+/**
+ * A msg-id is one token. Folding would leave a space in the id, so an id that
+ * cannot fit on one line next to its header name is omitted. A Message-ID that
+ * is omitted is replaced by the composer. An In-Reply-To or References id that
+ * is omitted is left off. Ids that fit are kept, and a list is folded on the
+ * spaces between them.
+ */
+function fitMessageIdHeader(name: string, value: string | undefined): string | undefined {
+  if (!value) {
+    return undefined;
+  }
+  const id = bracketId(value);
+  if (!id || !idFits(name, id)) {
+    return undefined;
+  }
+  return id;
+}
+
+function fitReferences(value: string | undefined): string | undefined {
+  if (!value) {
+    return undefined;
+  }
+  const ids: string[] = [];
+  for (const part of value.split(/\s+/)) {
+    const id = bracketId(part);
+    if (id && idFits('References', id)) {
+      ids.push(id);
+    }
+  }
+  if (ids.length === 0) {
+    return undefined;
+  }
+  return ids.join(' ');
+}
+
+function bracketId(value: string): string | undefined {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  if (trimmed.startsWith('<') && trimmed.endsWith('>')) {
+    return trimmed;
+  }
+  return `<${trimmed.replace(/^<|>$/g, '')}>`;
+}
+
+function idFits(name: string, id: string): boolean {
+  return Buffer.byteLength(`${name}: ${id}`) <= MAX_HEADER_LINE_OCTETS;
+}
+
+function assertHeaderLines(raw: Buffer): void {
+  const text = raw.toString('binary');
+  const headerEnd = text.indexOf('\r\n\r\n');
+  const block = headerEnd === -1 ? text : text.slice(0, headerEnd);
+  for (const line of block.split('\r\n')) {
+    if (Buffer.byteLength(line) > MAX_HEADER_LINE_OCTETS) {
+      throw new MailError(
+        'INVALID_ARGUMENT',
+        `A header line is ${Buffer.byteLength(line)} octets, over the limit of ${MAX_HEADER_LINE_OCTETS}.`,
+        'Message-ID, In-Reply-To, and References ids that cannot fit on one line are omitted. A Message-ID that is omitted is replaced.',
+      );
+    }
+  }
 }
 
 function toComposerAttachment(attachment: OutboundAttachment): ComposerAttachment {

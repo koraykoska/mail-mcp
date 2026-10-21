@@ -10,7 +10,13 @@ import { headerValue, messageIds } from '../../src/mime/headers.js';
 import { capText, parseRawMessage } from '../../src/mime/parse.js';
 import { domainAllowed, planReply, planReplyAll, quotePlain } from '../../src/mime/reply.js';
 import { makeSnippet } from '../../src/mime/snippet.js';
-import { buildReferences, forwardSubject, replySubject } from '../../src/mime/subject.js';
+import {
+  FORWARD_SUBJECT_PREFIXES,
+  REPLY_SUBJECT_PREFIXES,
+  buildReferences,
+  forwardSubject,
+  replySubject,
+} from '../../src/mime/subject.js';
 import { flattenThread, threadMessages } from '../../src/mime/thread.js';
 import {
   brokenEncoding,
@@ -40,8 +46,18 @@ describe('subjects and quoting', () => {
     expect(replySubject('Hello')).toBe('Re: Hello');
     expect(replySubject('Re: Hello')).toBe('Re: Hello');
     expect(replySubject('Aw: Hallo')).toBe('Aw: Hallo');
+    expect(replySubject('Antw: Hallo')).toBe('Antw: Hallo');
+    expect(replySubject('Re[2]: Hello')).toBe('Re[2]: Hello');
+    expect(replySubject('Antw[2]: Hallo')).toBe('Antw[2]: Hallo');
+    for (const prefix of REPLY_SUBJECT_PREFIXES) {
+      expect(replySubject(`${prefix}: Hello`)).toBe(`${prefix}: Hello`);
+      expect(replySubject(`${prefix}[2]: Hello`)).toBe(`${prefix}[2]: Hello`);
+    }
     expect(forwardSubject('Hello')).toBe('Fwd: Hello');
     expect(forwardSubject('Fw: Hello')).toBe('Fw: Hello');
+    for (const prefix of FORWARD_SUBJECT_PREFIXES) {
+      expect(forwardSubject(`${prefix}: Hello`)).toBe(`${prefix}: Hello`);
+    }
     expect(buildReferences('<a@x> <b@x>', '<c@x>')).toBe('<a@x> <b@x> <c@x>');
     expect(buildReferences('<a@x>', '<a@x>')).toBe('<a@x>');
   });
@@ -152,6 +168,47 @@ describe('message builder', () => {
     expect(parsed.inReplyTo).toContain('m@example.com');
     expect(headerValue(text, 'x-test')).toBe('1');
     expect(messageIds(headerValue(text, 'references'))).toContain('<m@example.com>');
+  });
+
+  it('omits a message id that cannot fit on one 998-octet line', async () => {
+    const long = `<${'a'.repeat(1200)}@example.com>`;
+    const fitting = `<${'b'.repeat(880)}@example.com>`;
+    const raw = await buildRawMessage({
+      from: { address: 'a@example.com' },
+      to: [{ address: 'b@example.com' }],
+      subject: 'x',
+      text: 'y',
+      messageId: long,
+      inReplyTo: long,
+      references: `<short@example.com> ${long}`,
+    });
+    const text = raw.toString('binary');
+    const headerEnd = text.indexOf('\r\n\r\n');
+    const block = headerEnd === -1 ? text : text.slice(0, headerEnd);
+    for (const line of block.split('\r\n')) {
+      expect(Buffer.byteLength(line)).toBeLessThanOrEqual(998);
+    }
+    expect(block).not.toContain('a'.repeat(200));
+    expect(block).toMatch(/^Message-ID:/im);
+    expect(block).toContain('<short@example.com>');
+    expect(block).not.toMatch(/^In-Reply-To:/im);
+
+    const kept = await buildRawMessage({
+      from: { address: 'a@example.com' },
+      to: [{ address: 'b@example.com' }],
+      subject: 'x',
+      text: 'y',
+      messageId: fitting,
+      inReplyTo: fitting,
+    });
+    const keptText = kept.toString('binary');
+    expect(keptText).toContain(fitting);
+    expect(keptText).toMatch(/^In-Reply-To:/im);
+    const keptEnd = keptText.indexOf('\r\n\r\n');
+    const keptBlock = keptEnd === -1 ? keptText : keptText.slice(0, keptEnd);
+    for (const line of keptBlock.split('\r\n')) {
+      expect(Buffer.byteLength(line)).toBeLessThanOrEqual(998);
+    }
   });
 
   it('rejects an empty message', async () => {

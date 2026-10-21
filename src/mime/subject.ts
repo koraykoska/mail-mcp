@@ -1,5 +1,19 @@
-const REPLY_PREFIX = /^(re|aw|sv|antw)\s*(\[\d+\])?\s*:\s*/i;
-const FORWARD_PREFIX = /^(fwd|fw|wg|tr|rv)\s*:\s*/i;
+/** Reply prefixes. Matching is case-insensitive and allows a bracketed number, as in `Re[2]:`. */
+export const REPLY_SUBJECT_PREFIXES = ['Re', 'Aw', 'Sv', 'Antw'] as const;
+
+/** Forward prefixes. Matching is case-insensitive. */
+export const FORWARD_SUBJECT_PREFIXES = ['Fwd', 'Fw', 'Wg', 'Tr', 'Rv'] as const;
+
+/** Longer prefixes first so `Antw` is not matched as `Aw`. */
+function prefixPattern(prefixes: readonly string[]): string {
+  return [...prefixes].sort((left, right) => right.length - left.length).join('|');
+}
+
+const REPLY_PREFIX = new RegExp(
+  `^(${prefixPattern(REPLY_SUBJECT_PREFIXES)})\\s*(\\[\\d+\\])?\\s*:\\s*`,
+  'i',
+);
+const FORWARD_PREFIX = new RegExp(`^(${prefixPattern(FORWARD_SUBJECT_PREFIXES)})\\s*:\\s*`, 'i');
 
 /** Add a Re: prefix unless the subject already looks like a reply. */
 export function replySubject(subject: string | undefined): string {

@@ -73,6 +73,16 @@ export class FakeSession implements ImapSession {
   emulateIcloud = false;
   /** COPY succeeds and stores the messages, but omits COPYUID. */
   suppressCopyUid = false;
+  /** Thrown once from move, before any message is changed. */
+  moveFault?: MailError;
+  /** Thrown once from move after the source UIDs have been removed. */
+  moveFaultAfterRemove?: MailError;
+  /** After UID expunge removes the named UIDs, thrown once. */
+  expungeFaultAfterRemove?: MailError;
+  /** Thrown once from fetchSummaries after `summaryFaultSkips` successful calls. */
+  summaryFault?: MailError;
+  /** fetchSummaries calls to ignore before `summaryFault` is thrown. */
+  summaryFaultSkips = 0;
   /** Plain queries handed to the matcher, after client-side AND/NOT resolution. */
   readonly searchLog: Record<string, unknown>[] = [];
 
@@ -391,6 +401,15 @@ class FakeBox implements OpenMailbox {
     uids: number[],
     _options: { snippet: boolean; snippetChars: number },
   ): Promise<MessageSummary[]> {
+    if (this.session.summaryFault) {
+      if (this.session.summaryFaultSkips > 0) {
+        this.session.summaryFaultSkips -= 1;
+      } else {
+        const fault = this.session.summaryFault;
+        this.session.summaryFault = undefined;
+        throw fault;
+      }
+    }
     return uids.flatMap((uid) => {
       const message = this.box.messages.find((item) => item.uid === uid);
       if (!message || this.session.ghostUids.has(uid)) {
@@ -559,10 +578,16 @@ class FakeBox implements OpenMailbox {
     destination: string,
   ): Promise<{ map: Record<string, number>; kept: number[] }> {
     await this.session.pace();
+    const fault = this.session.moveFault;
+    if (fault) {
+      this.session.moveFault = undefined;
+      throw fault;
+    }
     if (this.session.moveSupported()) {
       const map = await this.copy(uids, destination);
       const moved = uids.filter((uid) => map[String(uid)] !== undefined);
       this.box.messages = this.box.messages.filter((message) => !moved.includes(message.uid));
+      this.throwMoveFaultAfterRemove();
       return { map, kept: uids.filter((uid) => map[String(uid)] === undefined) };
     }
     if (!this.session.uidPlusSupported()) {
@@ -571,16 +596,30 @@ class FakeBox implements OpenMailbox {
     const map = await this.copy(uids, destination);
     const confirmed = uids.filter((uid) => map[String(uid)] !== undefined);
     this.box.messages = this.box.messages.filter((message) => !confirmed.includes(message.uid));
+    this.throwMoveFaultAfterRemove();
     return {
       map,
       kept: uids.filter((uid) => map[String(uid)] === undefined),
     };
   }
 
+  private throwMoveFaultAfterRemove(): void {
+    const fault = this.session.moveFaultAfterRemove;
+    if (fault) {
+      this.session.moveFaultAfterRemove = undefined;
+      throw fault;
+    }
+  }
+
   async expunge(uids?: number[]): Promise<void> {
     await this.session.pace();
     if (uids && uids.length > 0) {
       this.box.messages = this.box.messages.filter((message) => !uids.includes(message.uid));
+      const fault = this.session.expungeFaultAfterRemove;
+      if (fault) {
+        this.session.expungeFaultAfterRemove = undefined;
+        throw fault;
+      }
       return;
     }
     this.box.messages = this.box.messages.filter((message) => !message.flags.includes('\\Deleted'));

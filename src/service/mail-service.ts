@@ -1261,7 +1261,9 @@ export class MailService {
       );
     }
     const preserved =
-      replaceUid === undefined ? {} : await this.preservedThreading(account, drafts, replaceUid);
+      replaceUid === undefined
+        ? {}
+        : await this.preservedThreading(account, drafts, replaceUid, input.uidValidity);
     const built = await this.outboundFromParts(account, {
       ...input,
       allowEmptyRecipients: true,
@@ -1274,35 +1276,35 @@ export class MailService {
     const raw = await buildRawMessage(built.message, {
       keepBcc: true,
     });
+    if (raw.length > account.limits.maxMessageBytes) {
+      throw new MailError('SIZE_LIMIT', `Message is ${raw.length} bytes, over maxMessageBytes.`);
+    }
     const appended = await this.withImap(account, (session) =>
       session.append(drafts, raw, ['\\Draft']),
     );
-    if (replaceUid !== undefined) {
-      try {
-        await this.deleteMessages({
-          account: account.id,
-          mailbox: drafts,
-          uids: [replaceUid],
-          permanent: account.allowPermanentDelete,
-        });
-      } catch (error) {
-        if (appended.uid !== undefined) {
-          await this.deleteMessages({
-            account: account.id,
-            mailbox: drafts,
-            uids: [appended.uid],
-            permanent: account.allowPermanentDelete,
-          }).catch(() => undefined);
-        }
-        throw error;
-      }
+    if (replaceUid === undefined) {
+      return {
+        ok: true as const,
+        account: account.id,
+        mailbox: drafts,
+        ...appended,
+        replacedUid: null,
+        ...publicIdentity(built.identity),
+      };
     }
+    const removal = await this.removeReplacedDraft(account, drafts, replaceUid, input.uidValidity);
+    const removed = removal === 'removed';
     return {
-      ok: true as const,
+      ok: removed,
       account: account.id,
       mailbox: drafts,
       ...appended,
-      replacedUid: replaceUid ?? null,
+      replacedUid: removed ? replaceUid : null,
+      ...(removed
+        ? {}
+        : {
+            warning: draftReplaceWarning(removal, drafts, replaceUid, appended.uid),
+          }),
       ...publicIdentity(built.identity),
     };
   }
@@ -3361,6 +3363,66 @@ export class MailService {
   }
 
   /**
+   * Remove the draft that was replaced. The new UID is never deleted. A later
+   * read can show that the old UID is still present, but that does not prove the
+   * old body is intact, so a duplicate is kept instead of removing the replacement.
+   * The old UID is reported removed only when the delete result says so, or a
+   * later read shows it is gone. When that read fails, the new draft stays and
+   * the result does not claim the old UID was removed.
+   */
+  private async removeReplacedDraft(
+    account: ResolvedAccount,
+    mailbox: string,
+    uid: number,
+    uidValidity?: string,
+  ): Promise<'removed' | 'present' | 'unknown'> {
+    let reported: 'removed' | 'present' | 'unknown';
+    try {
+      const result = await this.deleteMessages({
+        account: account.id,
+        mailbox,
+        uids: [uid],
+        permanent: account.allowPermanentDelete,
+        ...(uidValidity ? { uidValidity } : {}),
+      });
+      reported = classifyRemoval(result, uid);
+      if (reported === 'removed') {
+        return 'removed';
+      }
+    } catch {
+      reported = 'unknown';
+    }
+    const seen = await this.draftPresence(account, mailbox, uid, uidValidity);
+    if (seen === 'absent') {
+      return 'removed';
+    }
+    if (seen === 'present') {
+      return 'present';
+    }
+    return reported === 'present' ? 'present' : 'unknown';
+  }
+
+  private async draftPresence(
+    account: ResolvedAccount,
+    mailbox: string,
+    uid: number,
+    uidValidity?: string,
+  ): Promise<'present' | 'absent' | 'unknown'> {
+    try {
+      await this.withMailbox(account, mailbox, 'read', async (box) => {
+        this.assertUid(box, uidValidity);
+        await this.requireSummary(box, uid);
+      });
+      return 'present';
+    } catch (error) {
+      if (error instanceof MailError && error.code === 'NOT_FOUND') {
+        return 'absent';
+      }
+      return 'unknown';
+    }
+  }
+
+  /**
    * Threading headers already stored on a draft. An update copies these onto the
    * replacement and cannot drop them. Read fails before the new copy is appended.
    */
@@ -3368,8 +3430,14 @@ export class MailService {
     account: ResolvedAccount,
     mailbox: string,
     uid: number,
+    uidValidity?: string,
   ): Promise<{ inReplyTo?: string; references?: string }> {
-    const existing = await this.loadParsed(account, { account: account.id, mailbox, uid });
+    const existing = await this.loadParsed(account, {
+      account: account.id,
+      mailbox,
+      uid,
+      ...(uidValidity ? { uidValidity } : {}),
+    });
     const kept: { inReplyTo?: string; references?: string } = {};
     if (existing.parsed.inReplyTo) {
       kept.inReplyTo = existing.parsed.inReplyTo;
@@ -4144,6 +4212,37 @@ async function continueChunk(
   }
 }
 
+function classifyRemoval(
+  result: Record<string, unknown>,
+  uid: number,
+): 'removed' | 'present' | 'unknown' {
+  const results = Array.isArray(result.results) ? result.results : [];
+  const row = results.find(
+    (item): item is { uid?: number; ok?: boolean } =>
+      Boolean(item) && typeof item === 'object' && (item as { uid?: unknown }).uid === uid,
+  );
+  const stopped = result.stopped;
+  const finished = result.complete === true && (stopped === null || stopped === undefined);
+  if (!finished || !row) {
+    return 'unknown';
+  }
+  return row.ok === true ? 'removed' : 'present';
+}
+
+function draftReplaceWarning(
+  removal: 'present' | 'unknown',
+  mailbox: string,
+  oldUid: number,
+  newUid: number | undefined,
+): string {
+  const kept =
+    newUid === undefined ? 'The new draft was kept.' : `The new draft was kept as UID ${newUid}.`;
+  if (removal === 'present') {
+    return `Draft UID ${oldUid} is still in ${mailbox}. ${kept}`;
+  }
+  return `Could not confirm that draft UID ${oldUid} was removed from ${mailbox}. ${kept} The old draft was left in place if it is still there.`;
+}
+
 function progressFields(progress: ChunkProgress): {
   ok: boolean;
   complete: boolean;
@@ -4668,6 +4767,8 @@ export interface ForwardDraftInput extends Omit<ForwardInput, 'appendSent'> {
 
 export interface DraftInput extends ComposeParts {
   mailbox?: string;
+  /** Checked against the Drafts mailbox before the old draft is read or removed. */
+  uidValidity?: string;
   /** Set by reply and forward draft saves so the reported reason matches a send. */
   identityChoice?: IdentityChoice;
 }

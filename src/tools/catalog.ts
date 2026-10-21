@@ -1271,7 +1271,7 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_create_draft',
     title: 'Create a draft',
     description:
-      'Build a message and APPEND it to the Drafts mailbox with \\Draft. The Drafts path is resolved automatically unless mailbox is set. Recipients may be empty. Does not send. Use mail_update_draft to replace one and mail_send_draft to submit it. A reply or a forward is mail_create_reply_draft or mail_create_forward_draft. In-Reply-To and References cannot be set here or through headers. Blocked when readOnly.',
+      'Build a message and APPEND it to the Drafts mailbox with \\Draft. The Drafts path is resolved automatically unless mailbox is set. Recipients may be empty. Does not send. A message over maxMessageBytes is SIZE_LIMIT and is not appended. Use mail_update_draft to replace one and mail_send_draft to submit it. A reply or a forward is mail_create_reply_draft or mail_create_forward_draft. In-Reply-To and References cannot be set here or through headers. Blocked when readOnly.',
     input: z.object({
       account: fields.account,
       mailbox: fields.mailbox.optional().describe('Override the resolved Drafts mailbox.'),
@@ -1320,11 +1320,12 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_update_draft',
     title: 'Update a draft',
     description:
-      'Replace a draft: APPEND a new copy, then delete the UID you pass. The delete is a Trash move unless allowPermanentDelete is on, in which case the old UID is expunged. Pass the same compose fields as mail_create_draft. uid is the existing draft. In-Reply-To and References already stored on that draft are copied onto the replacement and cannot be set or cleared here. The old draft is read before the new copy is appended. If that read fails, nothing is appended and the old draft stays.',
+      'Replace a draft: APPEND a new copy, then delete the UID you pass. The delete is a Trash move unless allowPermanentDelete is on, in which case the old UID is expunged. Pass the same compose fields as mail_create_draft. uid is the existing draft. Optional uidValidity is checked before the old draft is read and again before it is removed. A message over maxMessageBytes is SIZE_LIMIT and is not appended. In-Reply-To and References already stored on that draft are copied onto the replacement and cannot be set or cleared here. The old draft is read before the new copy is appended. If that read fails, nothing is appended and the old draft stays. ok is true only when the old UID was removed, and replacedUid is that UID. When the old UID is still present, or removal cannot be confirmed, ok is false, replacedUid is null, and warning names the mailbox and both UIDs. The new draft is kept. It is never deleted to undo a failed replace.',
     input: z.object({
       account: fields.account,
       mailbox: fields.mailbox.optional(),
       uid: fields.uid.describe('UID of the draft to replace.'),
+      uidValidity: fields.uidValidity,
       from: fields.address.optional(),
       to: fields.addressList.optional(),
       cc: fields.addressList.optional(),
@@ -1343,6 +1344,12 @@ export const TOOLS: ToolDefinition[] = [
       destination: z.string().optional(),
       bytes: z.number().optional(),
       replacedUid: z.number().nullable(),
+      warning: z
+        .string()
+        .optional()
+        .describe(
+          'Set when the new draft was kept and the old UID was not confirmed removed. Names the mailbox and both UIDs.',
+        ),
       identity: z
         .object({ id: z.string().nullable(), email: z.string(), name: z.string().optional() })
         .strict(),
@@ -1368,7 +1375,7 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_create_reply_draft',
     title: 'Save a reply as a draft',
     description:
-      'Save a reply without sending it. The composition matches mail_reply_message: In-Reply-To and References come from the original Message-ID and References, the subject is Re: unless it already has a reply prefix (Re, Aw, Sv), the original body is quoted, and recipients and the From identity are chosen the same way (replyAll, from, replyTo). The message is APPENDed to the resolved Drafts mailbox with \\Draft, unless draftsMailbox is set. The result includes the new draft UID. Does not send, does not require allowSend, and does not set \\Answered on the original. In-Reply-To and References cannot be passed as headers. mail_update_draft keeps those threading headers. mail_send_draft sends them intact. Blocked when readOnly.',
+      'Save a reply without sending it. The composition matches mail_reply_message: In-Reply-To and References come from the original Message-ID and References, the subject is Re: unless it already has a reply prefix (Re, Aw, Sv, Antw, including a bracketed number such as Re[2]:), the original body is quoted, and recipients and the From identity are chosen the same way (replyAll, from, replyTo). The message is APPENDed to the resolved Drafts mailbox with \\Draft, unless draftsMailbox is set. The result includes the new draft UID. Does not send, does not require allowSend, and does not set \\Answered on the original. In-Reply-To and References cannot be passed as headers. mail_update_draft keeps those threading headers. mail_send_draft sends them intact. Blocked when readOnly.',
     input: z.object({
       account: fields.account,
       mailbox: fields.mailbox.describe('Mailbox that holds the message being replied to.'),
@@ -1435,7 +1442,7 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_create_forward_draft',
     title: 'Save a forward as a draft',
     description:
-      'Save a forward without sending it. The composition matches mail_forward_message: the subject gains Fwd: unless it already has a forward prefix, the original text is quoted under a forwarded-message line, and the message attaches forwarded.eml plus the original non-inline attachments under their original file names. Inline images are not copied. includeAttachments defaults to true. Pass to (required) and optional cc. From follows the same identity rules as mail_reply_message. The message is APPENDed to the resolved Drafts mailbox with \\Draft, unless draftsMailbox is set. The result includes the new draft UID. Does not send, does not require allowSend, and does not set $Forwarded on the original. Blocked when readOnly.',
+      'Save a forward without sending it. The composition matches mail_forward_message: the subject gains Fwd: unless it already has a forward prefix (Fwd, Fw, Wg, Tr, Rv), the original text is quoted under a forwarded-message line, and the message attaches forwarded.eml plus the original non-inline attachments under their original file names. Inline images are not copied. includeAttachments defaults to true. Pass to (required) and optional cc. From follows the same identity rules as mail_reply_message. The message is APPENDed to the resolved Drafts mailbox with \\Draft, unless draftsMailbox is set. The result includes the new draft UID. Does not send, does not require allowSend, and does not set $Forwarded on the original. Blocked when readOnly.',
     input: z.object({
       account: fields.account,
       mailbox: fields.mailbox.describe('Mailbox that holds the message being forwarded.'),
@@ -1615,7 +1622,7 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_reply_message',
     title: 'Reply to a message',
     description:
-      'Reply to a message identified by account, mailbox, and UID. Sets In-Reply-To and References, prefixes the subject with Re: unless it already has a reply prefix (Re, Aw, Sv), and quotes the original plain text (or the HTML rendered to text). replyAll true puts the original From (or Reply-To) in To and the other recipients in Cc, omitting this account. An omitted replyTo uses the selected identity replyTo. The result is the same shape as mail_send_message. Requires allowSend.',
+      'Reply to a message identified by account, mailbox, and UID. Sets In-Reply-To and References, prefixes the subject with Re: unless it already has a reply prefix (Re, Aw, Sv, Antw, including a bracketed number such as Re[2]:), and quotes the original plain text (or the HTML rendered to text). replyAll true puts the original From (or Reply-To) in To and the other recipients in Cc, omitting this account. An omitted replyTo uses the selected identity replyTo. The result is the same shape as mail_send_message. Requires allowSend.',
     input: z.object({
       account: fields.account,
       mailbox: fields.mailbox,
@@ -1682,7 +1689,7 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_forward_message',
     title: 'Forward a message',
     description:
-      'Forward a message by UID. Subject gains Fwd: unless it already has a forward prefix. The original text is quoted under a forwarded-message line. includeAttachments defaults to true and reattaches non-inline originals. Inline images are not copied. Pass to (required) and optional cc. Same send result and Sent-append rules as mail_send_message.',
+      'Forward a message by UID. Subject gains Fwd: unless it already has a forward prefix (Fwd, Fw, Wg, Tr, Rv). The original text is quoted under a forwarded-message line. includeAttachments defaults to true and reattaches non-inline originals. Inline images are not copied. Pass to (required) and optional cc. Same send result and Sent-append rules as mail_send_message.',
     input: z.object({
       account: fields.account,
       mailbox: fields.mailbox,
