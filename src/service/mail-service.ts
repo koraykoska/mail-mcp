@@ -48,6 +48,7 @@ import {
   closeByHeaders,
   conversationThreadKey,
   dedupeMessages,
+  keepWithinCap,
   normalizeMessageId,
   type ConversationMessage,
   type LinkKind,
@@ -2896,48 +2897,25 @@ export class MailService {
     const linked: LinkKind = gmail ? 'gmail-thrid' : 'objectid';
     const compiled = compileSearch({ threadId: seed.threadId });
     assertSearchCapabilities(compiled.requires, (name) => session.hasCapability(name));
-    const messages: ConversationMessage[] = [];
     const seen: ConversationMessage[] = [];
-    const counted = new Set<string>();
-    let truncated = false;
-    const admits = (message: ConversationMessage): boolean => {
-      const id = normalizeMessageId(message.messageId);
-      const capKey = id || `${message.mailbox}\0${message.uid}`;
-      if (counted.has(capKey)) {
-        return true;
-      }
-      if (counted.size >= maxMessages) {
-        truncated = true;
-        return false;
-      }
-      counted.add(capKey);
-      return true;
-    };
     for (const folder of folders) {
       const found = await session.withMailbox(folder, 'read', async (box) => {
         const uids = await box.search(compiled);
         const summaries = await box.fetchSummaries(uids, { snippet: true, snippetChars: 160 });
         const rows: ConversationMessage[] = [];
         for (const summary of summaries) {
-          const message = await this.conversationFrom(box, summary, folder, linked);
-          seen.push(message);
-          if (!admits(message)) {
-            continue;
-          }
-          rows.push(message);
+          rows.push(await this.conversationFrom(box, summary, folder, linked));
         }
         return rows;
       });
-      messages.push(...found);
+      seen.push(...found);
     }
+    // Same earliest-date, mailbox, UID rule as the header walk. `seen` stays
+    // the full capability-search hit list so the closure still counts a
+    // folder that cites a message the cap does not keep.
     const sawSeed = seen.some((item) => item.mailbox === seed.mailbox && item.uid === seed.uid);
-    if (
-      !sawSeed &&
-      !messages.some((item) => item.mailbox === seed.mailbox && item.uid === seed.uid)
-    ) {
-      messages.unshift(seed);
-    }
-    return { messages, seen, truncated };
+    const kept = keepWithinCap(sawSeed ? seen : [...seen, seed], maxMessages);
+    return { messages: kept.messages, seen, truncated: kept.dropped };
   }
 
   private async subjectCandidates(

@@ -337,7 +337,7 @@ export async function closeByHeaders(options: {
  * Copies of one id share a slot. A placeholder seed does not use one.
  * The order does not depend on which seed started the walk.
  */
-function keepWithinCap(
+export function keepWithinCap(
   messages: readonly ConversationMessage[],
   maxMessages: number,
 ): { messages: ConversationMessage[]; dropped: boolean } {
