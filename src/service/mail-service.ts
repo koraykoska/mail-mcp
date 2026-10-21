@@ -1521,6 +1521,17 @@ export class MailService {
         if (fast) {
           messages = fast.messages;
           truncated = fast.truncated;
+          const closure = await this.outsideClosure(
+            account.id,
+            session,
+            paths,
+            threadIdSet(messages, [seed]),
+            maxRounds,
+          );
+          outsideMessages = closure.outside;
+          walkedOutside = true;
+          rounds = closure.rounds;
+          truncated = truncated || closure.truncated;
         } else {
           const closed = await closeByHeaders({
             seed,
@@ -1553,9 +1564,11 @@ export class MailService {
       ];
       messages = dedupeMessages(messages, prefer);
       const threadIds = threadIdSet(messages, [seed, ...outsideMessages]);
-      const excludedMatches = walkedOutside
-        ? excludedFromMentions(mentionsByMailbox(outsideMessages), paths, threadIds)
-        : await this.excludedFolderHits(account.id, session, paths, threadIds);
+      const excludedMatches = cursor?.excluded
+        ? cursor.excluded
+        : walkedOutside
+          ? excludedFromMentions(mentionsByMailbox(outsideMessages), paths, threadIds)
+          : await this.excludedFolderHits(account.id, session, paths, threadIds);
       if (cursor) {
         messages = messages.filter((item) => {
           const folder = cursor.folders.find((entry) => entry.mailbox === item.mailbox);
@@ -1704,7 +1717,7 @@ export class MailService {
         rounds,
         items,
         messages: items,
-        nextCursor: withCursorKeys(page.nextCursor, frozenKeys),
+        nextCursor: withCursorKeys(page.nextCursor, frozenKeys, excludedMatches),
         total: page.total,
         offset: page.offset,
         truncated: truncated || folders.some((folder) => folder.truncated),
@@ -2686,6 +2699,39 @@ export class MailService {
     return excludedFromMentions(mentions, paths, wanted);
   }
 
+  /**
+   * Header closure of out-of-scope folders for a fast path that already loaded
+   * the in-scope messages. The result is excluded counts, not more items.
+   */
+  private async outsideClosure(
+    accountId: string,
+    session: ImapSession,
+    paths: readonly string[],
+    ids: readonly string[],
+    maxRounds: number,
+  ): Promise<{ outside: ConversationMessage[]; rounds: number; truncated: boolean }> {
+    const probe = await closeByHeaders({
+      seed: {
+        mailbox: '',
+        uid: 0,
+        uidValidity: '',
+        references: [...ids],
+        from: [],
+        to: [],
+        cc: [],
+        flags: [],
+        hasAttachments: false,
+        linked: 'header',
+      },
+      folders: [],
+      maxMessages: 1,
+      maxRounds,
+      search: async () => [],
+      outside: (batch) => this.outsideMessages(accountId, session, paths, batch),
+    });
+    return { outside: probe.outside, rounds: probe.rounds, truncated: probe.truncated };
+  }
+
   /** Out-of-scope hits for one walk round. Ids from these messages extend the closure. */
   private async outsideMessages(
     accountId: string,
@@ -3614,12 +3660,22 @@ function frozenSortUids(keys: readonly string[], mailbox: string): number[] {
   return uids;
 }
 
-function withCursorKeys(cursor: string | null, keys: readonly string[]): string | null {
+function withCursorKeys(
+  cursor: string | null,
+  keys: readonly string[],
+  excluded?: ReadonlyArray<{ mailbox: string; count: number }>,
+): string | null {
   if (!cursor) {
     return null;
   }
   const decoded = decodeSnapshotCursor(cursor);
-  return encodeSnapshotCursor({ ...decoded, keys: [...keys] });
+  return encodeSnapshotCursor({
+    ...decoded,
+    keys: [...keys],
+    ...(excluded
+      ? { excluded: excluded.map((item) => ({ mailbox: item.mailbox, count: item.count })) }
+      : {}),
+  });
 }
 
 function headerMentions(message: ConversationMessage, wanted: ReadonlySet<string>): boolean {

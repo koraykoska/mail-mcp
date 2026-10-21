@@ -48,6 +48,11 @@ export interface SnapshotCursor {
   /** Set when the page is a list of keys rather than message UIDs. */
   anchorKey?: string;
   keys?: string[];
+  /**
+   * Frozen excludedMatches for a thread page. One row per folder, not per
+   * message, so a later page can reuse the closure without storing its ids.
+   */
+  excluded?: Array<{ mailbox: string; count: number }>;
 }
 
 export interface PageRow extends SortableMessage {
@@ -195,6 +200,25 @@ function readCursor(parsed: unknown): SnapshotCursor {
   }
   if (Array.isArray(record.keys) && record.keys.every((item) => typeof item === 'string')) {
     cursor.keys = record.keys;
+  }
+  if (record.excluded !== undefined) {
+    if (!Array.isArray(record.excluded) || record.excluded.length > 500) {
+      throw new MailError('INVALID_ARGUMENT', 'The page cursor is not valid.');
+    }
+    cursor.excluded = record.excluded.map((item) => {
+      const row = item as { mailbox?: unknown; count?: unknown };
+      if (
+        typeof row.mailbox !== 'string' ||
+        row.mailbox.length === 0 ||
+        row.mailbox.length > 1000 ||
+        typeof row.count !== 'number' ||
+        !Number.isInteger(row.count) ||
+        row.count < 0
+      ) {
+        throw new MailError('INVALID_ARGUMENT', 'The page cursor is not valid.');
+      }
+      return { mailbox: row.mailbox, count: row.count };
+    });
   }
   return cursor;
 }

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- A later `mail_get_thread` page reuses the `excludedMatches` list frozen on the first page, including ids that were found only on out-of-scope messages. The Gmail `X-GM-THRID` and OBJECTID fast paths build that list from the same header closure. Hitting `maxMessages` still scans out-of-scope folders. The kept items are the earliest messages, so the set does not depend on which seed started the walk.
+- Header threading repeats a search for every id an out-of-scope hit adds until no new id appears, or until 8 searches per round and 32 searches in total. Both seeds that finish under that cap return the same items and the same `truncated` value. A walk stopped by the cap sets `truncated`.
+- An `X-` token is rejected when any digit normalization matches an address or routing word: all digits removed, or look-alike digits mapped (`0` as `o`, `1` as `l` and as `i`, `3` as `e`, `4` as `a`, `5` as `s`, `7` as `t`) with the other digits removed. That is a best-effort guard. MTAs and Nodemailer do not read those names as routing headers. It over-blocks `X-From0`, `X-From0-Not`, `X-Enve1ope`, `X-Bounc3`, `X-3nv3l0p3`, and `X-B0unc3`. `X-Sender-IP2`, `X-Notification2`, `X-Photo2`, and `X-Original-Arrival-Time` stay allowed.
 - Conversation threading across folders (`mail_get_thread`), with header links by default and an opt-in subject heuristic. Messages that have no Message-ID are not merged.
 - Shared folder scope and snapshot pagination for list, search, threads, attachments, correspondents, counts, and dry-run bulk actions. A cursor freezes an upper UID so mail that arrives later does not shift the page. `CURSOR_INVALIDATED` is returned when UIDVALIDITY changes.
 - Sending identities: optional `from` on send, reply, forward, and drafts, checked against configured identities and `allowFromDomains`.

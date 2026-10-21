@@ -364,6 +364,10 @@ class FakeBox implements OpenMailbox {
         ...(inReplyTo ? { inReplyTo } : {}),
         ...(references.length > 0 ? { references } : {}),
       };
+      const threadId = header(message.raw, 'x-gm-thrid');
+      if (threadId) {
+        summary.threadId = threadId;
+      }
       if (message.subject) {
         summary.subject = message.subject;
       }
@@ -606,6 +610,12 @@ function matches(message: StoredMessage, query: Record<string, unknown>): boolea
   const text = message.raw.toString('utf8');
   if (typeof query.text === 'string' && !text.includes(String(query.text))) {
     return false;
+  }
+  if (typeof query.threadId === 'string') {
+    const threadId = header(message.raw, 'x-gm-thrid');
+    if (!threadId || threadId !== query.threadId) {
+      return false;
+    }
   }
   return true;
 }

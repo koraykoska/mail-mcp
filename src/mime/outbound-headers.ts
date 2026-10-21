@@ -208,16 +208,17 @@ function headerHint(name: string): string {
   if (canonical.startsWith('x-') && routingHeaderDenied(name)) {
     return (
       'An X- header is lowercased first and split on "-" and "_", never on camelCase. ' +
-      'Each token is normalized before the match: 0 is read as o and other digits are removed, ' +
-      'so digits are stripped from every token. A token that becomes from, to, cc, bcc, or ' +
-      'recipient is rejected in any position. It is rejected when the last token is ' +
+      'Each token is checked with all digits removed, and again with look-alike digits mapped ' +
+      '(0 as o, 1 as l and as i, 3 as e, 4 as a, 5 as s, 7 as t) and the other digits removed. ' +
+      'Any match rejects the name. A token that becomes from, to, cc, bcc, or recipient is ' +
+      'rejected in any position. It is rejected when the last token is ' +
       'to, from, sender, cc, bcc, or recipient, when the trailing tokens are an address-bearing ' +
       'name (reply-to, errors-to, return-path, rcpt-to, delivered-to, apparently-to, ' +
       'apparently-from, original-from, original-sender, original-to, original-recipient, ' +
       'receipt-to, read-receipt-to, return-receipt-to, notification-to, ' +
       'disposition-notification-to, confirm-reading-to, reading-to, mdn-to, mail-followup-to, ' +
       'followup-to, mail-reply-to), or when any token is resent, envelope, rcpt, or bounce. ' +
-      'The lowercased name with "-" and "_" removed, 0 read as o, and other digits removed is always rejected when ' +
+      'The lowercased name with "-" and "_" removed is checked the same way, and it is rejected when ' +
       'it ends with from, sender, recipient, replyto, errorsto, returnpath, deliveredto, ' +
       'receiptto, notificationto, readingto, mdnto, apparentlyto, followupto, originalto, or ' +
       'rcptto, or when it contains resent, envelope, rcpt, or bounce. Names such as ' +
@@ -240,14 +241,17 @@ export function isFieldName(name: string): boolean {
  * True when `name` is a routing or receipt header, or an X- alias of one.
  * The name is lowercased before it is split. CamelCase is not a boundary.
  * A trailing token sequence that equals an address-bearing header name is denied.
- * Any token equal to resent, envelope, rcpt, or bounce is denied. Digits are
- * normalized in every token (0 is read as o, other digits are removed) before
- * that match, and a token that becomes from, to, cc, bcc, or recipient is denied
- * in any position. sender is denied only as the last token or a compact suffix,
- * so X-Sender-IP stays allowed. The compact form is always checked as well.
- * X-Report-Abuse-To is denied because its last token is an address token; that
- * over-block is intentional, as is denying from, to, cc, bcc, or recipient
- * when the token is not last (X-From2-Not).
+ * Any token equal to resent, envelope, rcpt, or bounce is denied. Each token is
+ * matched with all digits removed and with look-alike digits mapped (0 as o,
+ * 1 as l and as i, 3 as e, 4 as a, 5 as s, 7 as t). A token that becomes from,
+ * to, cc, bcc, or recipient is denied in any position. sender is denied only as
+ * the last token or a compact suffix, so X-Sender-IP stays allowed. The compact
+ * form is checked the same way. This is a best-effort guard: MTAs and Nodemailer
+ * do not read these names as routing headers. X-Report-Abuse-To is denied because
+ * its last token is an address token; that over-block is intentional, as is
+ * denying from, to, cc, bcc, or recipient when the token is not last, and names
+ * that only spell those words after the look-alike mapping (X-From0, X-Enve1ope,
+ * X-Bounc3, X-3nv3l0p3, X-B0unc3).
  */
 export function routingHeaderDenied(name: string): boolean {
   const canonical = canonicalHeaderName(name);
@@ -270,26 +274,66 @@ export function routingHeaderDenied(name: string): boolean {
 /** Address words denied in any token position. sender stays last-token only. */
 const ANY_POSITION_TOKENS = new Set(['from', 'to', 'cc', 'bcc', 'recipient']);
 
-/**
- * Read 0 as o and drop every other digit, so a digit inside a token cannot
- * hide from, envelope, or bounce, and a trailing digit cannot hide the last token.
- */
-function matchToken(piece: string): string {
-  return piece.replace(/0/g, 'o').replace(/\d/g, '');
+const LOOKALIKE_DIGIT: Record<string, string> = {
+  '0': 'o',
+  '3': 'e',
+  '4': 'a',
+  '5': 's',
+  '7': 't',
+};
+
+/** Digits removed, plus look-alike mappings of 1 to both l and i. */
+function tokenVariants(piece: string): string[] {
+  const stripped = piece.replace(/\d/g, '');
+  return [...new Set([stripped, mapLookalike(piece, 'l'), mapLookalike(piece, 'i')])].filter(
+    (token) => token.length > 0,
+  );
 }
 
-function xHeaderDenied(canonical: string): boolean {
-  let rest = canonical;
-  while (rest.startsWith('x-') || rest.startsWith('x_')) {
-    rest = rest.slice(2);
+function mapLookalike(piece: string, one: 'l' | 'i'): string {
+  let out = '';
+  for (const char of piece) {
+    if (char === '1') {
+      out += one;
+      continue;
+    }
+    const mapped = LOOKALIKE_DIGIT[char];
+    if (mapped) {
+      out += mapped;
+      continue;
+    }
+    if (char >= '0' && char <= '9') {
+      continue;
+    }
+    out += char;
   }
-  const tokens = rest
-    .split(/[-_]+/)
-    .map((piece) => matchToken(piece))
-    .filter((token) => token.length > 0);
-  if (tokens.length === 0) {
-    return true;
+  return out;
+}
+
+function variantSequences(groups: readonly (readonly string[])[]): string[][] {
+  const product = groups.reduce((count, group) => count * group.length, 1);
+  if (product > 256) {
+    const width = groups.reduce((widest, group) => Math.max(widest, group.length), 0);
+    const sequences: string[][] = [];
+    for (let index = 0; index < width; index += 1) {
+      sequences.push(groups.map((group) => group[Math.min(index, group.length - 1)] ?? ''));
+    }
+    return sequences;
   }
+  let sequences: string[][] = [[]];
+  for (const group of groups) {
+    const next: string[][] = [];
+    for (const sequence of sequences) {
+      for (const token of group) {
+        next.push([...sequence, token]);
+      }
+    }
+    sequences = next;
+  }
+  return sequences;
+}
+
+function sequenceDenied(tokens: readonly string[]): boolean {
   if (tokens.some((token) => X_DENY_TOKENS.has(token) || ANY_POSITION_TOKENS.has(token))) {
     return true;
   }
@@ -298,11 +342,33 @@ function xHeaderDenied(canonical: string): boolean {
       return true;
     }
   }
-  const compact = matchToken(canonical.replace(/[-_]/g, ''));
+  return false;
+}
+
+function compactDenied(compact: string): boolean {
   if (COMPACT_CONTAINS.some((token) => compact.includes(token))) {
     return true;
   }
   return COMPACT_ADDRESS_SUFFIXES.some((suffix) => compact.endsWith(suffix));
+}
+
+function xHeaderDenied(canonical: string): boolean {
+  let rest = canonical;
+  while (rest.startsWith('x-') || rest.startsWith('x_')) {
+    rest = rest.slice(2);
+  }
+  const groups = rest
+    .split(/[-_]+/)
+    .filter((piece) => piece.length > 0)
+    .map((piece) => tokenVariants(piece))
+    .filter((group) => group.length > 0);
+  if (groups.length === 0) {
+    return true;
+  }
+  if (variantSequences(groups).some((tokens) => sequenceDenied(tokens))) {
+    return true;
+  }
+  return tokenVariants(canonical.replace(/[-_]/g, '')).some((compact) => compactDenied(compact));
 }
 
 function routingNameDenied(name: string): boolean {

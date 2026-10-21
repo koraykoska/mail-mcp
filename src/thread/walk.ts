@@ -193,15 +193,25 @@ function overlaps(left: Set<string>, right: Set<string>): boolean {
   return false;
 }
 
+/** How many id searches one round may spend, and the most one walk will run. */
+export const THREAD_SEARCHES_PER_ROUND = 8;
+export const THREAD_SEARCH_CAP = 32;
+
+/** Search budget for a walk. A longer chain than this stops with truncated set. */
+export function threadSearchCap(maxRounds: number): number {
+  return Math.min(THREAD_SEARCH_CAP, Math.max(1, maxRounds) * THREAD_SEARCHES_PER_ROUND);
+}
+
 /**
  * Header closure. `search` returns messages in one folder whose Message-ID,
  * References, or In-Reply-To contains one of the ids. `outside` returns
  * out-of-scope messages for the same ids. Those messages contribute ids and
  * are returned for excluded counts; they are not items and do not use a cap
- * slot. The walk repeats until no new ids appear or a bound is hit.
- * Ids an out-of-scope hit adds are searched in that same round, so a uid seed
- * does not spend a round only learning the next id.
- * A placeholder seed (empty mailbox, uid 0) records its ids without using a slot.
+ * slot. Hitting maxMessages does not skip that scan.
+ * Ids an out-of-scope hit adds are searched before the walk moves on, repeating
+ * until no new id appears or `threadSearchCap` is reached. Both seeds that
+ * finish under that cap see the same ids. A placeholder seed (empty mailbox,
+ * uid 0) records its ids without using a slot.
  */
 export async function closeByHeaders(options: {
   seed: ConversationMessage;
@@ -219,7 +229,6 @@ export async function closeByHeaders(options: {
   const byKey = new Map<string, ConversationMessage>();
   const known = new Set<string>();
   const searched = new Set<string>();
-  const counted = new Set<string>();
   const outsideMessages: ConversationMessage[] = [];
   const outsideSeen = new Set<string>();
   let truncated = false;
@@ -228,20 +237,6 @@ export async function closeByHeaders(options: {
     if (byKey.has(key)) {
       return;
     }
-    // The Trash/Junk placeholder is not an item. Counting it would hide the
-    // last in-scope message under the cap, and the scope filter drops it later.
-    const placeholder = message.mailbox === '' && message.uid === 0;
-    if (!placeholder) {
-      // Copies of one Message-ID are one message. The cap is applied after that,
-      // so a second folder does not consume a slot and hide a different message.
-      const id = normalizeMessageId(message.messageId);
-      const capKey = id || key;
-      if (!counted.has(capKey) && counted.size >= options.maxMessages) {
-        truncated = true;
-        return;
-      }
-      counted.add(capKey);
-    }
     byKey.set(key, { ...message, linked: message.linked || 'header' });
     for (const id of idsOf(message)) {
       known.add(id);
@@ -249,7 +244,7 @@ export async function closeByHeaders(options: {
   };
   const searchIds = async (pendingIds: readonly string[]): Promise<void> => {
     for (const folder of options.folders) {
-      for (let offset = 0; offset < pendingIds.length && !truncated; offset += 8) {
+      for (let offset = 0; offset < pendingIds.length; offset += 8) {
         const batch = pendingIds.slice(offset, offset + 8);
         const found = await options.search(folder, batch);
         for (const message of found) {
@@ -257,9 +252,10 @@ export async function closeByHeaders(options: {
         }
       }
     }
-    if (!options.outside || truncated) {
+    if (!options.outside) {
       return;
     }
+    // The message cap does not apply here. Out-of-scope hits are counts, not items.
     const found = await options.outside(pendingIds);
     for (const message of found) {
       const key = messageKey(message);
@@ -274,7 +270,8 @@ export async function closeByHeaders(options: {
   };
   remember({ ...options.seed, linked: 'header' });
   let rounds = 0;
-  for (let round = 0; round < options.maxRounds && !truncated; round += 1) {
+  const passCap = threadSearchCap(options.maxRounds);
+  while (rounds < passCap) {
     const pending = [...known].filter((id) => !searched.has(id)).sort();
     if (pending.length === 0) {
       break;
@@ -284,20 +281,68 @@ export async function closeByHeaders(options: {
       searched.add(id);
     }
     await searchIds(pending);
-    // An outside hit can add the next hop's id. Search it before the round
-    // ends so a uid seed and a Message-ID seed stay inside the same budget.
-    const learned = [...known].filter((id) => !searched.has(id)).sort();
-    if (learned.length > 0 && !truncated) {
-      for (const id of learned) {
-        searched.add(id);
-      }
-      await searchIds(learned);
-    }
   }
   if ([...known].some((id) => !searched.has(id))) {
     truncated = true;
   }
-  return { messages: [...byKey.values()], outside: outsideMessages, rounds, truncated };
+  const kept = keepWithinCap([...byKey.values()], options.maxMessages);
+  if (kept.dropped) {
+    truncated = true;
+  }
+  return { messages: kept.messages, outside: outsideMessages, rounds, truncated };
+}
+
+/**
+ * Keep the earliest messages, up to maxMessages distinct Message-IDs.
+ * Copies of one id share a slot. A placeholder seed does not use one.
+ * The order does not depend on which seed started the walk.
+ */
+function keepWithinCap(
+  messages: readonly ConversationMessage[],
+  maxMessages: number,
+): { messages: ConversationMessage[]; dropped: boolean } {
+  const placeholders: ConversationMessage[] = [];
+  const real: ConversationMessage[] = [];
+  for (const message of messages) {
+    if (message.mailbox === '' && message.uid === 0) {
+      placeholders.push(message);
+    } else {
+      real.push(message);
+    }
+  }
+  real.sort(byAge);
+  const seen = new Set<string>();
+  const kept: ConversationMessage[] = [];
+  let dropped = false;
+  for (const message of real) {
+    const id = normalizeMessageId(message.messageId);
+    const capKey = id || messageKey(message);
+    if (!seen.has(capKey) && seen.size >= maxMessages) {
+      dropped = true;
+      continue;
+    }
+    seen.add(capKey);
+    kept.push(message);
+  }
+  return { messages: [...placeholders, ...kept], dropped };
+}
+
+function byAge(left: ConversationMessage, right: ConversationMessage): number {
+  const leftDate = left.date || left.internalDate || '';
+  const rightDate = right.date || right.internalDate || '';
+  if (leftDate < rightDate) {
+    return -1;
+  }
+  if (leftDate > rightDate) {
+    return 1;
+  }
+  if (left.mailbox < right.mailbox) {
+    return -1;
+  }
+  if (left.mailbox > right.mailbox) {
+    return 1;
+  }
+  return left.uid - right.uid;
 }
 
 /** Add messages that share a normalized subject and at least one participant. Opt-in only. */
