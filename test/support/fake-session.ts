@@ -73,6 +73,10 @@ export class FakeSession implements ImapSession {
   emulateIcloud = false;
   /** COPY succeeds and stores the messages, but omits COPYUID. */
   suppressCopyUid = false;
+  /** Runs once at the start of the next APPEND, before the message is stored. */
+  beforeNextAppend?: (box: StoredMailbox) => void;
+  /** Runs once after the next COPY has stored its messages, before the source is removed. */
+  afterNextCopy?: (box: StoredMailbox) => void;
   /** Thrown once from move, before any message is changed. */
   moveFault?: MailError;
   /** Thrown once from move after the source UIDs have been removed. */
@@ -240,6 +244,11 @@ export class FakeSession implements ImapSession {
     flags?: string[],
   ): Promise<{ uid?: number; uidValidity?: string; destination: string }> {
     const box = this.requireBox(path);
+    const hook = this.beforeNextAppend;
+    if (hook) {
+      this.beforeNextAppend = undefined;
+      hook(box);
+    }
     const uid = box.uidNext;
     box.uidNext += 1;
     box.messages.push({
@@ -570,6 +579,11 @@ class FakeBox implements OpenMailbox {
         map[String(uid)] = next;
       }
     }
+    const hook = this.session.afterNextCopy;
+    if (hook) {
+      this.session.afterNextCopy = undefined;
+      hook(this.box);
+    }
     return map;
   }
 
@@ -595,6 +609,7 @@ class FakeBox implements OpenMailbox {
     }
     const map = await this.copy(uids, destination);
     const confirmed = uids.filter((uid) => map[String(uid)] !== undefined);
+    this.assertStoredUidValidity();
     this.box.messages = this.box.messages.filter((message) => !confirmed.includes(message.uid));
     this.throwMoveFaultAfterRemove();
     return {
@@ -611,9 +626,21 @@ class FakeBox implements OpenMailbox {
     }
   }
 
+  /** UID expunge must use the UIDVALIDITY observed when the mailbox was selected. */
+  private assertStoredUidValidity(): void {
+    if (this.box.uidValidity !== this.uidValidity) {
+      throw new MailError(
+        'UIDVALIDITY_CHANGED',
+        `UIDVALIDITY is ${this.box.uidValidity}, not ${this.uidValidity}.`,
+        'The originals were left in place. Copies may remain in the destination.',
+      );
+    }
+  }
+
   async expunge(uids?: number[]): Promise<void> {
     await this.session.pace();
     if (uids && uids.length > 0) {
+      this.assertStoredUidValidity();
       this.box.messages = this.box.messages.filter((message) => !uids.includes(message.uid));
       const fault = this.session.expungeFaultAfterRemove;
       if (fault) {

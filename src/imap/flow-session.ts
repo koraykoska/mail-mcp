@@ -1384,6 +1384,7 @@ class FlowMailbox implements OpenMailbox {
 
   async expunge(uids?: number[]): Promise<void> {
     if (uids && uids.length > 0) {
+      this.assertSelectedUidValidity();
       this.session.clearRefusal();
       await this.commandResult(
         () => this.client.messageDelete(uidList(uids), { uid: true }),
@@ -1394,6 +1395,19 @@ class FlowMailbox implements OpenMailbox {
     const raw = this.client as unknown as RawClient;
     const response = await raw.exec('EXPUNGE', false);
     response.next();
+  }
+
+  /** UID expunge must use the UIDVALIDITY observed when the mailbox was selected. */
+  private assertSelectedUidValidity(): void {
+    const mailbox = this.client.mailbox;
+    const live = mailbox ? bigintToString(mailbox.uidValidity) : undefined;
+    if (!live || live !== this.uidValidity) {
+      throw new MailError(
+        'UIDVALIDITY_CHANGED',
+        `UIDVALIDITY is ${live ?? 'unknown'}, not ${this.uidValidity}.`,
+        'The originals were left in place. Copies may remain in the destination.',
+      );
+    }
   }
 
   async serverSort(

@@ -1260,14 +1260,14 @@ export class MailService {
         'Set draftsMailbox or create a Drafts folder.',
       );
     }
-    const preserved =
+    const prior =
       replaceUid === undefined
-        ? {}
+        ? undefined
         : await this.preservedThreading(account, drafts, replaceUid, input.uidValidity);
     const built = await this.outboundFromParts(account, {
       ...input,
       allowEmptyRecipients: true,
-      ...preserved,
+      ...(prior?.threading ?? {}),
     });
     if (input.identityChoice) {
       built.identity = input.identityChoice;
@@ -1292,7 +1292,20 @@ export class MailService {
         ...publicIdentity(built.identity),
       };
     }
-    const removal = await this.removeReplacedDraft(account, drafts, replaceUid, input.uidValidity);
+    // The appended UID can equal the old UID when the mailbox was recreated and
+    // UIDVALIDITY changed. Deleting that number would remove the new draft.
+    if (appended.uid === replaceUid) {
+      return {
+        ok: false,
+        account: account.id,
+        mailbox: drafts,
+        ...appended,
+        replacedUid: null,
+        warning: `Draft UID ${replaceUid} is the message just appended, so it was not deleted. The new draft was kept as UID ${replaceUid}.`,
+        ...publicIdentity(built.identity),
+      };
+    }
+    const removal = await this.removeReplacedDraft(account, drafts, replaceUid, prior?.uidValidity);
     const removed = removal === 'removed';
     return {
       ok: removed,
@@ -2338,6 +2351,7 @@ export class MailService {
                 continue;
               }
               await session.withMailbox(scan.mailbox, 'write', async (box) => {
+                this.assertUid(box, scan.uidValidity);
                 const progress = await runInChunks({
                   uids,
                   budgetMs: Math.max(0, plan.budgetDeadline - Date.now()),
@@ -3367,7 +3381,8 @@ export class MailService {
    * read can show that the old UID is still present, but that does not prove the
    * old body is intact, so a duplicate is kept instead of removing the replacement.
    * The old UID is reported removed only when the delete result says so, or a
-   * later read shows it is gone. When that read fails, the new draft stays and
+   * later read shows it is gone. The UIDVALIDITY from the pre-append read is
+   * the expected value for both. When that read fails, the new draft stays and
    * the result does not claim the old UID was removed.
    */
   private async removeReplacedDraft(
@@ -3431,22 +3446,25 @@ export class MailService {
     mailbox: string,
     uid: number,
     uidValidity?: string,
-  ): Promise<{ inReplyTo?: string; references?: string }> {
+  ): Promise<{
+    threading: { inReplyTo?: string; references?: string };
+    uidValidity: string;
+  }> {
     const existing = await this.loadParsed(account, {
       account: account.id,
       mailbox,
       uid,
       ...(uidValidity ? { uidValidity } : {}),
     });
-    const kept: { inReplyTo?: string; references?: string } = {};
+    const threading: { inReplyTo?: string; references?: string } = {};
     if (existing.parsed.inReplyTo) {
-      kept.inReplyTo = existing.parsed.inReplyTo;
+      threading.inReplyTo = existing.parsed.inReplyTo;
     }
     const references = buildReferences(existing.parsed.references, undefined);
     if (references) {
-      kept.references = references;
+      threading.references = references;
     }
-    return kept;
+    return { threading, uidValidity: existing.uidValidity };
   }
 
   private async attachmentsRoot(): Promise<string> {
@@ -3578,7 +3596,7 @@ export class MailService {
   private async loadParsed(
     account: ResolvedAccount,
     input: UidInput,
-  ): Promise<{ parsed: ParsedMessage; summary: MessageSummary }> {
+  ): Promise<{ parsed: ParsedMessage; summary: MessageSummary; uidValidity: string }> {
     return this.withMailbox(account, input.mailbox, 'read', async (box) => {
       this.assertUid(box, input.uidValidity);
       const summary = await this.requireSummary(box, input.uid);
@@ -3593,7 +3611,7 @@ export class MailService {
       if (!source) {
         throw new MailError('NOT_FOUND', `Message UID ${input.uid} was not found.`);
       }
-      return { parsed: await parseRawMessage(source), summary };
+      return { parsed: await parseRawMessage(source), summary, uidValidity: box.uidValidity };
     });
   }
 

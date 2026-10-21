@@ -181,6 +181,87 @@ describe('draft replace', () => {
     expect(draftUids(session)).toEqual(before);
   });
 
+  it('does not delete the new draft when UIDVALIDITY changes and the appended UID reuses the old number', async () => {
+    const session = new FakeSession();
+    const mail = service(session);
+    const uid = await seedDraft(mail);
+    expect(uid).toBe(1);
+    session.beforeNextAppend = (box) => {
+      box.messages = [];
+      box.uidValidity = '200';
+      box.uidNext = 1;
+    };
+    const updated = await mail.saveDraft(replacement, uid);
+    const tool = TOOLS.find((item) => item.name === 'mail_update_draft');
+    expect(tool?.output.safeParse(updated).success).toBe(true);
+    expect(updated.ok).toBe(false);
+    expect(updated.replacedUid).toBeNull();
+    expect(updated.uid).toBe(1);
+    expect(updated.warning).toBe(
+      'Draft UID 1 is the message just appended, so it was not deleted. The new draft was kept as UID 1.',
+    );
+    expect(draftUids(session)).toEqual([1]);
+    expect(draftText(session, 1)).toContain('new body');
+    expect(session.boxes.get('Trash')?.messages ?? []).toHaveLength(0);
+  });
+
+  it('does not delete when the appended UID matches even if UIDVALIDITY stays the same', async () => {
+    const session = new FakeSession();
+    const mail = service(session);
+    const uid = await seedDraft(mail);
+    session.beforeNextAppend = (box) => {
+      box.messages = [];
+      box.uidNext = 1;
+    };
+    const updated = await mail.saveDraft(replacement, uid);
+    expect(updated.ok).toBe(false);
+    expect(updated.replacedUid).toBeNull();
+    expect(draftUids(session)).toEqual([1]);
+    expect(draftText(session, 1)).toContain('new body');
+  });
+
+  it('keeps the new draft when UIDVALIDITY changes before the delete and the new UID is different', async () => {
+    const session = new FakeSession();
+    const mail = service(session);
+    const uid = await seedDraft(mail);
+    session.beforeNextAppend = (box) => {
+      box.messages = [];
+      box.uidValidity = '200';
+      box.uidNext = 5;
+    };
+    const updated = await mail.saveDraft(replacement, uid);
+    expect(updated.ok).toBe(false);
+    expect(updated.replacedUid).toBeNull();
+    expect(updated.uid).toBe(5);
+    expect(String(updated.warning)).toContain('Could not confirm that draft UID 1 was removed');
+    expect(draftUids(session)).toEqual([5]);
+    expect(draftText(session, 5)).toContain('new body');
+  });
+
+  it('leaves the original in place when UIDVALIDITY changes after a copy and before expunge', async () => {
+    const session = new FakeSession(['IMAP4rev1', 'UIDPLUS']);
+    await session.append(
+      'INBOX',
+      simpleMessage({
+        subject: 'Keep',
+        text: 'original',
+        from: 'Ada <ada@example.com>',
+        to: 'User <user@example.com>',
+      }),
+      [],
+    );
+    const mail = service(session);
+    session.afterNextCopy = (box) => {
+      box.uidValidity = '200';
+    };
+    await expect(
+      mail.deleteMessages({ mailbox: 'INBOX', uids: [1], permanent: false }),
+    ).rejects.toMatchObject({ code: 'UIDVALIDITY_CHANGED' });
+    expect(session.boxes.get('INBOX')?.messages).toHaveLength(1);
+    expect(session.boxes.get('INBOX')?.messages[0]?.raw.toString('utf8')).toContain('original');
+    expect(session.boxes.get('Trash')?.messages).toHaveLength(1);
+  });
+
   it('refuses a draft over maxMessageBytes before append', async () => {
     const created = new FakeSession();
     const create = service(
