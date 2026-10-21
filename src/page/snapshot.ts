@@ -10,6 +10,8 @@ export const DEFAULT_THREAD_MESSAGES = 100;
 export const MAX_THREAD_MESSAGES = 500;
 export const DEFAULT_THREAD_ROUNDS = 4;
 export const MAX_THREAD_ROUNDS = 8;
+/** Folders stored on a thread cursor. Encode and decode both stop here. */
+export const MAX_EXCLUDED_FOLDERS = 500;
 
 export type PageOrder = 'newest-first' | 'oldest-first';
 
@@ -51,8 +53,26 @@ export interface SnapshotCursor {
   /**
    * Frozen excludedMatches for a thread page. One row per folder, not per
    * message, so a later page can reuse the closure without storing its ids.
+   * At most MAX_EXCLUDED_FOLDERS rows. The first page also freezes whether
+   * that list was cut, plus the walk's truncated flag and search passes.
    */
   excluded?: Array<{ mailbox: string; count: number }>;
+  excludedTruncated?: boolean;
+  truncated?: boolean;
+  rounds?: number;
+}
+
+/** Keep the path-ordered prefix that a cursor can store. */
+export function capExcludedFolders(rows: ReadonlyArray<{ mailbox: string; count: number }>): {
+  rows: Array<{ mailbox: string; count: number }>;
+  truncated: boolean;
+} {
+  const capped = rows.length > MAX_EXCLUDED_FOLDERS;
+  const kept = capped ? rows.slice(0, MAX_EXCLUDED_FOLDERS) : rows;
+  return {
+    rows: kept.map((item) => ({ mailbox: item.mailbox, count: item.count })),
+    truncated: capped,
+  };
 }
 
 export interface PageRow extends SortableMessage {
@@ -202,7 +222,7 @@ function readCursor(parsed: unknown): SnapshotCursor {
     cursor.keys = record.keys;
   }
   if (record.excluded !== undefined) {
-    if (!Array.isArray(record.excluded) || record.excluded.length > 500) {
+    if (!Array.isArray(record.excluded) || record.excluded.length > MAX_EXCLUDED_FOLDERS) {
       throw new MailError('INVALID_ARGUMENT', 'The page cursor is not valid.');
     }
     cursor.excluded = record.excluded.map((item) => {
@@ -219,6 +239,29 @@ function readCursor(parsed: unknown): SnapshotCursor {
       }
       return { mailbox: row.mailbox, count: row.count };
     });
+  }
+  if (record.excludedTruncated !== undefined) {
+    if (typeof record.excludedTruncated !== 'boolean') {
+      throw new MailError('INVALID_ARGUMENT', 'The page cursor is not valid.');
+    }
+    cursor.excludedTruncated = record.excludedTruncated;
+  }
+  if (record.truncated !== undefined) {
+    if (typeof record.truncated !== 'boolean') {
+      throw new MailError('INVALID_ARGUMENT', 'The page cursor is not valid.');
+    }
+    cursor.truncated = record.truncated;
+  }
+  if (record.rounds !== undefined) {
+    if (
+      typeof record.rounds !== 'number' ||
+      !Number.isInteger(record.rounds) ||
+      record.rounds < 0 ||
+      record.rounds > 10_000
+    ) {
+      throw new MailError('INVALID_ARGUMENT', 'The page cursor is not valid.');
+    }
+    cursor.rounds = record.rounds;
   }
   return cursor;
 }

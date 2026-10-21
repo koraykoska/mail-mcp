@@ -54,6 +54,7 @@ import {
 } from '../thread/walk.js';
 import {
   assertCursorFits,
+  capExcludedFolders,
   decodeSnapshotCursor,
   DEFAULT_THREAD_MESSAGES,
   DEFAULT_THREAD_ROUNDS,
@@ -1511,11 +1512,12 @@ export class MailService {
       let messages: ConversationMessage[];
       let outsideMessages: ConversationMessage[] = [];
       let walkedOutside = false;
-      let rounds = 0;
+      let rounds: number;
       let truncated: boolean;
       if (cursor?.keys) {
         messages = await this.fetchFrozenKeys(session, cursor.keys);
-        truncated = false;
+        truncated = cursor.truncated === true;
+        rounds = cursor.rounds ?? 0;
       } else {
         const fast = await this.fastThread(session, paths, seed, maxMessages);
         if (fast) {
@@ -1525,7 +1527,7 @@ export class MailService {
             account.id,
             session,
             paths,
-            threadIdSet(messages, [seed]),
+            threadIdSet(fast.seen, [seed]),
             maxRounds,
           );
           outsideMessages = closure.outside;
@@ -1564,11 +1566,19 @@ export class MailService {
       ];
       messages = dedupeMessages(messages, prefer);
       const threadIds = threadIdSet(messages, [seed, ...outsideMessages]);
-      const excludedMatches = cursor?.excluded
-        ? cursor.excluded
-        : walkedOutside
+      let excludedMatches: Array<{ mailbox: string; count: number }>;
+      let excludedMatchesTruncated: boolean;
+      if (cursor?.excluded) {
+        excludedMatches = cursor.excluded;
+        excludedMatchesTruncated = cursor.excludedTruncated === true;
+      } else {
+        const full = walkedOutside
           ? excludedFromMentions(mentionsByMailbox(outsideMessages), paths, threadIds)
           : await this.excludedFolderHits(account.id, session, paths, threadIds);
+        const capped = capExcludedFolders(full);
+        excludedMatches = capped.rows;
+        excludedMatchesTruncated = capped.truncated;
+      }
       if (cursor) {
         messages = messages.filter((item) => {
           const folder = cursor.folders.find((entry) => entry.mailbox === item.mailbox);
@@ -1709,6 +1719,7 @@ export class MailService {
           ...(input.includeBodies ? { text, textTruncated } : {}),
         });
       }
+      const reportedTruncated = truncated || folders.some((folder) => folder.truncated);
       return {
         ok: true as const,
         account: account.id,
@@ -1717,13 +1728,19 @@ export class MailService {
         rounds,
         items,
         messages: items,
-        nextCursor: withCursorKeys(page.nextCursor, frozenKeys, excludedMatches),
+        nextCursor: withCursorKeys(page.nextCursor, frozenKeys, {
+          excluded: excludedMatches,
+          excludedTruncated: excludedMatchesTruncated,
+          truncated: reportedTruncated,
+          rounds,
+        }),
         total: page.total,
         offset: page.offset,
-        truncated: truncated || folders.some((folder) => folder.truncated),
+        truncated: reportedTruncated,
         order,
         snapshot: { folders },
         excludedMatches,
+        excludedMatchesTruncated,
       };
     });
   }
@@ -2701,7 +2718,9 @@ export class MailService {
 
   /**
    * Header closure of out-of-scope folders for a fast path that already loaded
-   * the in-scope messages. The result is excluded counts, not more items.
+   * the in-scope messages. `ids` is every id the capability search returned,
+   * including messages maxMessages did not keep. The result is excluded
+   * counts, not more items.
    */
   private async outsideClosure(
     accountId: string,
@@ -2726,6 +2745,7 @@ export class MailService {
       folders: [],
       maxMessages: 1,
       maxRounds,
+      countFrom: 'ids',
       search: async () => [],
       outside: (batch) => this.outsideMessages(accountId, session, paths, batch),
     });
@@ -2860,7 +2880,11 @@ export class MailService {
     folders: readonly string[],
     seed: ConversationMessage,
     maxMessages: number,
-  ): Promise<{ messages: ConversationMessage[]; truncated: boolean } | null> {
+  ): Promise<{
+    messages: ConversationMessage[];
+    seen: ConversationMessage[];
+    truncated: boolean;
+  } | null> {
     if (!seed.threadId) {
       return null;
     }
@@ -2873,6 +2897,7 @@ export class MailService {
     const compiled = compileSearch({ threadId: seed.threadId });
     assertSearchCapabilities(compiled.requires, (name) => session.hasCapability(name));
     const messages: ConversationMessage[] = [];
+    const seen: ConversationMessage[] = [];
     const counted = new Set<string>();
     let truncated = false;
     const admits = (message: ConversationMessage): boolean => {
@@ -2895,8 +2920,9 @@ export class MailService {
         const rows: ConversationMessage[] = [];
         for (const summary of summaries) {
           const message = await this.conversationFrom(box, summary, folder, linked);
+          seen.push(message);
           if (!admits(message)) {
-            break;
+            continue;
           }
           rows.push(message);
         }
@@ -2904,10 +2930,14 @@ export class MailService {
       });
       messages.push(...found);
     }
-    if (!messages.some((item) => item.mailbox === seed.mailbox && item.uid === seed.uid)) {
+    const sawSeed = seen.some((item) => item.mailbox === seed.mailbox && item.uid === seed.uid);
+    if (
+      !sawSeed &&
+      !messages.some((item) => item.mailbox === seed.mailbox && item.uid === seed.uid)
+    ) {
       messages.unshift(seed);
     }
-    return { messages, truncated };
+    return { messages, seen, truncated };
   }
 
   private async subjectCandidates(
@@ -3663,18 +3693,25 @@ function frozenSortUids(keys: readonly string[], mailbox: string): number[] {
 function withCursorKeys(
   cursor: string | null,
   keys: readonly string[],
-  excluded?: ReadonlyArray<{ mailbox: string; count: number }>,
+  state: {
+    excluded?: ReadonlyArray<{ mailbox: string; count: number }>;
+    excludedTruncated: boolean;
+    truncated: boolean;
+    rounds: number;
+  },
 ): string | null {
   if (!cursor) {
     return null;
   }
   const decoded = decodeSnapshotCursor(cursor);
+  const capped = state.excluded ? capExcludedFolders(state.excluded) : undefined;
   return encodeSnapshotCursor({
     ...decoded,
     keys: [...keys],
-    ...(excluded
-      ? { excluded: excluded.map((item) => ({ mailbox: item.mailbox, count: item.count })) }
-      : {}),
+    ...(capped ? { excluded: capped.rows } : {}),
+    excludedTruncated: state.excludedTruncated || capped?.truncated === true,
+    truncated: state.truncated,
+    rounds: state.rounds,
   });
 }
 

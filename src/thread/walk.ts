@@ -193,13 +193,38 @@ function overlaps(left: Set<string>, right: Set<string>): boolean {
   return false;
 }
 
-/** How many id searches one round may spend, and the most one walk will run. */
+/** How many id searches one round may spend. */
 export const THREAD_SEARCHES_PER_ROUND = 8;
-export const THREAD_SEARCH_CAP = 32;
 
-/** Search budget for a walk. A longer chain than this stops with truncated set. */
+/**
+ * Search budget for a walk. Each round allows 8 searches.
+ * The default of 4 rounds is 32 searches. A higher maxRounds raises that
+ * ceiling by the same 8, up to the tool maximum of 8 rounds (64 searches).
+ */
 export function threadSearchCap(maxRounds: number): number {
-  return Math.min(THREAD_SEARCH_CAP, Math.max(1, maxRounds) * THREAD_SEARCHES_PER_ROUND);
+  const rounds = Math.max(1, Math.floor(maxRounds));
+  return rounds * THREAD_SEARCHES_PER_ROUND;
+}
+
+/**
+ * Earliest id the seed already names. A parent uid and a reply that cites
+ * that parent both start here, so the pass budget does not depend on which
+ * of those seeds opened the walk.
+ */
+function closureStartIds(message: ConversationMessage): string[] {
+  const referenced = message.references
+    .map((item) => normalizeMessageId(item))
+    .filter((item) => item.length > 0);
+  const first = referenced[0];
+  if (first) {
+    return [first];
+  }
+  const reply = normalizeMessageId(message.inReplyTo);
+  if (reply) {
+    return [reply];
+  }
+  const own = normalizeMessageId(message.messageId);
+  return own ? [own] : [];
 }
 
 /**
@@ -209,15 +234,22 @@ export function threadSearchCap(maxRounds: number): number {
  * are returned for excluded counts; they are not items and do not use a cap
  * slot. Hitting maxMessages does not skip that scan.
  * Ids an out-of-scope hit adds are searched before the walk moves on, repeating
- * until no new id appears or `threadSearchCap` is reached. Both seeds that
- * finish under that cap see the same ids. A placeholder seed (empty mailbox,
- * uid 0) records its ids without using a slot.
+ * until no new id appears or `threadSearchCap` is reached. Unless `countFrom`
+ * is `ids`, passes are counted from the earliest id the seed already names.
+ * Two seeds that name the same start therefore see the same ids and the same
+ * truncated value, including when the cap stops the walk. A placeholder seed
+ * (empty mailbox, uid 0) records its message without using a slot.
  */
 export async function closeByHeaders(options: {
   seed: ConversationMessage;
   folders: readonly string[];
   maxMessages: number;
   maxRounds: number;
+  /**
+   * `start` counts from the earliest id on the seed. `ids` counts from every
+   * id on the seed, which is how a fast path keeps messages the cap dropped.
+   */
+  countFrom?: 'start' | 'ids';
   search: (folder: string, ids: readonly string[]) => Promise<ConversationMessage[]>;
   outside?: (ids: readonly string[]) => Promise<ConversationMessage[]>;
 }): Promise<{
@@ -234,10 +266,9 @@ export async function closeByHeaders(options: {
   let truncated = false;
   const remember = (message: ConversationMessage): void => {
     const key = messageKey(message);
-    if (byKey.has(key)) {
-      return;
+    if (!byKey.has(key)) {
+      byKey.set(key, { ...message, linked: message.linked || 'header' });
     }
-    byKey.set(key, { ...message, linked: message.linked || 'header' });
     for (const id of idsOf(message)) {
       known.add(id);
     }
@@ -269,6 +300,15 @@ export async function closeByHeaders(options: {
     }
   };
   remember({ ...options.seed, linked: 'header' });
+  if (options.countFrom !== 'ids') {
+    const start = closureStartIds(options.seed);
+    if (start.length > 0) {
+      known.clear();
+      for (const id of start) {
+        known.add(id);
+      }
+    }
+  }
   let rounds = 0;
   const passCap = threadSearchCap(options.maxRounds);
   while (rounds < passCap) {

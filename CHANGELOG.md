@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- The Gmail `X-GM-THRID` and OBJECTID fast paths pass every id the capability search returned into the header closure, including a message `maxMessages` did not keep. A folder that cites only that message still appears in `excludedMatches`.
+- A later `mail_get_thread` page reuses the first page's `truncated` flag and `rounds`, along with the frozen `excludedMatches` list.
+- `excludedMatches` on the cursor is capped at 500 folders, the first in path order. When more match, `excludedMatchesTruncated` is true and a later page reuses that prefix.
+- Header threading starts from the earliest id the seed already names, so a parent uid and the Message-ID of a reply that cites it share one search budget even when the cap stops the walk. Each round allows 8 searches. The default of 4 rounds is 32 searches. `maxRounds` raises that ceiling, up to 8 rounds (64 searches).
 - A later `mail_get_thread` page reuses the `excludedMatches` list frozen on the first page, including ids that were found only on out-of-scope messages. The Gmail `X-GM-THRID` and OBJECTID fast paths build that list from the same header closure. Hitting `maxMessages` still scans out-of-scope folders. The kept items are the earliest messages, so the set does not depend on which seed started the walk.
 - Header threading repeats a search for every id an out-of-scope hit adds until no new id appears, or until 8 searches per round and 32 searches in total. Both seeds that finish under that cap return the same items and the same `truncated` value. A walk stopped by the cap sets `truncated`.
 - An `X-` token is rejected when any digit normalization matches an address or routing word: all digits removed, or look-alike digits mapped (`0` as `o`, `1` as `l` and as `i`, `3` as `e`, `4` as `a`, `5` as `s`, `7` as `t`) with the other digits removed. That is a best-effort guard. MTAs and Nodemailer do not read those names as routing headers. It over-blocks `X-From0`, `X-From0-Not`, `X-Enve1ope`, `X-Bounc3`, `X-3nv3l0p3`, and `X-B0unc3`. `X-Sender-IP2`, `X-Notification2`, `X-Photo2`, and `X-Original-Arrival-Time` stay allowed.

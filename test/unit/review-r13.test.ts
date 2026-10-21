@@ -325,6 +325,9 @@ describe('search cap and message cap', () => {
     const byId = await service.getThread({ messageId: '<child@ex>', maxRounds: 1 });
     expect(byUid.truncated).toBe(true);
     expect(byId.truncated).toBe(true);
+    expect(messageIdsOf(byUid)).toEqual(messageIdsOf(byId));
+    expect(byUid.excludedMatches).toEqual(byId.excludedMatches);
+    expect(byUid.rounds).toBe(byId.rounds);
   });
 
   it('still lists Trash when maxMessages keeps one of two replies', async () => {
@@ -398,6 +401,17 @@ describe('search cap and message cap', () => {
     expect(result.truncated).toBe(true);
     expect(result.total).toBe(100);
     expect(result.excludedMatches).toEqual([{ mailbox: 'Trash', count: 1 }]);
+    const page = await service.getThread({
+      messageId: '<root@ex>',
+      cursor: String(result.nextCursor),
+    });
+    expect(page.truncated).toBe(true);
+    expect(page.rounds).toBe(result.rounds);
+    expect(page.total).toBe(100);
+    expect(page.excludedMatches).toEqual(result.excludedMatches);
+    const stored = decodeSnapshotCursor(String(result.nextCursor));
+    expect(stored.truncated).toBe(true);
+    expect(stored.rounds).toBe(result.rounds);
   });
 });
 
