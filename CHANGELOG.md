@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
 
 - The Gmail `X-GM-THRID` and OBJECTID fast paths keep the earliest in-scope messages when `maxMessages` trips, using the same date, mailbox, and UID order as the header walk. Every id the capability search returned is still walked.
 - The Gmail `X-GM-THRID` and OBJECTID fast paths pass every id the capability search returned into the header closure, including a message `maxMessages` did not keep. A folder that cites only that message still appears in `excludedMatches`.
