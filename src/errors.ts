@@ -185,20 +185,26 @@ export function mapTransportError(error: unknown): MailError {
     );
   }
 
+  const status = typeof like.responseStatus === 'string' ? like.responseStatus.toUpperCase() : '';
+  // A tagged NO or BAD stays a protocol error even when its text mentions a close.
+  const refusedByServer = status === 'NO' || status === 'BAD';
   if (
-    /econnrefused|econnreset|ehostunreach|enetunreach|epipe|socket hang up|connection closed|not connected|econnectionclosed|connection not available|socket is already closed|noconnection/.test(
+    !refusedByServer &&
+    (/econnrefused|econnreset|ehostunreach|enetunreach|epipe|socket hang up|connection closed|not connected|econnectionclosed|connection not available|socket closed|noconnection|unexpected close|closedafterconnecttext|closed after connect/.test(
       lower,
     ) ||
-    [
-      'ECONNREFUSED',
-      'ECONNRESET',
-      'EHOSTUNREACH',
-      'ENETUNREACH',
-      'EPIPE',
-      'ECONNECTIONCLOSED',
-      'NoConnection',
-      'EConnectionClosed',
-    ].includes(code)
+      [
+        'ECONNREFUSED',
+        'ECONNRESET',
+        'EHOSTUNREACH',
+        'ENETUNREACH',
+        'EPIPE',
+        'ECONNECTIONCLOSED',
+        'NoConnection',
+        'EConnectionClosed',
+        'ClosedAfterConnectText',
+        'ClosedAfterConnectTLS',
+      ].includes(code))
   ) {
     return new MailError(
       'CONNECTION_FAILED',

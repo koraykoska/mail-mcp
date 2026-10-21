@@ -112,7 +112,9 @@ There is no config key for a default folder list. The defaults live on the tools
 
 Criteria in one search object are sent as one IMAP SEARCH, with the keys side by side. That is how IMAP expresses AND, and it means the same thing on iCloud, Gmail, Dovecot, and GreenMail. A `NOT` of a UID set, a sequence set, or more than one criterion is not sent to the server. The client searches for the positive set and for every message in the folder, then returns the difference. A single text key or a single flag can still be negated on the server.
 
-When the server answers `NO` or `BAD`, the tool error is `PROTOCOL_ERROR` and the message includes that response text.
+When the server answers `NO` or `BAD`, the tool error is `PROTOCOL_ERROR` and the message includes that response text. A connection that closes during connect, the greeting, login, or a command is `CONNECTION_FAILED`, not `PROTOCOL_ERROR`.
+
+An ESEARCH `ALL` value that contains `*` is not decoded. `*` means the highest UID that still exists, which is not `UIDNEXT - 1` after that message is expunged, and rewriting `8:*` from a stale `UIDNEXT` pulls in UIDs the server did not return. The same criteria are searched again as a plain `UID SEARCH`. That list is used only when it is explicit and the mailbox did not change during the command. Another `*`, or a change, is `PROTOCOL_ERROR` and no message is changed from that result.
 
 ### Bulk changes
 
@@ -130,7 +132,7 @@ When the server answers `NO` or `BAD`, the tool error is `PROTOCOL_ERROR` and th
 
 A move uses `UID MOVE` when the server advertises MOVE, or when IMAP4rev2 is active. IMAP4rev2 is active after `ENABLE IMAP4REV2` takes effect, or on a session that advertises IMAP4rev2 and not IMAP4rev1. A bare IMAP4rev2 token next to IMAP4rev1 is not enough. Otherwise the client copies, then expunges only the UIDs named by UIDPLUS `COPYUID`, and UIDPLUS is decided the same way. A UID the server does not confirm stays in the source mailbox, with `ok: false` and a message that the original was left in place. A duplicate in the destination can remain. A server with neither MOVE nor UIDPLUS is refused with `CAPABILITY_UNSUPPORTED`. `allowPermanentDelete` does not permit expunging every `\Deleted` message in order to finish that move. Copy does not need `COPYUID`.
 
-`mail_modify_by_search` still returns `SIZE_LIMIT` and changes nothing when the scan finishes and the match count is above `maxBulk` or a folder was truncated. The time budget covers that scan. When the scan itself stops early, `complete` is false and `stopped` is `budget`. `remaining` lists the matches already found. An empty `remaining` means the scan did not finish: repeat the same search.
+`mail_modify_by_search` still returns `SIZE_LIMIT` and changes nothing when the scan finishes and the match count is above `maxBulk` or a folder was truncated. The time budget covers that scan. When the scan stops before every folder, `complete` is false, `stopped` is `budget`, `remaining` is empty, and nothing is changed. Repeat the same search. A partial list is not returned, because resuming it would skip the folders that were not scanned. When the scan finishes and the budget stops before a chunk, `remaining` lists every match.
 
 ## Configuration
 
@@ -246,7 +248,7 @@ Provider hosts, ports, and notes: [docs/PROVIDERS.md](docs/PROVIDERS.md).
 | `connectPort` | integer 1–65535                    | `port`                                                        | TCP port when it differs.                                                                                                                                                                                                     |
 | `secure`      | boolean                            | provider value, else `true`                                   | `true` is implicit TLS (typically 993 or 465). `false` is cleartext that may upgrade with STARTTLS.                                                                                                                           |
 | `starttls`    | `required`, `optional`, `disabled` | `disabled` when `secure` is true; otherwise `required`        | `required` refuses a server that does not offer STARTTLS. `optional` stays on cleartext when the server does not offer it and logs a warning. `disabled` is cleartext and must be explicit. `secure: true` forces `disabled`. |
-| `timeoutMs`   | positive integer                   | 30000                                                         | Connect and command budget.                                                                                                                                                                                                   |
+| `timeoutMs`   | integer 1–50000                    | 30000                                                         | Connect and command budget. Values above 50000 are rejected so one call stays inside a 60 second client limit.                                                                                                                |
 | `tls`         | object                             | verify on                                                     | See below.                                                                                                                                                                                                                    |
 
 ### TLS

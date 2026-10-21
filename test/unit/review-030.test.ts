@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { accountSchema, boundedCommandTimeout } from '../../src/config/schema.js';
 import { MailError, mapTransportError } from '../../src/errors.js';
 import { MailService } from '../../src/service/mail-service.js';
 import { runInChunks } from '../../src/service/bulk.js';
@@ -383,7 +384,162 @@ describe('ESEARCH star and the bulk budget', () => {
     });
     const messages = found.messages as Array<{ uid: number }>;
     expect(messages.map((item) => item.uid).sort((left, right) => left - right)).toEqual([1, 3]);
-    expect(server.trace.some((line) => /FETCH/.test(line))).toBe(true);
+    const searches = server.trace.filter((line) => /SEARCH/.test(line));
+    expect(searches.some((line) => /RETURN/i.test(line))).toBe(true);
+    expect(searches.some((line) => !/RETURN/i.test(line))).toBe(true);
+    await runtime.close();
+    await server.close();
+  });
+
+  it('keeps a bare ESEARCH star from naming an expunged UID', async () => {
+    const server = new ScriptedImap({
+      capabilities: ['IMAP4rev1', 'ESEARCH', 'UIDPLUS'],
+      esearchAll: (_args, uids) => {
+        if (uids.length === 1 && uids[0] === 2) {
+          return '*';
+        }
+        if (uids.length === 2) {
+          return '1,*';
+        }
+        return undefined;
+      },
+    });
+    await server.ready();
+    seed(server, 3);
+    server.dropUid(3);
+    const runtime = runtimeFor(server.port);
+    const positive = await runtime.service.searchMessages({
+      mailbox: 'INBOX',
+      search: { uid: '2' },
+      limit: 10,
+      includeSnippet: false,
+    });
+    expect((positive.messages as Array<{ uid: number }>).map((item) => item.uid)).toEqual([2]);
+    const excluded = await runtime.service.searchMessages({
+      mailbox: 'INBOX',
+      search: { not: { uid: '2' } },
+      limit: 10,
+      includeSnippet: false,
+    });
+    expect(
+      (excluded.messages as Array<{ uid: number }>)
+        .map((item) => item.uid)
+        .sort((left, right) => left - right),
+    ).toEqual([1]);
+    const moved = await runtime.service.modifyBySearch({
+      mailbox: 'INBOX',
+      search: { not: { uid: '2' } },
+      action: 'move',
+      destination: 'Archive',
+      dryRun: false,
+    });
+    expect(moved.ok).toBe(true);
+    expect(server.messagesIn('INBOX').map((item) => item.uid)).toEqual([2]);
+    const acted = server.trace.filter((line) => /FETCH|COPY|MOVE|EXPUNGE/.test(line));
+    expect(acted.some((line) => /(^|[^0-9])3([^0-9]|$)/.test(line))).toBe(false);
+    await runtime.close();
+    await server.close();
+  });
+
+  it('does not widen an inverted ESEARCH star from a stale UIDNEXT', async () => {
+    const server = new ScriptedImap({
+      capabilities: ['IMAP4rev1', 'ESEARCH', 'UIDPLUS'],
+      selectUidNext: 5,
+      esearchAll: (_args, uids) => (uids.join(',') === '8,9,10' ? '8:*' : undefined),
+    });
+    await server.ready();
+    seed(server, 10);
+    const runtime = runtimeFor(server.port);
+    const found = await runtime.service.searchMessages({
+      mailbox: 'INBOX',
+      search: { uid: '8:10' },
+      limit: 10,
+      includeSnippet: false,
+    });
+    expect(
+      (found.messages as Array<{ uid: number }>)
+        .map((item) => item.uid)
+        .sort((left, right) => left - right),
+    ).toEqual([8, 9, 10]);
+    const moved = await runtime.service.modifyBySearch({
+      mailbox: 'INBOX',
+      search: { uid: '8:10' },
+      action: 'move',
+      destination: 'Archive',
+      dryRun: false,
+    });
+    expect(moved.stopped).toBeNull();
+    expect(server.messagesIn('INBOX').map((item) => item.uid)).toEqual([1, 2, 3, 4, 5, 6, 7]);
+    expect(server.trace.some((line) => /8:4/.test(line))).toBe(false);
+    await runtime.close();
+    await server.close();
+  });
+
+  it('does not use a search result when a message arrives while * is resolved', async () => {
+    let late = 0;
+    let arrive = (): string => '';
+    const server = new ScriptedImap({
+      capabilities: ['IMAP4rev1', 'ESEARCH', 'UIDPLUS'],
+      esearchAllStar: true,
+      beforePlainSearch: () => arrive(),
+    });
+    arrive = () => {
+      late += 1;
+      server.addMessage(
+        simpleMessage({
+          subject: `late ${late}`,
+          messageId: `<late-${late}@example.com>`,
+        }).toString('utf8'),
+        [],
+      );
+      return `* ${server.messagesIn('INBOX').length} EXISTS\r\n`;
+    };
+    await server.ready();
+    seed(server, 3);
+    const runtime = runtimeFor(server.port);
+    await expect(
+      runtime.service.searchMessages({
+        mailbox: 'INBOX',
+        search: { all: true },
+        limit: 10,
+        includeSnippet: false,
+      }),
+    ).rejects.toMatchObject({ code: 'PROTOCOL_ERROR' });
+    await expect(
+      runtime.service.modifyBySearch({
+        mailbox: 'INBOX',
+        search: { all: true },
+        action: 'move',
+        destination: 'Archive',
+        dryRun: false,
+      }),
+    ).rejects.toMatchObject({ code: 'PROTOCOL_ERROR' });
+    expect(server.messagesIn('INBOX').length).toBeGreaterThan(3);
+    expect(server.trace.some((line) => /\b(COPY|MOVE|EXPUNGE)\b/.test(line))).toBe(false);
+    await runtime.close();
+    await server.close();
+  });
+
+  it('fails closed when a plain search still answers with *', async () => {
+    const server = new ScriptedImap({
+      capabilities: ['IMAP4rev1', 'ESEARCH', 'UIDPLUS'],
+      esearchAll: () => '*',
+      plainSearchStar: true,
+    });
+    await server.ready();
+    seed(server, 2);
+    const runtime = runtimeFor(server.port);
+    await expect(
+      runtime.service.modifyBySearch({
+        mailbox: 'INBOX',
+        search: { all: true },
+        action: 'move',
+        destination: 'Archive',
+        dryRun: false,
+      }),
+    ).rejects.toMatchObject({ code: 'PROTOCOL_ERROR' });
+    expect(server.messagesIn('INBOX')).toHaveLength(2);
+    expect(server.trace.some((line) => /\b(COPY|MOVE|EXPUNGE|FETCH)\b/.test(line))).toBe(false);
     await runtime.close();
     await server.close();
   });
@@ -482,14 +638,60 @@ describe('ESEARCH star and the bulk budget', () => {
     expect(result.stopped).toBe('budget');
     expect(result.complete).toBe(false);
     expect(result.ok).toBe(false);
-    const remaining = result.remaining as Array<{ mailbox: string; uid: number }>;
-    expect(remaining.length).toBeGreaterThan(0);
-    expect(remaining.every((item) => item.mailbox === 'INBOX' || item.mailbox === 'Sent')).toBe(
-      true,
-    );
+    expect(result.remaining).toEqual([]);
     const flagged = (path: string): number =>
       session.boxes.get(path)?.messages.filter((message) => message.flags.includes('\\Seen'))
         .length ?? 0;
     expect(flagged('INBOX') + flagged('Sent')).toBe(0);
+  });
+});
+
+describe('connect closes and the command budget', () => {
+  it('maps a close during the greeting or login to CONNECTION_FAILED', () => {
+    const closed = Object.assign(new Error('Unexpected close'), { code: 'ClosedAfterConnectText' });
+    expect(mapTransportError(closed).code).toBe('CONNECTION_FAILED');
+    expect(mapTransportError(new Error('Socket closed')).code).toBe('CONNECTION_FAILED');
+    expect(
+      mapTransportError({
+        message: 'Unexpected close',
+        code: 'ClosedAfterConnectText',
+        responseStatus: 'NO',
+        responseText: 'System error',
+      }).code,
+    ).toBe('PROTOCOL_ERROR');
+    expect(
+      mapTransportError({
+        message: 'Command failed',
+        responseStatus: 'BAD',
+        responseText: 'Invalid command',
+      }).code,
+    ).toBe('PROTOCOL_ERROR');
+  });
+
+  it('reports a greeting close as CONNECTION_FAILED', async () => {
+    const server = new ScriptedImap({ closeAfterGreeting: true });
+    await server.ready();
+    const runtime = runtimeFor(server.port);
+    await expect(runtime.service.capabilities()).rejects.toMatchObject({
+      code: 'CONNECTION_FAILED',
+    });
+    await runtime.close();
+    await server.close();
+  });
+
+  it('rejects a command timeout that can outlast a 60 second client', () => {
+    expect(boundedCommandTimeout(30_000)).toBe(30_000);
+    expect(boundedCommandTimeout(120_000)).toBe(50_000);
+    expect(() =>
+      accountSchema.parse({
+        email: 'user@example.com',
+        imap: { host: '127.0.0.1', timeoutMs: 60_000 },
+      }),
+    ).toThrow(/50000/);
+    const parsed = accountSchema.parse({
+      email: 'user@example.com',
+      imap: { host: '127.0.0.1', timeoutMs: 30_000 },
+    });
+    expect(parsed.imap?.timeoutMs).toBe(30_000);
   });
 });

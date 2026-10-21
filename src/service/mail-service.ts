@@ -74,6 +74,7 @@ import {
   MAX_TOP_N,
   type PageOrder,
 } from '../page/snapshot.js';
+import { boundedCommandTimeout } from '../config/schema.js';
 import { dialTarget } from '../net/connect.js';
 import { resolveSpecialUse, type ResolvedSpecialUse } from '../imap/special-use.js';
 import { normalizeFlags, touchesDeleted } from '../imap/flags.js';
@@ -2381,8 +2382,12 @@ export class MailService {
           }> = [];
           const remaining: Array<{ mailbox: string; uid: number }> = [];
           let stopped: ChunkProgress['stopped'] = null;
-          const budgetGone = !dryRun && (scanCut || Date.now() >= plan.budgetDeadline);
-          if (budgetGone) {
+          // A scan that stops between folders has not seen every mailbox. Listing
+          // only the folders already read would make a resume skip the rest, so
+          // the call changes nothing and returns an empty remaining.
+          if (!dryRun && scanCut) {
+            stopped = 'budget';
+          } else if (!dryRun && Date.now() >= plan.budgetDeadline) {
             stopped = 'budget';
             for (const scan of scans) {
               remaining.push(
@@ -2482,7 +2487,7 @@ export class MailService {
             subject: row.summary.subject ?? null,
             date: row.date ?? row.arrival ?? null,
           }));
-          session.setCommandTimeout?.(account.imap.timeoutMs);
+          session.setCommandTimeout?.(boundedCommandTimeout(account.imap.timeoutMs));
           const applyComplete = dryRun || (remaining.length === 0 && stopped === null);
           return {
             ok: applyComplete && applied.every((item) => item.ok),
@@ -3276,12 +3281,8 @@ export class MailService {
     timeoutMs?: number,
     deadlineMs?: number,
   ): Promise<T> {
-    return this.pool.use(
-      account.id,
-      (session) => fn(session),
-      timeoutMs ?? account.imap.timeoutMs,
-      deadlineMs,
-    );
+    const requested = timeoutMs ?? boundedCommandTimeout(account.imap.timeoutMs);
+    return this.pool.use(account.id, (session) => fn(session), requested, deadlineMs);
   }
 
   private async withMailbox<T>(
@@ -3627,7 +3628,7 @@ export class MailService {
           try {
             return await fn(session, plan);
           } finally {
-            session.setCommandTimeout?.(account.imap.timeoutMs);
+            session.setCommandTimeout?.(boundedCommandTimeout(account.imap.timeoutMs));
           }
         },
         undefined,

@@ -50,6 +50,19 @@ export interface ScriptedOptions {
   omitEnabled?: string[];
   /** A UID SEARCH that matches every message answers ESEARCH ALL 1:* instead of listing UIDs. */
   esearchAllStar?: boolean;
+  /**
+   * When a UID SEARCH uses RETURN, this value is the ESEARCH ALL set.
+   * Return undefined to list the matching UIDs.
+   */
+  esearchAll?: (args: string, uids: number[]) => string | undefined;
+  /** Extra untagged lines written before a UID SEARCH that has no RETURN. */
+  beforePlainSearch?: () => string | undefined;
+  /** A UID SEARCH without RETURN answers ESEARCH ALL * instead of a number list. */
+  plainSearchStar?: boolean;
+  /** SELECT reports this UIDNEXT instead of the next UID the server will assign. */
+  selectUidNext?: number;
+  /** Write the greeting and then close the socket, before login. */
+  closeAfterGreeting?: boolean;
 }
 
 /**
@@ -114,6 +127,10 @@ export class ScriptedImap {
             !capabilities.some((item) => item.toUpperCase() === 'IMAP4REV1')),
       });
       write('* OK scripted IMAP ready\r\n');
+      if (this.options.closeAfterGreeting) {
+        socket.end();
+        return;
+      }
       const consume = (): void => {
         while (buffer.length > 0) {
           const newline = buffer.indexOf('\r\n');
@@ -177,6 +194,11 @@ export class ScriptedImap {
     this.nextUid += 1;
     this.messages.push({ uid, raw, flags });
     return uid;
+  }
+
+  /** Remove one UID and leave the next-UID counter where it is. */
+  dropUid(uid: number): void {
+    this.messages = this.messages.filter((message) => message.uid !== uid);
   }
 
   /** Mailboxes that received a COPY or MOVE. */
@@ -343,7 +365,9 @@ export class ScriptedImap {
       ctx.write('* 0 RECENT\r\n');
       ctx.write(`* ${this.messages.length} EXISTS\r\n`);
       ctx.write(`* OK [UIDVALIDITY ${this.uidValidity}] UIDs valid\r\n`);
-      ctx.write(`* OK [UIDNEXT ${this.nextUid}] Predicted next UID\r\n`);
+      ctx.write(
+        `* OK [UIDNEXT ${this.options.selectUidNext ?? this.nextUid}] Predicted next UID\r\n`,
+      );
       ok(`[${command === 'EXAMINE' ? 'READ-ONLY' : 'READ-WRITE'}] ${command} completed`);
       return;
     }
@@ -686,10 +710,23 @@ export class ScriptedImap {
     uids: number[],
   ): void {
     if (args.toUpperCase().includes('RETURN')) {
+      const custom = this.options.esearchAll?.(args, uids);
       const star =
-        this.options.esearchAllStar && uids.length > 0 && uids.length === this.messages.length;
-      const listed = uids.length > 0 ? ` ALL ${star ? '1:*' : uids.join(',')}` : '';
+        custom === undefined &&
+        this.options.esearchAllStar &&
+        uids.length > 0 &&
+        uids.length === this.messages.length;
+      const all = custom ?? (star ? '1:*' : uids.length > 0 ? uids.join(',') : undefined);
+      const listed = all ? ` ALL ${all}` : '';
       ctx.write(`* ESEARCH (TAG "${tag}") UID COUNT ${uids.length}${listed}\r\n`);
+      return;
+    }
+    const banner = this.options.beforePlainSearch?.();
+    if (banner) {
+      ctx.write(banner);
+    }
+    if (this.options.plainSearchStar) {
+      ctx.write(`* ESEARCH (TAG "${tag}") UID ALL *\r\n`);
       return;
     }
     ctx.write(`* SEARCH ${uids.join(' ')}\r\n`);

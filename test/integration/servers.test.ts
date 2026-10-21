@@ -42,6 +42,30 @@ function runtimeFor(overrides: Partial<ReturnType<typeof account>> = {}) {
   });
 }
 
+/** Walk every LIST page. A full server does not put a new mailbox in the first 200 rows. */
+async function mailboxPaths(service: MailService, subscribed: boolean): Promise<string[]> {
+  const paths: string[] = [];
+  let cursor: string | undefined;
+  for (let page = 0; page < 50; page += 1) {
+    const listed = await service.listMailboxes(undefined, subscribed, {
+      limit: 200,
+      ...(cursor ? { cursor } : {}),
+    });
+    const mailboxes = listed.mailboxes as Array<{ path?: string }>;
+    for (const box of mailboxes) {
+      if (box.path) {
+        paths.push(box.path);
+      }
+    }
+    const next = listed.nextCursor;
+    if (typeof next !== 'string' || next.length === 0) {
+      return paths;
+    }
+    cursor = next;
+  }
+  return paths;
+}
+
 describe('GreenMail', () => {
   beforeAll(async () => {
     greenmail = await ensureGreenMail();
@@ -70,13 +94,13 @@ describe('GreenMail', () => {
     const created = await service.createMailbox(undefined, folder);
     expect(created.created).toBe(true);
     await service.subscribe(undefined, folder, true);
-    const subscribed = await service.listMailboxes(undefined, true, { limit: 200 });
-    expect(JSON.stringify(subscribed.mailboxes)).toContain(folder);
+    const subscribed = await mailboxPaths(service, true);
+    expect(subscribed).toContain(folder);
 
     const unicode = `Café-${stamp}`;
     await service.createMailbox(undefined, unicode);
-    const listed = await service.listMailboxes(undefined, false, { limit: 200 });
-    expect(JSON.stringify(listed.mailboxes)).toContain(unicode);
+    const listed = await mailboxPaths(service, false);
+    expect(listed).toContain(unicode);
 
     await service.append({
       mailbox: folder,

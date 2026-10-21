@@ -13,7 +13,7 @@ import { capabilityMatches, hasExactCapability as exactCapability } from './capa
 import { headerValue, messageIds } from '../mime/headers.js';
 import { decodeTransfer, parseSequenceSet } from '../mime/transfer.js';
 import { VERSION } from '../version.js';
-import type { ResolvedAccount } from '../config/schema.js';
+import { boundedCommandTimeout, type ResolvedAccount } from '../config/schema.js';
 import { dialTarget } from '../net/connect.js';
 import type { Logger } from '../log.js';
 import { decodeBody } from '../charset.js';
@@ -54,7 +54,10 @@ interface RawClient {
     command: string,
     attributes: unknown,
     options?: {
-      untagged?: Record<string, (untagged: { attributes?: ImapAttr[] }) => void | Promise<void>>;
+      untagged?: Record<
+        string,
+        (untagged: { attributes?: ImapAttr[]; numbers?: number[] }) => void | Promise<void>
+      >;
     },
   ): Promise<{ next: () => IteratorResult<unknown> | void }>;
   preCheck?: (() => Promise<void>) | false;
@@ -170,7 +173,7 @@ export class ImapFlowSession implements ImapSession {
   }
 
   idleBudgetMs(): number {
-    return this.account.imap.timeoutMs;
+    return boundedCommandTimeout(this.account.imap.timeoutMs);
   }
 
   /** Remember a parser-size failure even when the command later rejects with a follow-on error. */
@@ -766,9 +769,9 @@ export class ImapFlowSession implements ImapSession {
       tls,
       logger: this.imapLogger,
       disableAutoIdle: true,
-      connectionTimeout: endpoint.timeoutMs,
-      greetingTimeout: Math.min(endpoint.timeoutMs, 16_000),
-      socketTimeout: endpoint.timeoutMs,
+      connectionTimeout: boundedCommandTimeout(endpoint.timeoutMs),
+      greetingTimeout: Math.min(boundedCommandTimeout(endpoint.timeoutMs), 16_000),
+      socketTimeout: boundedCommandTimeout(endpoint.timeoutMs),
       clientInfo: { name: 'mail-mcp', version: VERSION },
       auth: await this.authOptions(),
       qresync: true,
@@ -920,8 +923,11 @@ class FlowMailbox implements OpenMailbox {
       return result;
     }
     if (result.all) {
+      // `*` is the highest UID that still exists. UIDNEXT-1 names a hole once
+      // that message is expunged, and a stale UIDNEXT turns `8:*` into a wider
+      // range. Neither substitution is safe for a complement, so it is not used.
       if (result.all.includes('*')) {
-        return this.uidsForStar(result.all);
+        return this.explicitUidSearch(query);
       }
       return parseSequenceSet(result.all);
     }
@@ -929,16 +935,14 @@ class FlowMailbox implements OpenMailbox {
   }
 
   /**
-   * ESEARCH ALL may use `*` for the highest UID. imapflow drops UID `*`, which
-   * would make a client-side complement look empty. Resolve `*` to UIDNEXT-1
-   * and FETCH that set, so only UIDs the server still has are returned.
+   * Read the same criteria again as a plain UID SEARCH. The numbers are used
+   * only when the answer is an explicit list and the mailbox did not change
+   * during the command. A second `*` or a change fails closed: the set is not
+   * guessed, and no message is changed from it.
    */
-  private async uidsForStar(all: string): Promise<number[]> {
-    const uidNext = this.uidNext;
-    if (!Number.isFinite(uidNext) || uidNext <= 1) {
-      return [];
-    }
-    const concrete = all.replace(/\*/g, String(uidNext - 1));
+  private async explicitUidSearch(query: Record<string, unknown>): Promise<number[]> {
+    const hint =
+      'The mailbox was not empty; the search itself failed. Narrow the criteria or check capabilities.';
     if (!this.client.usable || !this.client.mailbox || this.session.hasFailed()) {
       throw new MailError(
         'CONNECTION_FAILED',
@@ -946,15 +950,44 @@ class FlowMailbox implements OpenMailbox {
         'The search did not finish on a selected mailbox, so no UID is reported missing.',
       );
     }
-    let rows: Awaited<ReturnType<ImapFlow['fetchAll']>>;
+    const before = mailboxStamp(this.client);
+    const fromSearch: number[] = [];
+    const fromEsearch: number[] = [];
+    let sawSearch = false;
+    let sawEsearchAll = false;
+    let sawStar = false;
+    const raw = this.client as unknown as RawClient;
     try {
-      rows = await this.client.fetchAll(concrete, { uid: true }, { uid: true });
-    } catch (error) {
-      throw this.session.failTransport(
-        error,
-        'The server refused the SEARCH command.',
-        'The mailbox was not empty; the search itself failed. Narrow the criteria or check capabilities.',
+      const compiled = searchAttributes(this.client, { query, requires: [] });
+      const response = await raw.exec(
+        'UID SEARCH',
+        Array.isArray(compiled) ? compiled : [compiled],
+        {
+          untagged: {
+            SEARCH: (untagged) => {
+              sawSearch = true;
+              if (takeSearchNumbers(untagged, fromSearch)) {
+                sawStar = true;
+              }
+            },
+            ESEARCH: (untagged) => {
+              const parsed = esearchUidList(untagged.attributes);
+              if (!parsed.present) {
+                return;
+              }
+              sawEsearchAll = true;
+              if (parsed.star) {
+                sawStar = true;
+                return;
+              }
+              fromEsearch.push(...parsed.uids);
+            },
+          },
+        },
       );
+      response.next();
+    } catch (error) {
+      throw this.session.failTransport(error, 'The server refused the SEARCH command.', hint);
     }
     if (!this.client.usable || !this.client.mailbox || this.session.hasFailed()) {
       throw new MailError(
@@ -963,7 +996,27 @@ class FlowMailbox implements OpenMailbox {
         'The search did not finish on a selected mailbox, so no UID is reported missing.',
       );
     }
-    return rows.map((row) => row.uid).filter((uid) => Number.isInteger(uid) && uid > 0);
+    const after = mailboxStamp(this.client);
+    const changed = before.exists !== after.exists || before.uidNext !== after.uidNext;
+    if (sawStar || changed) {
+      throw new MailError(
+        'PROTOCOL_ERROR',
+        sawStar
+          ? 'The server returned a UID set containing *, so the match list was not used.'
+          : 'The mailbox changed while the search result was read, so the match list was not used.',
+        'Repeat the search. No message was changed from this result.',
+      );
+    }
+    const searchUids = normalizeUids(fromSearch);
+    const esearchUids = normalizeUids(fromEsearch);
+    if (sawSearch && sawEsearchAll && !sameUids(searchUids, esearchUids)) {
+      throw new MailError(
+        'PROTOCOL_ERROR',
+        'The server returned two different UID lists for one search, so neither list was used.',
+        'Repeat the search. No message was changed from this result.',
+      );
+    }
+    return sawEsearchAll && !sawSearch ? esearchUids : searchUids;
   }
 
   async fetchSummaries(
@@ -2020,6 +2073,94 @@ function refusalFromLog(entry: unknown): string {
   return serverRefusal(err);
 }
 
+function mailboxStamp(client: ImapFlow): { exists: number; uidNext: number } {
+  const box = client.mailbox as { exists?: number; uidNext?: number } | false | undefined;
+  if (!box) {
+    return { exists: -1, uidNext: -1 };
+  }
+  return {
+    exists: typeof box.exists === 'number' ? box.exists : -1,
+    uidNext: typeof box.uidNext === 'number' ? box.uidNext : -1,
+  };
+}
+
+function attributeValues(node: unknown): string[] {
+  const values: string[] = [];
+  const visit = (item: unknown): void => {
+    if (Array.isArray(item)) {
+      for (const child of item) {
+        visit(child);
+      }
+      return;
+    }
+    if (!item || typeof item !== 'object') {
+      return;
+    }
+    const record = item as { value?: unknown; attributes?: unknown };
+    if (Array.isArray(record.attributes)) {
+      visit(record.attributes);
+    }
+    if (typeof record.value === 'string' || typeof record.value === 'number') {
+      values.push(String(record.value));
+    }
+  };
+  visit(node);
+  return values;
+}
+
+/** True when the line contained `*`, which is not an explicit UID. */
+function takeSearchNumbers(
+  untagged: { attributes?: ImapAttr[]; numbers?: number[] },
+  target: number[],
+): boolean {
+  if (Array.isArray(untagged.numbers)) {
+    for (const value of untagged.numbers) {
+      if (Number.isInteger(value) && value > 0) {
+        target.push(value);
+      }
+    }
+    return false;
+  }
+  let star = false;
+  for (const value of attributeValues(untagged.attributes)) {
+    if (value.includes('*')) {
+      star = true;
+      continue;
+    }
+    if (/^\d+$/.test(value)) {
+      target.push(Number(value));
+    }
+  }
+  return star;
+}
+
+function esearchUidList(attributes: ImapAttr[] | undefined): {
+  present: boolean;
+  star: boolean;
+  uids: number[];
+} {
+  const values = attributeValues(attributes);
+  const index = values.findIndex((value) => value.toUpperCase() === 'ALL');
+  if (index < 0) {
+    return { present: false, star: false, uids: [] };
+  }
+  const set = values[index + 1] ?? '';
+  if (set.includes('*')) {
+    return { present: true, star: true, uids: [] };
+  }
+  return { present: true, star: false, uids: parseSequenceSet(set) };
+}
+
+function normalizeUids(uids: number[]): number[] {
+  return [...new Set(uids)]
+    .filter((uid) => Number.isInteger(uid) && uid > 0)
+    .sort((left, right) => left - right);
+}
+
+function sameUids(left: number[], right: number[]): boolean {
+  return left.length === right.length && left.every((uid, index) => uid === right[index]);
+}
+
 function breakFromLog(entry: unknown): 'timeout' | 'connection' | null {
   if (!entry || typeof entry !== 'object') {
     return null;
@@ -2040,7 +2181,9 @@ function breakFromLog(entry: unknown): 'timeout' | 'connection' | null {
     code === 'ECONNRESET' ||
     code === 'EPIPE' ||
     code === 'ECONNREFUSED' ||
-    /connection not available|socket is already closed|socket closed|econnreset|epipe|connection closed/.test(
+    code === 'ClosedAfterConnectText' ||
+    code === 'ClosedAfterConnectTLS' ||
+    /connection not available|socket is already closed|socket closed|econnreset|epipe|connection closed|unexpected close|closedafterconnecttext/.test(
       message,
     )
   ) {
