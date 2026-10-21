@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
 
 - Search AND is one SEARCH with the criteria side by side. A NOT over a UID set, a sequence set, or more than one criterion is computed from UID sets on the client, so the same query matches the same messages on iCloud, Gmail, Dovecot, and GreenMail. A text criterion combined with a UID or a flag is sent as that one SEARCH.
 - `PROTOCOL_ERROR` includes the server's `NO` or `BAD` text when the server sent one.
