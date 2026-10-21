@@ -1,6 +1,14 @@
 import { z } from 'zod';
 import type { MailService } from '../service/mail-service.js';
 import type { MutationKind } from '../safety.js';
+import {
+  cursorLimit,
+  pageKeyList,
+  pageLimit,
+  readPageCursor,
+  resolveOrder,
+} from '../service/browse.js';
+import type { PageOrder } from '../page/snapshot.js';
 import { fields, strictOutput } from './schema.js';
 
 export interface ToolAnnotations {
@@ -18,6 +26,8 @@ export interface ToolDefinition {
   output: z.ZodObject<z.ZodRawShape>;
   annotations: ToolAnnotations;
   kind: 'read' | MutationKind;
+  /** When true, limit, cursor, and order are added and the result uses the shared page envelope. */
+  paged?: boolean;
   examples: string[];
   run(args: Record<string, unknown>, service: MailService): Promise<Record<string, unknown>>;
 }
@@ -27,8 +37,42 @@ const baseOut = {
   account: z.string().describe('Account id that handled the call.'),
 };
 
+const pageFields = {
+  items: z
+    .array(z.record(z.string(), z.unknown()))
+    .describe(
+      'This page. The same cursor model is used for every paged tool: pass nextCursor back as cursor. A new call without a cursor starts a new snapshot and includes mail that arrived after the previous one.',
+    ),
+  nextCursor: z.string().nullable().describe('Cursor for the next page, or null on the last page.'),
+  total: z.number().describe('Rows inside the snapshot, before this page is sliced.'),
+  truncated: z
+    .boolean()
+    .describe(
+      'True when a cap omitted matches. omitted and scanned on snapshot.folders say which folder.',
+    ),
+  snapshot: z
+    .record(z.string(), z.unknown())
+    .describe(
+      'Frozen view from the first page. Message lists store each folder uidValidity and the highest UID that search returned. Later arrivals stay outside this walk.',
+    ),
+  order: z.enum(['newest-first', 'oldest-first']).describe('Order used for this page.'),
+};
+
 function define(tool: ToolDefinition): ToolDefinition {
-  return tool;
+  if (!tool.paged) {
+    return tool;
+  }
+  return {
+    ...tool,
+    input: tool.input
+      .extend({
+        limit: fields.limit,
+        cursor: fields.cursor,
+        order: fields.order,
+      })
+      .strict(),
+    output: tool.output.extend(pageFields).strict(),
+  };
 }
 
 const readAnn = (title: string): ToolAnnotations => ({
@@ -46,7 +90,7 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_list_accounts',
     title: 'List configured accounts',
     description:
-      'List every account this server can use, without secrets. Use it first when more than one account is configured, then pass the id as `account` on later calls. The default account is marked. Read-only metadata: provider, safety switches, whether SMTP is configured, and From identities. Does not open a network connection.',
+      'List every account this server can use, without secrets. Use it first when more than one account is configured, then pass the id as `account` on later calls. The default account is marked. Read-only metadata: provider, safety switches, whether SMTP is configured, and From identities including each identity replyTo. Does not open a network connection.',
     input: z.object({}).describe('No arguments.'),
     output: strictOutput({
       ok: fields.ok,
@@ -59,9 +103,41 @@ export const TOOLS: ToolDefinition[] = [
       openWorldHint: false,
     },
     kind: 'read',
+    paged: true,
     examples: ['{}'],
-    async run(_args, service) {
-      return { ok: true, accounts: service.listAccounts() };
+    async run(args, service) {
+      const accounts = service.listAccounts();
+      const input = args as { limit?: number; cursor?: string; order?: PageOrder };
+      const cursor = readPageCursor(input.cursor);
+      const { order } = resolveOrder(input.order ? { order: input.order } : {});
+      const limit = pageLimit(
+        cursorLimit(cursor, input.limit, service.config.limits.pageSize),
+        service.config.limits.pageSize,
+        service.config.limits.maxPageSize,
+        false,
+      );
+      const paged = pageKeyList(
+        accounts.map((item) => String(item.id)),
+        {
+          limit,
+          order,
+          ...(cursor ? { cursor } : {}),
+          scope: 'accounts',
+          sort: [{ field: 'arrival', reverse: order === 'newest-first' }],
+        },
+      );
+      const byId = new Map(accounts.map((item) => [String(item.id), item]));
+      const items = paged.keys.map((key) => byId.get(key)).filter((item) => item !== undefined);
+      return {
+        ok: true,
+        accounts: items,
+        items,
+        nextCursor: paged.nextCursor,
+        total: paged.total,
+        truncated: false,
+        order,
+        snapshot: { folders: [] },
+      };
     },
   }),
   define({
@@ -190,7 +266,11 @@ export const TOOLS: ToolDefinition[] = [
         .optional()
         .describe('When true, only subscribed mailboxes. Default false (all listed).'),
     }),
-    output: strictOutput({ ...baseOut, mailboxes: z.array(z.record(z.string(), z.unknown())) }),
+    output: strictOutput({
+      ...baseOut,
+      mailboxes: z.array(z.record(z.string(), z.unknown())),
+      offset: z.number(),
+    }),
     annotations: {
       readOnlyHint: true,
       destructiveHint: false,
@@ -198,10 +278,21 @@ export const TOOLS: ToolDefinition[] = [
       openWorldHint: true,
     },
     kind: 'read',
+    paged: true,
     examples: ['{"subscribedOnly":true}'],
     async run(args, service) {
-      const input = args as { account?: string; subscribedOnly?: boolean };
-      return service.listMailboxes(input.account, input.subscribedOnly === true);
+      const input = args as {
+        account?: string;
+        subscribedOnly?: boolean;
+        limit?: number;
+        cursor?: string;
+        order?: PageOrder;
+      };
+      return service.listMailboxes(input.account, input.subscribedOnly === true, {
+        ...(input.limit !== undefined ? { limit: input.limit } : {}),
+        ...(input.cursor ? { cursor: input.cursor } : {}),
+        ...(input.order ? { order: input.order } : {}),
+      });
     },
   }),
   define({
@@ -353,7 +444,11 @@ export const TOOLS: ToolDefinition[] = [
     description:
       'Shortcut for mail_list_mailboxes with subscribedOnly true. Same result shape. Use it when a client only cares about the subscription list.',
     input: z.object({ account: fields.account }),
-    output: strictOutput({ ...baseOut, mailboxes: z.array(z.record(z.string(), z.unknown())) }),
+    output: strictOutput({
+      ...baseOut,
+      mailboxes: z.array(z.record(z.string(), z.unknown())),
+      offset: z.number(),
+    }),
     annotations: {
       readOnlyHint: true,
       destructiveHint: false,
@@ -361,9 +456,20 @@ export const TOOLS: ToolDefinition[] = [
       openWorldHint: true,
     },
     kind: 'read',
+    paged: true,
     examples: ['{}'],
     async run(args, service) {
-      return service.listMailboxes((args as { account?: string }).account, true);
+      const input = args as {
+        account?: string;
+        limit?: number;
+        cursor?: string;
+        order?: PageOrder;
+      };
+      return service.listMailboxes(input.account, true, {
+        ...(input.limit !== undefined ? { limit: input.limit } : {}),
+        ...(input.cursor ? { cursor: input.cursor } : {}),
+        ...(input.order ? { order: input.order } : {}),
+      });
     },
   }),
   define({
@@ -389,10 +495,14 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_list_messages',
     title: 'List message summaries',
     description:
-      'Page message summaries in a mailbox. Default mailbox is INBOX. Default sort is arrival descending (newest first) via the SORT extension, with a client-side fallback that refuses mailboxes larger than limits.maxSortCandidates when the server cannot sort. Each summary has uid, flags, size (octets), date, from, to, subject, hasAttachments, and a snippet of about snippetChars characters (default 160). Pass nextCursor back as cursor. Never returns an unbounded mailbox. For criteria use mail_search_messages; a search object is also accepted here. Optional uidValidity detects a recreated mailbox.',
+      'Page message summaries in a mailbox. Default mailbox is INBOX. Default sort is arrival descending (newest first) via the SORT extension, with a client-side fallback. A folder larger than limits.maxSortCandidates is truncated, including a single-folder server SORT: snapshot.folders reports omitted and scanned, and paging continues inside that window. Each summary has uid, flags, size (octets), date, from, to, subject, hasAttachments, and a snippet of about snippetChars characters (default 160). Pass nextCursor back as cursor. Mail that arrives after the first page needs a new call without a cursor. For criteria use mail_search_messages; a search object is also accepted here. Optional uidValidity detects a recreated mailbox. folders all, globs, and special-use skip mailboxes marked \\Noselect or \\NonExistent. Naming one of those paths returns MAILBOX_NOT_SELECTABLE.',
     input: z.object({
       account: fields.account,
-      mailbox: fields.mailbox.optional().describe('Mailbox path. Default INBOX.'),
+      mailbox: fields.mailbox
+        .optional()
+        .describe('Mailbox path. Default INBOX. Ignored when folders is set.'),
+      folders: fields.folders,
+      maxPerFolder: fields.maxPerFolder,
       search: fields.search.optional(),
       sort: z
         .array(fields.sortKey)
@@ -426,6 +536,8 @@ export const TOOLS: ToolDefinition[] = [
         z
           .object({
             uid: z.number(),
+            mailbox: z.string(),
+            uidValidity: z.string(),
             flags: z.array(z.string()),
             size: z.number().nullable(),
             date: z.string().nullable(),
@@ -446,10 +558,14 @@ export const TOOLS: ToolDefinition[] = [
             labels: z.array(z.string()),
             threadId: z.string().nullable(),
             modseq: z.string().nullable(),
+            listUnsubscribe: z.string().nullable(),
+            listId: z.string().nullable(),
+            autoSubmitted: z.string().nullable(),
           })
           .strict(),
       ),
       nextCursor: z.string().nullable(),
+      folders: z.array(z.string()).describe('Mailbox paths included in this snapshot.'),
     }),
     annotations: {
       readOnlyHint: true,
@@ -458,6 +574,7 @@ export const TOOLS: ToolDefinition[] = [
       openWorldHint: true,
     },
     kind: 'read',
+    paged: true,
     examples: ['{"mailbox":"INBOX","limit":10}'],
     async run(args, service) {
       return service.listMessages(args as never);
@@ -471,6 +588,8 @@ export const TOOLS: ToolDefinition[] = [
     input: z.object({
       account: fields.account,
       mailbox: fields.mailbox.optional(),
+      folders: fields.folders,
+      maxPerFolder: fields.maxPerFolder,
       search: fields.search,
       sort: z.array(fields.sortKey).optional(),
       limit: fields.limit,
@@ -501,6 +620,8 @@ export const TOOLS: ToolDefinition[] = [
         z
           .object({
             uid: z.number(),
+            mailbox: z.string(),
+            uidValidity: z.string(),
             flags: z.array(z.string()),
             size: z.number().nullable(),
             date: z.string().nullable(),
@@ -521,10 +642,14 @@ export const TOOLS: ToolDefinition[] = [
             labels: z.array(z.string()),
             threadId: z.string().nullable(),
             modseq: z.string().nullable(),
+            listUnsubscribe: z.string().nullable(),
+            listId: z.string().nullable(),
+            autoSubmitted: z.string().nullable(),
           })
           .strict(),
       ),
       nextCursor: z.string().nullable(),
+      folders: z.array(z.string()).describe('Mailbox paths included in this snapshot.'),
     }),
     annotations: {
       readOnlyHint: true,
@@ -533,6 +658,7 @@ export const TOOLS: ToolDefinition[] = [
       openWorldHint: true,
     },
     kind: 'read',
+    paged: true,
     examples: ['{"mailbox":"INBOX","search":{"seen":false,"from":"ada@example.com"},"limit":20}'],
     async run(args, service) {
       return service.searchMessages(args as never);
@@ -752,7 +878,7 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_list_threads',
     title: 'List threads',
     description:
-      'Group messages into threads. Uses the THREAD extension (REFERENCES by default, or ORDEREDSUBJECT) when the server advertises it and the search is "all"; otherwise threads are built from References and In-Reply-To, with a subject fallback for ORDEREDSUBJECT. The result is a tree plus a paged flat UID list (parent before children). Gmail thread ids, when present on summaries, are a separate field from this tree. Large mailboxes are capped at maxSortCandidates for the client-side path.',
+      'Group messages into threads in one mailbox unless folders is set. source is server only when a single folder uses the server THREAD tree. Several folders are built on the client from the References, In-Reply-To, and Message-ID header fields, not from the ENVELOPE alone, and each node is mailbox plus UID. ORDEREDSUBJECT is the opt-in subject heuristic. Every item carries the same threadKey for that conversation: the earliest message with no parent in the set. A folder larger than maxSortCandidates is truncated and reports omitted and scanned. Later pages stay inside the first page UID bound.',
     input: z.object({
       account: fields.account,
       mailbox: fields.mailbox.optional(),
@@ -760,7 +886,11 @@ export const TOOLS: ToolDefinition[] = [
       algorithm: z
         .enum(['REFERENCES', 'ORDEREDSUBJECT'])
         .optional()
-        .describe('Default REFERENCES.'),
+        .describe(
+          'Default REFERENCES. ORDEREDSUBJECT is the subject heuristic and labels rows as subject.',
+        ),
+      folders: fields.folders,
+      maxPerFolder: fields.maxPerFolder,
       limit: fields.limit,
       cursor: fields.cursor,
       uidValidity: fields.uidValidity,
@@ -777,6 +907,7 @@ export const TOOLS: ToolDefinition[] = [
       threads: z.array(z.record(z.string(), z.unknown())),
       uids: z.array(z.number()),
       nextCursor: z.string().nullable(),
+      offset: z.number(),
     }),
     annotations: {
       readOnlyHint: true,
@@ -785,6 +916,7 @@ export const TOOLS: ToolDefinition[] = [
       openWorldHint: true,
     },
     kind: 'read',
+    paged: true,
     examples: ['{"mailbox":"INBOX","algorithm":"REFERENCES","limit":20}'],
     async run(args, service) {
       return service.listThreads(args as never);
@@ -1142,6 +1274,10 @@ export const TOOLS: ToolDefinition[] = [
       destination: z.string().optional(),
       bytes: z.number().optional(),
       replacedUid: z.number().nullable().optional(),
+      identity: z
+        .object({ id: z.string().nullable(), email: z.string(), name: z.string().optional() })
+        .strict(),
+      identityReason: z.enum(['explicit', 'single-match', 'default-no-match', 'default-ambiguous']),
     }),
     annotations: {
       readOnlyHint: false,
@@ -1168,6 +1304,7 @@ export const TOOLS: ToolDefinition[] = [
       to: fields.addressList.optional(),
       cc: fields.addressList.optional(),
       bcc: fields.addressList.optional(),
+      replyTo: fields.addressList.optional(),
       subject: z.string().optional().describe('Replacement subject.'),
       text: z.string().optional().describe('Replacement plain text body.'),
       html: z.string().optional().describe('Replacement HTML body.'),
@@ -1181,6 +1318,10 @@ export const TOOLS: ToolDefinition[] = [
       destination: z.string().optional(),
       bytes: z.number().optional(),
       replacedUid: z.number().nullable(),
+      identity: z
+        .object({ id: z.string().nullable(), email: z.string(), name: z.string().optional() })
+        .strict(),
+      identityReason: z.enum(['explicit', 'single-match', 'default-no-match', 'default-ambiguous']),
     }),
     annotations: {
       readOnlyHint: false,
@@ -1228,7 +1369,7 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_send_message',
     title: 'Send a message',
     description:
-      'Submit a message over SMTP (RFC 5321 / RFC 6409). Supports text, HTML (multipart/alternative when both are set), attachments from base64 or a local path, inline cid images, extra headers, priority (high, normal, low), a read receipt (Disposition-Notification-To), and DSN options when the server advertises DSN. from must be a configured identity. recipientDomainAllowList and sendRateLimit are enforced. After a successful send, the message is appended to Sent unless the provider is Gmail (which stores Sent itself) or appendSent is false or the account sets appendSent false. envelopeFrom and envelopeTo override the SMTP envelope without changing headers. Blocked when allowSend is false or readOnly.',
+      'Submit a message over SMTP (RFC 5321 / RFC 6409). Supports text, HTML (multipart/alternative when both are set), attachments from base64 or a local path, inline cid images, extra headers, priority (high, normal, low), a read receipt (Disposition-Notification-To set from the From identity), and DSN options when the server advertises DSN. from and replyTo must be configured identities, or allowFromDomains must list the domain. When replyTo is omitted, the selected identity replyTo is used. headers is an allow-list: X-* plus List-Unsubscribe, List-Unsubscribe-Post, Auto-Submitted, Precedence, Importance, Keywords, and Comments. An X- header is lowercased first and is never split on camelCase. The remainder after X- is split on "-" and "_", and each token is checked with all digits removed, and again with look-alike digits mapped (0 as o, 1 as l and as i, 3 as e, 4 as a, 5 as s, 7 as t) and the other digits removed. Any of those variants rejects the name. A token that becomes from, to, cc, bcc, or recipient is rejected in any position, so X-From2-Not, X-From0, X-From0-Not, X-Fr0m, X-Envel0pe, X-Enve1ope, X-3nv3l0p3, X-B0unce, X-Bounc3, and X-B0unc3 are rejected. sender is rejected only as the last token or a compact suffix, so X-Sender-IP, X-Sender-IP2, X-Notification, X-Notification2, X-Photo, X-Photo2, and X-Original-Arrival-Time stay allowed. The look-alike pass is a best-effort guard: MTAs and Nodemailer do not read these names as routing headers. It is rejected when that token is to, from, sender, cc, bcc, or recipient, when the trailing tokens are an address-bearing name (reply-to, errors-to, return-path, delivered-to, apparently-to, apparently-from, original-from, original-sender, original-to, original-recipient, receipt-to, read-receipt-to, return-receipt-to, notification-to, disposition-notification-to, confirm-reading-to, reading-to, mdn-to, mail-followup-to, followup-to, mail-reply-to, or rcpt-to), or when any token is resent, envelope, rcpt, or bounce. The same lowercased name, with "-" and "_" removed, 0 read as o, and other digits removed, is always rejected when it ends with from, sender, recipient, replyto, errorsto, returnpath, deliveredto, receiptto, notificationto, readingto, mdnto, apparentlyto, followupto, originalto, or rcptto, or when it contains resent, envelope, rcpt, or bounce. X-Report-Abuse-To, X-Complaint-To, X-Authenticated-Sender, and X-Forwarded-To are rejected on purpose. Other X-* headers stay allowed. A parenthesized comment on to, cc, bcc, or replyTo is dropped and the addr-spec is kept. From, Sender, Reply-To, To, Cc, Bcc, Message-ID, Return-Path, Resent-*, and receipt or legacy reply headers are rejected; use the structured from, replyTo, to, cc, and bcc fields. Names that contain spaces, controls, or a colon are rejected. recipientDomainAllowList and sendRateLimit are enforced. After a successful send, the message is appended to Sent unless the provider is Gmail (which stores Sent itself) or appendSent is false or the account sets appendSent false. envelopeFrom and envelopeTo override the SMTP envelope without changing headers. Blocked when allowSend is false or readOnly.',
     input: z.object({
       account: fields.account,
       from: fields.address
@@ -1239,7 +1380,11 @@ export const TOOLS: ToolDefinition[] = [
       bcc: fields.addressList
         .optional()
         .describe('Envelope recipients. Not stored in the message header by the composer.'),
-      replyTo: fields.addressList.optional(),
+      replyTo: fields.addressList
+        .optional()
+        .describe(
+          'Reply-To. Omit to use the selected identity replyTo. Must be an identity or an allowFromDomains address. A display name that contains another address is not sent.',
+        ),
       subject: z.string().describe('Subject line.'),
       text: z.string().optional().describe('Plain text body. Provide text, html, or both.'),
       html: z.string().optional().describe('HTML body.'),
@@ -1247,7 +1392,9 @@ export const TOOLS: ToolDefinition[] = [
       headers: z
         .record(z.string(), z.string())
         .optional()
-        .describe('Additional headers, for example {"X-Entity":"42"}.'),
+        .describe(
+          'Allow-listed headers only: X-* except routing and receipt aliases. An X- name is lowercased first and is never split on camelCase. The remainder after X- is split on "-" and "_", and each token is checked with all digits removed, and again with look-alike digits mapped (0 as o, 1 as l and as i, 3 as e, 4 as a, 5 as s, 7 as t) and the other digits removed. Any of those variants rejects the name. A token that becomes from, to, cc, bcc, or recipient is rejected in any position, so X-From2-Not, X-From0, X-From0-Not, X-Fr0m, X-Envel0pe, X-Enve1ope, X-3nv3l0p3, X-B0unce, X-Bounc3, and X-B0unc3 are rejected. sender is rejected only as the last token or a compact suffix, so X-Sender-IP, X-Sender-IP2, X-Notification, X-Notification2, X-Photo, X-Photo2, and X-Original-Arrival-Time stay allowed. The look-alike pass is a best-effort guard: MTAs and Nodemailer do not read these names as routing headers. It is rejected when that token is to, from, sender, cc, bcc, or recipient, when the trailing tokens are reply-to, errors-to, return-path, delivered-to, apparently-to, apparently-from, original-from, original-sender, original-to, original-recipient, receipt-to, read-receipt-to, return-receipt-to, notification-to, disposition-notification-to, confirm-reading-to, reading-to, mdn-to, mail-followup-to, followup-to, mail-reply-to, or rcpt-to, or when any token is resent, envelope, rcpt, or bounce. The same lowercased name, with "-" and "_" removed, 0 read as o, and other digits removed, is always rejected when it ends with from, sender, recipient, replyto, errorsto, returnpath, deliveredto, receiptto, notificationto, readingto, mdnto, apparentlyto, followupto, originalto, or rcptto, or when it contains resent, envelope, rcpt, or bounce. X-Report-Abuse-To, X-Complaint-To, X-Authenticated-Sender, and X-Forwarded-To are rejected on purpose. Other X-* headers are allowed, plus List-Unsubscribe, List-Unsubscribe-Post, Auto-Submitted, Precedence, Importance, Keywords, and Comments. Address headers are rejected; use from, replyTo, to, cc, and bcc.',
+        ),
       priority: z
         .enum(['high', 'normal', 'low'])
         .optional()
@@ -1288,6 +1435,14 @@ export const TOOLS: ToolDefinition[] = [
       bytes: z.number(),
       smtp: z.record(z.string(), z.unknown()),
       sentAppend: z.record(z.string(), z.unknown()).nullable(),
+      identity: z
+        .object({
+          id: z.string().nullable(),
+          email: z.string(),
+          name: z.string().optional(),
+        })
+        .strict(),
+      identityReason: z.enum(['explicit', 'single-match', 'default-no-match', 'default-ambiguous']),
     }),
     annotations: {
       readOnlyHint: false,
@@ -1305,7 +1460,7 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_reply_message',
     title: 'Reply to a message',
     description:
-      'Reply to a message identified by account, mailbox, and UID. Sets In-Reply-To and References, prefixes the subject with Re: unless it already has a reply prefix (Re, Aw, Sv), and quotes the original plain text (or the HTML rendered to text). replyAll true puts the original From (or Reply-To) in To and the other recipients in Cc, omitting this account. The result is the same shape as mail_send_message. Requires allowSend.',
+      'Reply to a message identified by account, mailbox, and UID. Sets In-Reply-To and References, prefixes the subject with Re: unless it already has a reply prefix (Re, Aw, Sv), and quotes the original plain text (or the HTML rendered to text). replyAll true puts the original From (or Reply-To) in To and the other recipients in Cc, omitting this account. An omitted replyTo uses the selected identity replyTo. The result is the same shape as mail_send_message. Requires allowSend.',
     input: z.object({
       account: fields.account,
       mailbox: fields.mailbox,
@@ -1316,6 +1471,16 @@ export const TOOLS: ToolDefinition[] = [
         .optional()
         .describe(
           'true replies to all recipients. Default false replies only to From or Reply-To.',
+        ),
+      from: fields.address
+        .optional()
+        .describe(
+          'From identity. When omitted, an identity is selected only if exactly one configured address is in the original To or Cc.',
+        ),
+      replyTo: fields.addressList
+        .optional()
+        .describe(
+          'Reply-To. Omit to use the selected identity replyTo. The address must be an identity or an allowFromDomains address. A display name that contains another address is dropped.',
         ),
       text: z.string().optional().describe('Your reply, placed above the quoted original.'),
       html: z
@@ -1337,6 +1502,14 @@ export const TOOLS: ToolDefinition[] = [
       bytes: z.number(),
       smtp: z.record(z.string(), z.unknown()),
       sentAppend: z.record(z.string(), z.unknown()).nullable(),
+      identity: z
+        .object({
+          id: z.string().nullable(),
+          email: z.string(),
+          name: z.string().optional(),
+        })
+        .strict(),
+      identityReason: z.enum(['explicit', 'single-match', 'default-no-match', 'default-ambiguous']),
     }),
     annotations: {
       readOnlyHint: false,
@@ -1360,6 +1533,10 @@ export const TOOLS: ToolDefinition[] = [
       mailbox: fields.mailbox,
       uid: fields.uid,
       uidValidity: fields.uidValidity,
+      from: fields.address
+        .optional()
+        .describe('From identity. Same selection rules as mail_reply_message.'),
+      replyTo: fields.addressList.optional(),
       to: fields.addressList.min(1),
       cc: fields.addressList.optional(),
       text: z.string().optional().describe('Note placed above the forwarded body.'),
@@ -1388,6 +1565,14 @@ export const TOOLS: ToolDefinition[] = [
       bytes: z.number(),
       smtp: z.record(z.string(), z.unknown()),
       sentAppend: z.record(z.string(), z.unknown()).nullable(),
+      identity: z
+        .object({
+          id: z.string().nullable(),
+          email: z.string(),
+          name: z.string().optional(),
+        })
+        .strict(),
+      identityReason: z.enum(['explicit', 'single-match', 'default-no-match', 'default-ambiguous']),
     }),
     annotations: {
       readOnlyHint: false,
@@ -1405,18 +1590,39 @@ export const TOOLS: ToolDefinition[] = [
     name: 'mail_send_draft',
     title: 'Send a saved draft',
     description:
-      'Submit the raw RFC822 of a saved draft over SMTP, using its headers as the message and its To/Cc/Bcc as the envelope. mailbox defaults to wherever the draft lives; pass the Drafts path and the draft UID. Does not delete the draft; call mail_delete_draft afterwards if you want it gone. Same safety checks as mail_send_message.',
+      'Submit a saved draft over SMTP. The stored message is parsed on every send and the submitted bytes are rebuilt. From, Sender, and Reply-To are written once from the checked addr-specs, and To, Cc, and Bcc are written the same way. A display name is NFKC-normalized after encoded-word decoding and dropped when it contains @ or <>, when it is still an encoded-word, or when it came from a comment. A parenthesized comment is accepted on To, Cc, and Bcc and on send, reply, and forward, and the addr-spec is kept. Duplicate allow-listed headers stay separate fields, and each keeps the field name from the draft. A second From, Sender, or Reply-To, or a field name that is not an RFC 5322 field name (whitespace before the colon), is PERMISSION_DENIED. Allow-listed headers are copied from the raw header block, original field name and raw value, so List-Unsubscribe, List-Unsubscribe-Post, and Importance survive. Every address on From, Sender, Reply-To, Resent-*, and the receipt or legacy reply headers must be a configured identity. recipientDomainAllowList and sendRateLimit apply. When the draft has no Reply-To, the selected identity replyTo is applied. identityReason is stored-draft when from is omitted, and explicit when from is passed. mailbox defaults to wherever the draft lives; pass the Drafts path and the draft UID. Does not delete the draft; call mail_delete_draft afterwards if you want it gone.',
     input: z.object({
       account: fields.account,
       mailbox: fields.mailbox.describe('Mailbox that holds the draft, usually Drafts.'),
       uid: fields.uid,
       uidValidity: fields.uidValidity,
+      from: fields.address
+        .optional()
+        .describe('Replace the draft From. Must be an identity or an allowFromDomains address.'),
+      replyTo: fields.addressList
+        .optional()
+        .describe(
+          'Replace Reply-To. Omit to keep a stored Reply-To that is an identity, or to apply the identity replyTo when the draft has none.',
+        ),
       appendSent: z
         .boolean()
         .optional()
         .describe('Force or skip the Sent APPEND. Default follows the account setting.'),
     }),
-    output: strictOutput({ ...baseOut, uid: z.number(), smtp: z.record(z.string(), z.unknown()) }),
+    output: strictOutput({
+      ...baseOut,
+      uid: z.number(),
+      smtp: z.record(z.string(), z.unknown()),
+      sentAppend: z.record(z.string(), z.unknown()).nullable(),
+      identity: z
+        .object({ id: z.string().nullable(), email: z.string(), name: z.string().optional() })
+        .strict(),
+      identityReason: z
+        .enum(['explicit', 'single-match', 'default-no-match', 'default-ambiguous', 'stored-draft'])
+        .describe(
+          'stored-draft when from is omitted and From comes from the draft. explicit when from is passed.',
+        ),
+    }),
     annotations: {
       readOnlyHint: false,
       destructiveHint: false,
@@ -1482,6 +1688,261 @@ export const TOOLS: ToolDefinition[] = [
     examples: ['{"mailbox":"INBOX","timeoutMs":15000}'],
     async run(args, service) {
       return service.waitForChanges(args as never);
+    },
+  }),
+  define({
+    name: 'mail_get_thread',
+    title: 'Get a conversation',
+    description:
+      "Return one conversation, earlier and later messages, across folders. Pass mailbox and uid, or a messageId. With no folders, a Message-ID seed uses the same scope as a mailbox and uid seed: the seed mailbox, INBOX, Sent, Archive, and All. Junk and Trash stay out unless named, and so does every other folder that is not in that scope. After the thread is closed, the id set is every id the walk discovered, including every Message-ID of the items, every id they cite in In-Reply-To or References, the seed's own ids, and every id that appears only on an out-of-scope message, followed transitively. Ids that an out-of-scope hit adds are searched again immediately, repeating until no new id appears or the search cap is reached. The walk starts from the earliest id the seed already names: the first Reference, otherwise In-Reply-To, otherwise its own Message-ID. Two seeds that name the same start spend the same searches. The cap is 8 searches per round. The default of 4 rounds allows 32 searches. maxRounds raises that ceiling, up to 8 rounds (64 searches). Those seeds return the same items and the same truncated value, including when the cap stops the walk. A stopped walk sets truncated. excludedMatches is one path-ordered list for every seed of that conversation: every selectable folder outside the scope whose messages' Message-ID, In-Reply-To, or References intersect that set, with a count of those messages. An in-scope folder is never listed. An empty list means no out-of-scope message cited an id the walk searched. When truncated is true, maxMessages or the search cap may have left an in-scope message out; excludedMatches still lists the out-of-scope hits for the ids that were searched. A Message-ID whose only exact copy is in Junk or Trash is still walked in both directions from that copy's Message-ID, In-Reply-To, and References, so an in-scope parent and an in-scope reply are items and the Junk or Trash copy stays out. If nothing in scope matches, items are empty and excludedMatches still names that folder; name Junk or Trash in folders to open it. Out-of-scope folders are counted with UID SEARCH in batches of eight ids, not a full header fetch, and an empty mailbox is not searched. Pass folders to include one. Copies of the same Message-ID outside Junk and Trash are included. folders is applied before the Message-ID lookup. \\Noselect and \\NonExistent paths are skipped; naming one returns MAILBOX_NOT_SELECTABLE. Messages are linked by exact Message-ID, In-Reply-To, and References tokens. Gmail X-GM-THRID is used when X-GM-EXT-1 is present, otherwise OBJECTID THREADID. That fast path still builds excludedMatches from the header closure of every id the capability search returned, including a message maxMessages did not keep and ids that appear only on out-of-scope messages. Each item says how it was linked: header, gmail-thrid, objectid, or subject. subject is opt-in via subjectHeuristic. Copies that share a Message-ID collapse; messages with no Message-ID stay separate. alsoIn lists the other folders. The envelope threadKey and every item threadKey are the earliest message with no parent in the set. The first page freezes mailbox and UID keys, the excludedMatches list, truncated, and rounds. Later pages re-fetch those keys and reuse that list, truncated, and rounds. Later pages re-fetch those keys, including a child whose linking parent was expunged, and a UIDVALIDITY change returns CURSOR_INVALIDATED. includeBodies caps the page at 20. Identities are listed by mail_list_accounts.",
+    input: z.object({
+      account: fields.account,
+      mailbox: fields.mailbox.optional().describe('Required with uid.'),
+      uid: fields.uid.optional(),
+      uidValidity: fields.uidValidity,
+      messageId: z.string().optional().describe('Find the seed by Message-ID instead of uid.'),
+      folders: fields.folders,
+      includeBodies: z
+        .boolean()
+        .optional()
+        .describe('Include capped plain text. Default false. Page size max 20.'),
+      onlyUnread: z.boolean().optional().describe('Keep only messages without \\Seen.'),
+      subjectHeuristic: z
+        .boolean()
+        .optional()
+        .describe(
+          'Also link messages that share a normalized subject and a participant. Default false. Those items are linked "subject".',
+        ),
+      maxMessages: z
+        .number()
+        .int()
+        .positive()
+        .max(500)
+        .optional()
+        .describe(
+          'Keep at most this many in-scope messages, the earliest first. Copies of one Message-ID share a slot. A Junk or Trash Message-ID seed does not consume a slot. Out-of-scope folders are still scanned for excludedMatches, including on the Gmail and OBJECTID fast path, which still walks every id that search returned. Default 100, max 500.',
+        ),
+      maxRounds: z
+        .number()
+        .int()
+        .positive()
+        .max(8)
+        .optional()
+        .describe(
+          'Header-search rounds. Each round allows 8 id searches. Default 4 (32 searches). Maximum 8 (64 searches).',
+        ),
+    }),
+    output: strictOutput({
+      ...baseOut,
+      threadKey: z.string(),
+      tree: z.array(z.record(z.string(), z.unknown())),
+      rounds: z.number(),
+      messages: z.array(z.record(z.string(), z.unknown())),
+      offset: z.number(),
+      excludedMatches: z
+        .array(
+          z
+            .object({
+              mailbox: z.string(),
+              count: z.number().int(),
+            })
+            .strict(),
+        )
+        .describe(
+          "Folders outside this scope whose Message-ID, In-Reply-To, or References intersect the closed thread. That id set is every id the walk discovered, including every item Message-ID, every id the items cite, the seed's own ids, and every id that appears only on an out-of-scope message, followed transitively. The same path-ordered list for every seed of the conversation, each with a count of distinct messages. The first page freezes this list on the cursor and later pages reuse it. The cursor keeps at most 500 folders, the first in path order. When more match, excludedMatchesTruncated is true and later pages reuse that prefix. Empty when no out-of-scope message cited an id the walk searched. Hitting maxMessages still counts those folders, including a folder that cites only a message the Gmail or OBJECTID fast path did not keep. An in-scope folder is never listed. A Junk or Trash copy that was not opened is listed here; name that folder in folders to open it.",
+        ),
+      excludedMatchesTruncated: z
+        .boolean()
+        .describe(
+          'True when excludedMatches was cut to 500 folders. The cursor stores that same prefix, and later pages reuse it.',
+        ),
+    }),
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+    kind: 'read',
+    paged: true,
+    examples: ['{"mailbox":"INBOX","uid":41}'],
+    async run(args, service) {
+      return service.getThread(args as never);
+    },
+  }),
+  define({
+    name: 'mail_count',
+    title: 'Count messages per folder',
+    description:
+      'STATUS counts for each folder in the scope: messages, unseen, recent, uidNext, and uidValidity. When search is set, matches is the SEARCH count for that folder. The folder list is paged. Counts are exact for the folders on this page. A new call without a cursor sees folders created after the snapshot.',
+    input: z.object({
+      account: fields.account,
+      mailbox: fields.mailbox.optional(),
+      folders: fields.folders,
+      search: fields.search.optional(),
+    }),
+    output: strictOutput({ ...baseOut, offset: z.number() }),
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+    kind: 'read',
+    paged: true,
+    examples: ['{"folders":"all"}'],
+    async run(args, service) {
+      return service.countMessages(args as never);
+    },
+  }),
+  define({
+    name: 'mail_list_attachments',
+    title: 'List attachment metadata',
+    description:
+      'Page attachment metadata across a folder scope: filename, contentType, size, and partId. No bytes. Each row is one part, so a message with several attachments takes several rows. The cursor keeps mailbox, UIDVALIDITY, UID, and partId, and later pages stay inside the first page UID bound. Messages past the per-folder cap are omitted and truncated is true. Use mail_download_attachment for the bytes of one part.',
+    input: z.object({
+      account: fields.account,
+      mailbox: fields.mailbox.optional(),
+      folders: fields.folders,
+      search: fields.search.optional(),
+      maxPerFolder: fields.maxPerFolder,
+    }),
+    output: strictOutput({ ...baseOut, offset: z.number() }),
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+    kind: 'read',
+    paged: true,
+    examples: ['{"mailbox":"INBOX","search":{"larger":100000}}'],
+    async run(args, service) {
+      return service.listAttachments(args as never);
+    },
+  }),
+  define({
+    name: 'mail_list_correspondents',
+    title: 'List correspondents',
+    description:
+      'Count exact normalized From addresses over a folder scope and optional search. Own identities are excluded. Ties break by address. Every matching UID is read in batches, up to 10000 messages per folder. Above that cap truncated and partial are true and the counts cover only that prefix, not the whole mailbox. Later pages reuse the first page UID bound. Discover identities with mail_list_accounts.',
+    input: z.object({
+      account: fields.account,
+      mailbox: fields.mailbox.optional(),
+      folders: fields.folders,
+      search: fields.search.optional(),
+      maxPerFolder: fields.maxPerFolder,
+    }),
+    output: strictOutput({
+      ...baseOut,
+      offset: z.number(),
+      scanned: z.number(),
+      partial: z
+        .boolean()
+        .describe(
+          'True when the counts cover only the scanned prefix of a folder over 10000 matches.',
+        ),
+    }),
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+    kind: 'read',
+    paged: true,
+    examples: ['{"folders":"all","search":{"since":"2026-01-01"}}'],
+    async run(args, service) {
+      return service.listCorrespondents(args as never);
+    },
+  }),
+  define({
+    name: 'mail_search_facets',
+    title: 'Count a search',
+    description:
+      'Counts for a folder scope and optional search: matches, unread, flagged, and answered per folder, plus a has-attachments count and the top sender addresses and domains. top defaults to 10 and maxes at 100. Ties break alphabetically. Flag counts come from SEARCH and stay exact. Sender and attachment counts read every matching UID in batches, up to 10000 per folder. Above that cap truncated and partial are true and those two counts cover only the scanned prefix. This tool does not page.',
+    input: z.object({
+      account: fields.account,
+      mailbox: fields.mailbox.optional(),
+      folders: fields.folders,
+      search: fields.search.optional(),
+      maxPerFolder: fields.maxPerFolder,
+      top: z
+        .number()
+        .int()
+        .positive()
+        .max(100)
+        .optional()
+        .describe('Sender and domain rows. Default 10, max 100.'),
+    }),
+    output: strictOutput({
+      ...baseOut,
+      folders: z.array(z.record(z.string(), z.unknown())),
+      hasAttachments: z.number(),
+      senders: z.array(z.object({ value: z.string(), count: z.number() }).strict()),
+      domains: z.array(z.object({ value: z.string(), count: z.number() }).strict()),
+      scanned: z.number(),
+      truncated: z.boolean(),
+      partial: z
+        .boolean()
+        .describe(
+          'True when sender and attachment counts cover only the first 10000 matches in a folder.',
+        ),
+      top: z.number(),
+    }),
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+    kind: 'read',
+    examples: ['{"folders":"all","search":{"unkeyword":"$Junk"},"top":10}'],
+    async run(args, service) {
+      return service.searchFacets(args as never);
+    },
+  }),
+  define({
+    name: 'mail_modify_by_search',
+    title: 'Modify messages that match a search',
+    description:
+      'Apply addFlags, removeFlags, move, or archive to every message in a folder scope that matches search. dryRun defaults to true and only pages a preview. A real run is refused with SIZE_LIMIT, and changes nothing, when the match count exceeds limits.maxBulk or any folder is truncated or not fully loaded. move and archive require allowDelete. Adding or removing \\Deleted does too. There is no permanent delete here. The preview uses the shared snapshot cursor. The tool is a write: a readOnly account does not advertise it.',
+    input: z.object({
+      account: fields.account,
+      mailbox: fields.mailbox.optional(),
+      folders: fields.folders,
+      search: fields.search,
+      action: z
+        .enum(['addFlags', 'removeFlags', 'move', 'archive'])
+        .describe(
+          'addFlags and removeFlags use flags. move uses destination. archive moves to the Archive mailbox.',
+        ),
+      flags: z.array(z.string()).optional().describe('Flags for addFlags or removeFlags.'),
+      destination: z
+        .string()
+        .optional()
+        .describe('Target mailbox for move. Archive uses this or the resolved Archive mailbox.'),
+      dryRun: z.boolean().optional().describe('Default true. false applies the action.'),
+      maxPerFolder: fields.maxPerFolder,
+    }),
+    output: strictOutput({
+      ...baseOut,
+      dryRun: z.boolean(),
+      action: z.string(),
+      matched: z.number(),
+      offset: z.number(),
+    }),
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
+    kind: 'message-write',
+    paged: true,
+    examples: ['{"mailbox":"INBOX","search":{"seen":true},"action":"archive","dryRun":true}'],
+    async run(args, service) {
+      return service.modifyBySearch(args as never);
     },
   }),
 ];

@@ -210,6 +210,88 @@ describe('smtp 8bit and oauth single flight', () => {
 });
 
 describe('pool, http, and cli edges', () => {
+  it('borrows a free IMAP session and returns undefined when none is free', async () => {
+    let opened = 0;
+    const session = (): ImapSession => {
+      opened += 1;
+      return {
+        async connect() {
+          return undefined;
+        },
+        async logout() {
+          return undefined;
+        },
+        close() {
+          return undefined;
+        },
+      } as ImapSession;
+    };
+    const pool = new ImapConnectionPool(
+      async () => session(),
+      1,
+      createLogger({ level: 'silent' }),
+    );
+    await pool.use('a', async () => {
+      expect(await pool.tryUse('a', async () => 'spare')).toBeUndefined();
+      expect(opened).toBe(1);
+      return 'held';
+    });
+    await expect(pool.tryUse('a', async () => 'idle')).resolves.toBe('idle');
+    expect(opened).toBe(1);
+    const wide = new ImapConnectionPool(
+      async () => session(),
+      2,
+      createLogger({ level: 'silent' }),
+    );
+    await wide.use('a', async () => {
+      await expect(wide.tryUse('a', async () => 'second')).resolves.toBe('second');
+    });
+    await wide.close();
+    await expect(wide.tryUse('a', async () => 'closed')).resolves.toBeUndefined();
+    await pool.close();
+    const transient = new ImapConnectionPool(
+      async () => session(),
+      1,
+      createLogger({ level: 'silent' }),
+    );
+    await expect(transient.useTransient('a', async () => 'temp')).resolves.toBe('temp');
+    await transient.close();
+    await expect(transient.useTransient('a', async () => 'no')).resolves.toBeUndefined();
+    const refused = new ImapConnectionPool(
+      async () => {
+        throw new MailError('AUTH_FAILED', 'no');
+      },
+      1,
+      createLogger({ level: 'silent' }),
+    );
+    await expect(refused.useTransient('a', async () => 'x')).resolves.toBeUndefined();
+    const dropped = new ImapConnectionPool(
+      async () => {
+        const broken = session();
+        broken.connect = async () => {
+          throw new MailError('AUTH_FAILED', 'no');
+        };
+        return broken;
+      },
+      1,
+      createLogger({ level: 'silent' }),
+    );
+    await expect(dropped.useTransient('a', async () => 'x')).resolves.toBeUndefined();
+    const noisy = new ImapConnectionPool(
+      async () => {
+        const item = session();
+        item.logout = async () => {
+          throw new Error('bye');
+        };
+        return item;
+      },
+      1,
+      createLogger({ level: 'silent' }),
+    );
+    await expect(noisy.useTransient('a', async () => 'ok')).resolves.toBe('ok');
+    await noisy.close();
+  });
+
   it('rejects waiters when the pool closes and does not repeat a timed out command', async () => {
     const session = {
       async connect() {

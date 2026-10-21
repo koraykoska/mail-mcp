@@ -315,7 +315,7 @@ describe('per-UID labels, size cap, flags, and cursors', () => {
     expect(Buffer.from(String(downloaded.contentBase64), 'base64').toString()).toBe('notes!!');
   });
 
-  it('refuses a client-side sort above maxSortCandidates and leaves the mailbox', async () => {
+  it('caps a client-side scan above maxSortCandidates and reports the omission', async () => {
     const session = new FakeSession(['IMAP4rev1']);
     for (let index = 0; index < 3; index += 1) {
       await session.append('INBOX', simpleMessage({ subject: `N${index}` }), []);
@@ -323,9 +323,15 @@ describe('per-UID labels, size cap, flags, and cursors', () => {
     const { service } = harness(session, {
       limits: { ...account().limits, maxSortCandidates: 2 },
     });
-    await expect(
-      service.listMessages({ mailbox: 'INBOX', limit: 10, includeSnippet: false }),
-    ).rejects.toMatchObject({ code: 'SIZE_LIMIT' });
+    const listed = await service.listMessages({
+      mailbox: 'INBOX',
+      limit: 10,
+      includeSnippet: false,
+    });
+    expect(listed.truncated).toBe(true);
+    expect(listed.total).toBe(2);
+    const snapshot = listed.snapshot as { folders: Array<{ omitted: number; scanned: number }> };
+    expect(snapshot.folders[0]).toMatchObject({ omitted: 1, scanned: 2, truncated: true });
     expect(session.boxes.get('INBOX')?.messages).toHaveLength(3);
   });
 });

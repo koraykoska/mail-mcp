@@ -1,6 +1,12 @@
 import MailComposer from 'nodemailer/lib/mail-composer/index.js';
 import { MailError } from '../errors.js';
 import { addressToAscii, formatAddress, type MailAddress } from './address.js';
+import { canonicalHeaderName } from './outbound-headers.js';
+
+export interface HeaderField {
+  name: string;
+  value: string;
+}
 
 export interface OutboundAttachment {
   filename?: string;
@@ -14,6 +20,9 @@ export interface OutboundAttachment {
 
 export interface OutboundMessage {
   from: MailAddress;
+  /** Header From when it differs from the envelope identity. One field, sanitized addresses. */
+  fromHeader?: MailAddress[];
+  sender?: MailAddress[];
   to: MailAddress[];
   cc?: MailAddress[];
   bcc?: MailAddress[];
@@ -23,6 +32,8 @@ export interface OutboundMessage {
   html?: string;
   attachments?: OutboundAttachment[];
   headers?: Record<string, string>;
+  /** One entry per draft field. Duplicate names stay separate and keep their spelling. */
+  headerFields?: HeaderField[];
   inReplyTo?: string;
   references?: string;
   priority?: 'high' | 'normal' | 'low';
@@ -42,6 +53,7 @@ interface ComposerAttachment {
 
 interface ComposerMail {
   from: string;
+  sender?: string;
   to: string;
   cc?: string;
   bcc?: string;
@@ -50,7 +62,7 @@ interface ComposerMail {
   text?: string;
   html?: string;
   attachments?: ComposerAttachment[];
-  headers?: Record<string, string>;
+  headers?: Record<string, string> | Array<{ key: string; value: string }>;
   inReplyTo?: string;
   references?: string;
   messageId?: string;
@@ -71,16 +83,29 @@ export async function buildRawMessage(
       'A message needs text, html, or at least one attachment.',
     );
   }
-  const headers: Record<string, string> = { ...(message.headers ?? {}) };
+  const record: Record<string, string> = { ...(message.headers ?? {}) };
   if (message.readReceipt) {
-    headers['Disposition-Notification-To'] = formatAddress(message.from);
+    record['Disposition-Notification-To'] = formatAddress(message.from);
   }
+  const fields = message.headerFields ?? [];
+  const headers: Record<string, string> | Array<{ key: string; value: string }> =
+    fields.length > 0
+      ? [
+          ...Object.entries(record).map(([key, value]) => ({ key, value })),
+          ...fields.map((field) => ({ key: field.name, value: field.value })),
+        ]
+      : record;
+  const fromList =
+    message.fromHeader && message.fromHeader.length > 0 ? message.fromHeader : [message.from];
   const mail: ComposerMail = {
-    from: formatAddress(asciiAddress(message.from)),
+    from: fromList.map((item) => formatAddress(asciiAddress(item))).join(', '),
     to: message.to.map((item) => formatAddress(asciiAddress(item))).join(', '),
     subject: message.subject,
     headers,
   };
+  if (message.sender && message.sender.length > 0) {
+    mail.sender = message.sender.map((item) => formatAddress(asciiAddress(item))).join(', ');
+  }
   if (message.cc && message.cc.length > 0) {
     mail.cc = message.cc.map((item) => formatAddress(asciiAddress(item))).join(', ');
   }
@@ -115,6 +140,20 @@ export async function buildRawMessage(
   const composer = new MailComposer(mail);
   try {
     const compiled = composer.compile();
+    if (fields.length > 0) {
+      const pending = fields.map((field) => field.name);
+      compiled.normalizeHeaderKey = (key) => {
+        const index = pending.findIndex(
+          (name) => canonicalHeaderName(name) === canonicalHeaderName(key),
+        );
+        if (index < 0) {
+          return key;
+        }
+        const original = pending[index] as string;
+        pending.splice(index, 1);
+        return original;
+      };
+    }
     if (options?.keepBcc) {
       (compiled as { keepBcc?: boolean }).keepBcc = true;
     }

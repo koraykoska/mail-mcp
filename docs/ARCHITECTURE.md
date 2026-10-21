@@ -25,7 +25,7 @@ The server does not shell out to a desktop mail client and it does not keep a lo
 
 ## Configuration
 
-`src/config/load.ts` accepts either environment variables (one implicit account id `default`) or a JSON/JSONC file (`--config` or `MAIL_MCP_CONFIG`). `${VAR}` references are substituted before validation. Provider presets in `src/config/providers.ts` fill host, port, and TLS mode when `provider` is set. Plaintext is only used when `secure` is false and `starttls` is explicitly `disabled`. Otherwise a cleartext port upgrades with STARTTLS.
+`src/config/load.ts` accepts either environment variables or a JSON/JSONC file (`--config` or `MAIL_MCP_CONFIG`). With no file, the account id is `MAIL_ACCOUNT` or `default`. `${VAR}` references are substituted before validation. Provider presets in `src/config/providers.ts` fill host, port, and TLS mode when `provider` is set. `connectHost` and `connectPort` change the TCP dial only; SNI and certificate verification keep using `host`. Plaintext is only used when `secure` is false and `starttls` is explicitly `disabled`. Otherwise a cleartext port upgrades with STARTTLS.
 
 ## Sessions
 

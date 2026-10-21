@@ -54,6 +54,8 @@ export class FakeSession implements ImapSession {
   changes: MailboxChange[] = [];
   structure: BodyNode | null = null;
   sourceMissing = false;
+  /** UIDs that SEARCH and SORT still return, but FETCH omits. */
+  ghostUids = new Set<number>();
   partBodies = new Map<string, { content: Buffer; contentType: string; filename?: string }>();
 
   constructor(
@@ -215,6 +217,18 @@ export class FakeSession implements ImapSession {
     fn: (box: OpenMailbox) => Promise<T>,
   ): Promise<T> {
     const stored = this.requireBox(path);
+    if (
+      stored.flags.some((flag) => {
+        const name = flag.toLowerCase();
+        return name === '\\noselect' || name === '\\nonexistent';
+      })
+    ) {
+      throw new MailError(
+        'MAILBOX_NOT_SELECTABLE',
+        `Mailbox "${path}" cannot be selected.`,
+        'The folder is marked \\Noselect or \\NonExistent. Open a mailbox that can hold messages.',
+      );
+    }
     return fn(new FakeBox(stored, this));
   }
 
@@ -329,9 +343,12 @@ class FakeBox implements OpenMailbox {
   ): Promise<MessageSummary[]> {
     return uids.flatMap((uid) => {
       const message = this.box.messages.find((item) => item.uid === uid);
-      if (!message) {
+      if (!message || this.session.ghostUids.has(uid)) {
         return [];
       }
+      const messageId = headerIds(message.raw, 'message-id')[0];
+      const inReplyTo = headerIds(message.raw, 'in-reply-to')[0];
+      const references = headerIds(message.raw, 'references');
       const summary: MessageSummary = {
         uid: message.uid,
         flags: [...message.flags],
@@ -343,7 +360,14 @@ class FakeBox implements OpenMailbox {
         cc: [],
         replyTo: [],
         hasAttachments: message.raw.includes(Buffer.from('Content-Disposition: attachment')),
+        ...(messageId ? { messageId } : {}),
+        ...(inReplyTo ? { inReplyTo } : {}),
+        ...(references.length > 0 ? { references } : {}),
       };
+      const threadId = header(message.raw, 'x-gm-thrid');
+      if (threadId) {
+        summary.threadId = threadId;
+      }
       if (message.subject) {
         summary.subject = message.subject;
       }
@@ -550,6 +574,30 @@ function matches(message: StoredMessage, query: Record<string, unknown>): boolea
   if (typeof query.uid === 'string' && !uidInSet(message.uid, query.uid)) {
     return false;
   }
+  if (query.flagged === true && !message.flags.includes('\\Flagged')) {
+    return false;
+  }
+  if (query.flagged === false && message.flags.includes('\\Flagged')) {
+    return false;
+  }
+  if (query.answered === true && !message.flags.includes('\\Answered')) {
+    return false;
+  }
+  if (query.answered === false && message.flags.includes('\\Answered')) {
+    return false;
+  }
+  if (query.header && typeof query.header === 'object') {
+    const entry = Object.entries(query.header as Record<string, unknown>)[0];
+    if (entry) {
+      const raw = header(message.raw, entry[0]);
+      if (!raw) {
+        return false;
+      }
+      if (typeof entry[1] === 'string' && !raw.toLowerCase().includes(entry[1].toLowerCase())) {
+        return false;
+      }
+    }
+  }
   if (typeof query.from === 'string' && !(message.from ?? '').includes(String(query.from))) {
     return false;
   }
@@ -562,6 +610,12 @@ function matches(message: StoredMessage, query: Record<string, unknown>): boolea
   const text = message.raw.toString('utf8');
   if (typeof query.text === 'string' && !text.includes(String(query.text))) {
     return false;
+  }
+  if (typeof query.threadId === 'string') {
+    const threadId = header(message.raw, 'x-gm-thrid');
+    if (!threadId || threadId !== query.threadId) {
+      return false;
+    }
   }
   return true;
 }
@@ -584,12 +638,24 @@ function header(raw: Buffer, name: string): string | undefined {
   return match?.[1]?.trim();
 }
 
+function headerIds(raw: Buffer, name: string): string[] {
+  const value = header(raw, name);
+  if (!value) {
+    return [];
+  }
+  return [...value.matchAll(/<[^<>]+>/g)].map((item) => item[0]);
+}
+
 export class FakePool {
   constructor(readonly session: FakeSession) {}
 
   async use<T>(_accountId: string, fn: (session: FakeSession) => Promise<T>): Promise<T> {
     await this.session.connect();
     return fn(this.session);
+  }
+
+  async tryUse(): Promise<undefined> {
+    return undefined;
   }
 
   async close(): Promise<void> {

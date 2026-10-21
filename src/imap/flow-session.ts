@@ -8,11 +8,13 @@ import {
   type SearchObject,
 } from 'imapflow';
 import { searchCompiler } from 'imapflow/lib/search-compiler.js';
-import { MailError, mapTransportError } from '../errors.js';
+import { MailError, mapMailboxOpenError, mapTransportError } from '../errors.js';
 import { capabilityMatches, hasExactCapability as exactCapability } from './capabilities.js';
+import { headerValue, messageIds } from '../mime/headers.js';
 import { decodeTransfer, parseSequenceSet } from '../mime/transfer.js';
 import { VERSION } from '../version.js';
 import type { ResolvedAccount } from '../config/schema.js';
+import { dialTarget } from '../net/connect.js';
 import type { Logger } from '../log.js';
 import { decodeBody } from '../charset.js';
 import { findTextPart } from '../mime/parse.js';
@@ -392,7 +394,7 @@ export class ImapFlowSession implements ImapSession {
       const box = new FlowMailbox(client, this, path, mailbox);
       return await fn(box);
     } catch (error) {
-      throw mapTransportError(error);
+      throw mapMailboxOpenError(path, error);
     } finally {
       lock?.release();
     }
@@ -627,18 +629,18 @@ export class ImapFlowSession implements ImapSession {
       previous.close();
     }
     const endpoint = this.account.imap;
+    const dial = dialTarget(endpoint);
     const tls: ImapFlowOptions['tls'] = {
       rejectUnauthorized: endpoint.tls.rejectUnauthorized,
+      servername: dial.servername,
     };
-    if (endpoint.tls.servername) {
-      tls.servername = endpoint.tls.servername;
-    }
     if (endpoint.tls.caFile) {
       tls.ca = readFileSync(endpoint.tls.caFile);
     }
     const options: ImapFlowOptions = {
-      host: endpoint.host,
-      port: endpoint.port,
+      host: dial.host,
+      port: dial.port,
+      servername: dial.servername,
       secure: endpoint.secure,
       tls,
       logger: false,
@@ -805,6 +807,7 @@ class FlowMailbox implements OpenMailbox {
         envelope: true,
         internalDate: true,
         bodyStructure: true,
+        headers: ['REFERENCES', 'IN-REPLY-TO', 'MESSAGE-ID'],
         labels: this.session.hasCapability('X-GM-EXT-1'),
         threadId:
           this.session.hasCapability('OBJECTID') || this.session.hasCapability('X-GM-EXT-1'),
@@ -1114,7 +1117,7 @@ class FlowMailbox implements OpenMailbox {
     if (!this.session.hasCapability('SORT') || keys.length === 0) {
       return null;
     }
-    const searchKey = searchAttributes(this.client, compiled);
+    const searchParts = sortSearchParts(this.client, compiled);
     const displayable = keys.some(
       (key) => key.field === 'from' || key.field === 'to' || key.field === 'subject',
     );
@@ -1132,7 +1135,7 @@ class FlowMailbox implements OpenMailbox {
           criteria.push({ type: 'ATOM', value: imap });
         }
       }
-      const plain = [criteria, { type: 'ATOM', value: 'UTF-8' }, searchKey];
+      const plain = [criteria, { type: 'ATOM', value: 'UTF-8' }, ...searchParts];
       const attempts: Array<{ args: unknown[]; partial: boolean }> = [];
       if (this.session.hasCapability('ESORT') && window && !display) {
         const end = window.start + window.count - 1;
@@ -1195,7 +1198,30 @@ class FlowMailbox implements OpenMailbox {
         }
       }
     }
-    throw mapTransportError(lastError);
+    // A tagged NO on a live socket can fall back to a client scan. A socket that
+    // died inside SORT must not be read again: that read comes back empty.
+    await new Promise((resolve) => setImmediate(resolve));
+    if (this.sortSocketDead(lastError)) {
+      const cause = lastError instanceof Error ? lastError.message : 'SORT failed';
+      throw new MailError(
+        'CONNECTION_FAILED',
+        `Server SORT failed and the IMAP session is no longer connected. ${cause}`,
+        'Retry the call. The page was not returned from a dead socket.',
+      );
+    }
+    return null;
+  }
+
+  private sortSocketDead(error: unknown): boolean {
+    if (!this.client.usable) {
+      return true;
+    }
+    const raw = this.client as unknown as { socket?: { destroyed?: boolean } | false };
+    if (raw.socket && typeof raw.socket === 'object' && raw.socket.destroyed) {
+      return true;
+    }
+    const message = error instanceof Error ? error.message : '';
+    return /no connection|socket|ECONNRESET|EPIPE|ETIMEOUT|timed out|closed/i.test(message);
   }
 
   async serverThread(
@@ -1353,6 +1379,7 @@ function toSummary(row: FetchMessageObject): MessageSummary {
   if (envelope?.inReplyTo) {
     summary.inReplyTo = envelope.inReplyTo;
   }
+  applyThreadingHeaders(summary, (row as { headers?: Buffer | string }).headers);
   if (row.labels) {
     summary.labels = [...row.labels];
   }
@@ -1368,6 +1395,29 @@ function toSummary(row: FetchMessageObject): MessageSummary {
   }
   summaryStructure.set(summary, structure);
   return summary;
+}
+
+/** References and In-Reply-To come from HEADER.FIELDS. ENVELOPE omits them on some servers. */
+function applyThreadingHeaders(
+  summary: MessageSummary,
+  headers: Buffer | string | undefined,
+): void {
+  if (!headers) {
+    return;
+  }
+  const text = Buffer.isBuffer(headers) ? headers.toString('utf8') : headers;
+  const messageId = headerValue(text, 'message-id');
+  const inReplyTo = messageIds(headerValue(text, 'in-reply-to'))[0];
+  const references = messageIds(headerValue(text, 'references'));
+  if (messageId) {
+    summary.messageId = messageId;
+  }
+  if (inReplyTo) {
+    summary.inReplyTo = inReplyTo;
+  }
+  if (references.length > 0) {
+    summary.references = references;
+  }
 }
 
 function mapAddresses(
@@ -1559,6 +1609,21 @@ function uidMapToRecord(map: Map<number, number> | undefined): Record<string, nu
     out[String(from)] = to;
   }
   return out;
+}
+
+/**
+ * Search keys for UID SORT. `1:*` is every message, and GreenMail hangs on the
+ * parenthesized form `(UID 1:*)`. Send ALL for that range, and spread every
+ * other key so a one-key search is not wrapped in an extra pair of parentheses.
+ */
+function sortSearchParts(client: ImapFlow, compiled: CompiledSearch): unknown[] {
+  const keys = Object.keys(compiled.query);
+  const normalized =
+    keys.length === 1 && compiled.query.uid === '1:*'
+      ? { query: { all: true }, requires: compiled.requires }
+      : compiled;
+  const key = searchAttributes(client, normalized);
+  return Array.isArray(key) ? key : [key];
 }
 
 function searchAttributes(client: ImapFlow, compiled: CompiledSearch): unknown {

@@ -1,5 +1,7 @@
 export interface ThreadableMessage {
   uid: number;
+  /** Folder path. Nodes are keyed by mailbox and UID, so the same UID in two folders stays distinct. */
+  mailbox?: string;
   messageId?: string;
   inReplyTo?: string;
   references?: string[];
@@ -7,8 +9,14 @@ export interface ThreadableMessage {
   date?: string;
 }
 
+export interface ThreadMember {
+  mailbox: string;
+  uid: number;
+}
+
 export interface ThreadNode {
   uid?: number;
+  mailbox?: string;
   messageId?: string;
   children: ThreadNode[];
 }
@@ -21,7 +29,11 @@ export function threadMessages(messages: ThreadableMessage[], bySubject = false)
   const byId = new Map<string, ThreadNode>();
   const nodes: ThreadNode[] = [];
   for (const message of messages) {
-    const node: ThreadNode = { uid: message.uid, children: [] };
+    const node: ThreadNode = {
+      uid: message.uid,
+      mailbox: message.mailbox ?? '',
+      children: [],
+    };
     if (message.messageId) {
       node.messageId = normalizeId(message.messageId);
       byId.set(node.messageId, node);
@@ -93,7 +105,8 @@ function normalizeId(id: string): string {
   return id.trim().replace(/^<|>$/g, '').toLowerCase();
 }
 
-function subjectKey(subject: string | undefined): string {
+/** Subject with reply and forward prefixes removed, for an explicit subject heuristic. */
+export function normalizedSubject(subject: string | undefined): string {
   return (subject ?? '')
     .replace(/^(re|fwd|fw|aw|sv)\s*(\[\d+\])?\s*:\s*/gi, '')
     .trim()
@@ -101,12 +114,15 @@ function subjectKey(subject: string | undefined): string {
 }
 
 function groupRootsBySubject(roots: ThreadNode[], messages: ThreadableMessage[]): ThreadNode[] {
-  const byUid = new Map(messages.map((message) => [message.uid, message]));
+  const byUid = new Map(
+    messages.map((message) => [`${message.mailbox ?? ''}\0${message.uid}`, message]),
+  );
   const groups = new Map<string, ThreadNode>();
   const ordered: ThreadNode[] = [];
   for (const root of roots) {
-    const message = root.uid !== undefined ? byUid.get(root.uid) : undefined;
-    const key = subjectKey(message?.subject);
+    const message =
+      root.uid !== undefined ? byUid.get(`${root.mailbox ?? ''}\0${root.uid}`) : undefined;
+    const key = normalizedSubject(message?.subject);
     if (!key) {
       ordered.push(root);
       continue;
@@ -122,12 +138,12 @@ function groupRootsBySubject(roots: ThreadNode[], messages: ThreadableMessage[])
   return ordered;
 }
 
-/** Flatten a thread tree to a list of UIDs, parent before children. */
-export function flattenThread(nodes: ThreadNode[]): number[] {
-  const uids: number[] = [];
+/** Flatten a thread tree, parent before children. Each node keeps its mailbox and UID. */
+export function flattenThread(nodes: ThreadNode[]): ThreadMember[] {
+  const members: ThreadMember[] = [];
   const visit = (node: ThreadNode): void => {
     if (node.uid !== undefined) {
-      uids.push(node.uid);
+      members.push({ mailbox: node.mailbox ?? '', uid: node.uid });
     }
     for (const child of node.children) {
       visit(child);
@@ -136,5 +152,14 @@ export function flattenThread(nodes: ThreadNode[]): number[] {
   for (const node of nodes) {
     visit(node);
   }
-  return uids;
+  return members;
+}
+
+/** Copy a single-folder server THREAD tree onto that mailbox. */
+export function stampMailbox(nodes: readonly ThreadNode[], mailbox: string): ThreadNode[] {
+  return nodes.map((node) => ({
+    ...node,
+    mailbox,
+    children: stampMailbox(node.children, mailbox),
+  }));
 }

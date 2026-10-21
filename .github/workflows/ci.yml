@@ -29,6 +29,10 @@ jobs:
           - runtime: bun
             version: latest
     services:
+      # test:coverage includes the integration project, which talks to this
+      # GreenMail 2.1.14. That image answers a bad UID SORT and keeps the socket,
+      # so a client fallback still returns mail. The scripted IMAP test is what
+      # fails if SORT is sent (UID 1:*) or if a dropped SORT socket returns an empty page.
       greenmail:
         image: greenmail/standalone:2.1.14
         ports:

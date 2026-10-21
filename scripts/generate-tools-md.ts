@@ -1,5 +1,6 @@
 import { writeFileSync } from 'node:fs';
 import type { ZodType } from 'zod';
+import { MAIL_ERROR_CODES } from '../src/errors.js';
 import { TOOLS } from '../src/tools/catalog.js';
 
 const target = new URL('../docs/TOOLS.md', import.meta.url);
@@ -41,7 +42,7 @@ export function renderToolsMarkdown(): string {
     '',
     'Results are JSON in `structuredContent` plus a text rendering. Errors use `isError: true` and text only, shaped as `CODE: message` with an optional `Hint:` line. There is no structured error object. Codes:',
     '',
-    '`AUTH_FAILED`, `TLS_FAILED`, `NOT_FOUND`, `UIDVALIDITY_CHANGED`, `CAPABILITY_UNSUPPORTED`, `PERMISSION_DENIED`, `SIZE_LIMIT`, `TIMEOUT`, `RATE_LIMITED`, `CONFIG_ERROR`, `PROTOCOL_ERROR`, `CONNECTION_FAILED`, `INVALID_ARGUMENT`.',
+    `\`${MAIL_ERROR_CODES.join('`, `')}\`.`,
     '',
   ];
   for (const tool of TOOLS) {

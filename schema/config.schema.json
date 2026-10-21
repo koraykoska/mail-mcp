@@ -1,0 +1,420 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "$schema": {
+      "description": "JSON Schema URL. Ignored by the loader.",
+      "type": "string",
+      "minLength": 1
+    },
+    "defaultAccount": {
+      "type": "string",
+      "minLength": 1
+    },
+    "logLevel": {
+      "type": "string",
+      "enum": ["trace", "debug", "info", "warn", "error", "fatal", "silent"]
+    },
+    "poolSize": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 8
+    },
+    "attachmentsDir": {
+      "description": "If set, mail_download_attachment can only write inside this directory.",
+      "type": "string",
+      "minLength": 1
+    },
+    "limits": {
+      "type": "object",
+      "properties": {
+        "pageSize": {
+          "default": 25,
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "maxPageSize": {
+          "default": 200,
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "maxBodyChars": {
+          "default": 100000,
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "maxAttachmentBytes": {
+          "default": 15728640,
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "maxMessageBytes": {
+          "default": 36700160,
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "maxSortCandidates": {
+          "default": 5000,
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "maxBulk": {
+          "default": 200,
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "additionalProperties": false
+    },
+    "accounts": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string",
+        "minLength": 1
+      },
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "provider": {
+            "type": "string",
+            "enum": [
+              "generic",
+              "gmail",
+              "microsoft",
+              "icloud",
+              "fastmail",
+              "yahoo",
+              "proton-bridge"
+            ]
+          },
+          "email": {
+            "type": "string",
+            "minLength": 3
+          },
+          "user": {
+            "type": "string",
+            "minLength": 1
+          },
+          "password": {
+            "type": "string",
+            "minLength": 1
+          },
+          "auth": {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": ["password", "xoauth2", "oauth2"]
+              },
+              "password": {
+                "type": "string",
+                "minLength": 1
+              },
+              "accessToken": {
+                "type": "string",
+                "minLength": 1
+              },
+              "refreshToken": {
+                "type": "string",
+                "minLength": 1
+              },
+              "clientId": {
+                "type": "string",
+                "minLength": 1
+              },
+              "clientSecret": {
+                "type": "string",
+                "minLength": 1
+              },
+              "tokenUrl": {
+                "type": "string",
+                "format": "uri"
+              },
+              "scope": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "additionalProperties": false
+          },
+          "imap": {
+            "type": "object",
+            "properties": {
+              "host": {
+                "type": "string",
+                "minLength": 1
+              },
+              "port": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 65535
+              },
+              "connectHost": {
+                "description": "TCP host when it differs from host, such as 127.0.0.1 for an SSH tunnel. TLS still verifies host.",
+                "type": "string",
+                "minLength": 1
+              },
+              "connectPort": {
+                "description": "TCP port when it differs from port. TLS still verifies host.",
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 65535
+              },
+              "secure": {
+                "description": "True for implicit TLS (typically 993 or 465). False for cleartext that may upgrade with STARTTLS.",
+                "type": "boolean"
+              },
+              "starttls": {
+                "description": "required (default when secure is false), optional, or disabled. disabled is cleartext and must be explicit.",
+                "type": "string",
+                "enum": ["required", "optional", "disabled"]
+              },
+              "timeoutMs": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991
+              },
+              "tls": {
+                "type": "object",
+                "properties": {
+                  "rejectUnauthorized": {
+                    "default": true,
+                    "description": "When false, certificate verification is skipped. Unsafe outside a trusted local bridge.",
+                    "type": "boolean"
+                  },
+                  "caFile": {
+                    "description": "PEM file with one or more CA certificates to trust.",
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "servername": {
+                    "description": "TLS SNI / certificate name when it differs from the host.",
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": ["rejectUnauthorized"],
+                "additionalProperties": false
+              }
+            },
+            "additionalProperties": false
+          },
+          "smtp": {
+            "type": "object",
+            "properties": {
+              "host": {
+                "type": "string",
+                "minLength": 1
+              },
+              "port": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 65535
+              },
+              "connectHost": {
+                "description": "TCP host when it differs from host, such as 127.0.0.1 for an SSH tunnel. TLS still verifies host.",
+                "type": "string",
+                "minLength": 1
+              },
+              "connectPort": {
+                "description": "TCP port when it differs from port. TLS still verifies host.",
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 65535
+              },
+              "secure": {
+                "description": "True for implicit TLS (typically 993 or 465). False for cleartext that may upgrade with STARTTLS.",
+                "type": "boolean"
+              },
+              "starttls": {
+                "description": "required (default when secure is false), optional, or disabled. disabled is cleartext and must be explicit.",
+                "type": "string",
+                "enum": ["required", "optional", "disabled"]
+              },
+              "timeoutMs": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991
+              },
+              "tls": {
+                "type": "object",
+                "properties": {
+                  "rejectUnauthorized": {
+                    "default": true,
+                    "description": "When false, certificate verification is skipped. Unsafe outside a trusted local bridge.",
+                    "type": "boolean"
+                  },
+                  "caFile": {
+                    "description": "PEM file with one or more CA certificates to trust.",
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "servername": {
+                    "description": "TLS SNI / certificate name when it differs from the host.",
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": ["rejectUnauthorized"],
+                "additionalProperties": false
+              }
+            },
+            "additionalProperties": false
+          },
+          "identities": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "name": {
+                  "type": "string"
+                },
+                "email": {
+                  "type": "string",
+                  "minLength": 3
+                },
+                "replyTo": {
+                  "type": "string",
+                  "minLength": 3
+                },
+                "default": {
+                  "type": "boolean"
+                }
+              },
+              "required": ["email"],
+              "additionalProperties": false
+            }
+          },
+          "readOnly": {
+            "type": "boolean"
+          },
+          "allowSend": {
+            "type": "boolean"
+          },
+          "allowDelete": {
+            "type": "boolean"
+          },
+          "allowPermanentDelete": {
+            "type": "boolean"
+          },
+          "recipientDomainAllowList": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "allowFromDomains": {
+            "description": "When set, From may be any address at these domains in addition to the configured identities. Certificate checks are unrelated and stay enabled.",
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "sendRateLimit": {
+            "type": "object",
+            "properties": {
+              "max": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991
+              },
+              "windowMs": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991
+              }
+            },
+            "required": ["max", "windowMs"],
+            "additionalProperties": false
+          },
+          "appendSent": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "string",
+                "const": "auto"
+              }
+            ]
+          },
+          "sentMailbox": {
+            "type": "string",
+            "minLength": 1
+          },
+          "trashMailbox": {
+            "type": "string",
+            "minLength": 1
+          },
+          "draftsMailbox": {
+            "type": "string",
+            "minLength": 1
+          },
+          "limits": {
+            "type": "object",
+            "properties": {
+              "pageSize": {
+                "default": 25,
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991
+              },
+              "maxPageSize": {
+                "default": 200,
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991
+              },
+              "maxBodyChars": {
+                "default": 100000,
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991
+              },
+              "maxAttachmentBytes": {
+                "default": 15728640,
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991
+              },
+              "maxMessageBytes": {
+                "default": 36700160,
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991
+              },
+              "maxSortCandidates": {
+                "default": 5000,
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991
+              },
+              "maxBulk": {
+                "default": 200,
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

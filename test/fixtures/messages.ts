@@ -7,13 +7,14 @@ export function simpleMessage(
     messageId?: string;
     inReplyTo?: string;
     references?: string;
+    date?: string;
   } = {},
 ): Buffer {
   const lines = [
     `From: ${options.from ?? 'Ada Lovelace <ada@example.com>'}`,
     `To: ${options.to ?? 'User <user@example.com>'}`,
     `Subject: ${options.subject ?? 'Hello'}`,
-    'Date: Tue, 01 Jan 2026 00:00:00 +0000',
+    `Date: ${options.date ?? 'Tue, 01 Jan 2026 00:00:00 +0000'}`,
     `Message-ID: ${options.messageId ?? '<m1@example.com>'}`,
     'MIME-Version: 1.0',
     'Content-Type: text/plain; charset=utf-8',

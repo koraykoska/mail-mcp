@@ -29,10 +29,11 @@ export function account(overrides: Partial<ResolvedAccount> = {}): ResolvedAccou
     allowDelete: true,
     allowPermanentDelete: false,
     recipientDomainAllowList: [],
+    allowFromDomains: [],
     appendSent: true,
     limits: {
       pageSize: 25,
-      maxPageSize: 100,
+      maxPageSize: 200,
       maxBodyChars: 100_000,
       maxAttachmentBytes: 1024 * 1024,
       maxMessageBytes: 2 * 1024 * 1024,

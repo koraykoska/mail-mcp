@@ -269,14 +269,54 @@ const limit = z
   .max(10_000)
   .optional()
   .describe(
-    'Page size. Default is limits.pageSize (25). The schema allows up to 10000; the server rejects values above the configured limits.maxPageSize (default 100).',
+    'Page size. Default 25. Summaries are capped at 200 or limits.maxPageSize, whichever is lower. Calls that include message bodies are capped at 20. The cursor stores the limit from the first page; repeat it, or omit it and the stored limit is used. Mail that arrives after the first page is outside this snapshot: call again without a cursor to see it.',
   );
 
 const cursor = z
   .string()
   .optional()
   .describe(
-    "Opaque cursor from the previous page's nextCursor. It stores the last returned UID, that message's position, the primary sort key, and the mailbox uidValidity. The next page continues after that UID in a freshly sorted result. If the UID was expunged, the page continues at the first message that sorts strictly after the stored key, so deleting an earlier message does not skip the next one. Messages that compare equal to that key may be repeated or skipped. When the cursor has no sort key, the stored position is used, and adding or removing earlier messages can skip or repeat one. A cursor whose uidValidity no longer matches fails with UIDVALIDITY_CHANGED. Pass the same sort as the call that issued the cursor. Omit to start at the first page.",
+    'Opaque cursor from the previous page. It freezes the folder scope, sort, page size, and the highest UID the first search returned, so later arrivals do not shift the walk. The next page starts strictly after the last row in the total order (sort keys, then date, folder, UID). If that row was expunged, the page continues at the first row that sorts after it, so a deletion does not skip the following message. A uidValidity change returns CURSOR_INVALIDATED. An older cursor returns INVALID_ARGUMENT. Omit to start a new snapshot.',
+  );
+
+const folders = z
+  .union([
+    z.string().describe('One mailbox, a special-use flag such as "\\\\Sent", a glob, or "all".'),
+    z.array(z.string()).describe('Mailbox names, special-use flags, or globs.'),
+    z
+      .object({
+        all: z.boolean().optional().describe('Every listed mailbox except Trash and Junk.'),
+        mailboxes: z.array(z.string()).optional().describe('Explicit mailbox paths.'),
+        specialUse: z
+          .array(z.string())
+          .optional()
+          .describe('SPECIAL-USE flags such as "\\\\Sent".'),
+        globs: z.array(z.string()).optional().describe('Path globs. * and ? are wildcards.'),
+        exclude: z.array(z.string()).optional().describe('Paths or flags to drop from the scope.'),
+        includeTrash: z.boolean().optional().describe('Keep Trash when all is set. Default false.'),
+        includeJunk: z.boolean().optional().describe('Keep Junk when all is set. Default false.'),
+      })
+      .strict(),
+  ])
+  .optional()
+  .describe(
+    'Folder scope. Replaces mailbox when set. Default for a list or search is the single mailbox (INBOX when mailbox is omitted). "all" skips Trash and Junk unless they are named or includeTrash/includeJunk is true.',
+  );
+
+const maxPerFolder = z
+  .number()
+  .int()
+  .positive()
+  .optional()
+  .describe(
+    'Most messages kept from one folder. Default and maximum are limits.maxSortCandidates (5000). A higher value is rejected. A longer match is truncated for a server SORT and for a client scan: snapshot.folders reports omitted and scanned, and later pages stay inside that window.',
+  );
+
+const order = z
+  .enum(['newest-first', 'oldest-first'])
+  .optional()
+  .describe(
+    'Page order when sort is omitted. Default newest-first (arrival descending). oldest-first is arrival ascending. When sort is set, order must agree with the first key. Pass the same order on every page.',
   );
 
 const ok = z
@@ -298,6 +338,9 @@ export const fields = {
   attachment,
   limit,
   cursor,
+  order,
+  folders,
+  maxPerFolder,
   ok,
 };
 

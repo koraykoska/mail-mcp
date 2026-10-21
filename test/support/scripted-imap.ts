@@ -21,6 +21,8 @@ export interface ScriptedOptions {
   refuseSearch?: boolean;
   /** BAD any UID SORT whose arguments include this substring. */
   badSortIncluding?: string;
+  /** Close the socket instead of answering a UID SORT that includes this substring. */
+  dropOnSortIncluding?: string;
   refuseStore?: boolean;
   /** Answer UID SORT RETURN with an ESEARCH untagged line. */
   esearchSort?: boolean;
@@ -378,9 +380,8 @@ export class ScriptedImap {
           socket.write(')\r\n');
           continue;
         }
-        if (headerWanted) {
-          const split = message.raw.indexOf('\r\n\r\n');
-          const headers = Buffer.from(split >= 0 ? message.raw.slice(0, split + 4) : message.raw);
+        if (headerWanted && !wanted.includes('ENVELOPE')) {
+          const headers = headerSection(message.raw, args);
           ctx.write(`* ${sequence} FETCH (${common} BODY[HEADER] {${headers.length}}\r\n`);
           socket.write(headers);
           socket.write(')\r\n');
@@ -388,6 +389,15 @@ export class ScriptedImap {
         }
         if (wanted.includes('PREVIEW')) {
           ctx.write(`* ${sequence} FETCH (UID ${message.uid} PREVIEW "preview text")\r\n`);
+          continue;
+        }
+        if (headerWanted) {
+          const headers = headerSection(message.raw, args);
+          ctx.write(
+            `* ${sequence} FETCH (${common} ${envelopeOf(message.raw)} BODYSTRUCTURE ("TEXT" "PLAIN" ("CHARSET" "UTF-8") NIL NIL "8BIT" ${source.length} 1) BODY[HEADER.FIELDS (REFERENCES IN-REPLY-TO MESSAGE-ID)] {${headers.length}}\r\n`,
+          );
+          socket.write(headers);
+          socket.write(')\r\n');
           continue;
         }
         ctx.write(
@@ -403,6 +413,13 @@ export class ScriptedImap {
       return;
     }
     if (command === 'UID' && args.toUpperCase().startsWith('SORT')) {
+      if (
+        this.options.dropOnSortIncluding &&
+        args.toUpperCase().includes(this.options.dropOnSortIncluding.toUpperCase())
+      ) {
+        socket.destroy();
+        return;
+      }
       if (
         this.options.badSortIncluding &&
         args.toUpperCase().includes(this.options.badSortIncluding.toUpperCase())
@@ -548,6 +565,35 @@ export class ScriptedImap {
   }
 }
 
+function headerSection(raw: string, args: string): Buffer {
+  const split = raw.indexOf('\r\n\r\n');
+  const block = split >= 0 ? raw.slice(0, split) : raw;
+  const requested = /HEADER\.FIELDS\s*\(([^)]*)\)/i.exec(args)?.[1];
+  const names = requested
+    ? requested
+        .split(/\s+/)
+        .map((name) => name.toLowerCase())
+        .filter(Boolean)
+    : [];
+  const lines = block.split(/\r?\n/);
+  const kept: string[] = [];
+  let keeping = false;
+  for (const line of lines) {
+    if (/^[ \t]/.test(line)) {
+      if (keeping) {
+        kept.push(line);
+      }
+      continue;
+    }
+    const name = /^([^:]+):/.exec(line)?.[1]?.toLowerCase() ?? '';
+    keeping = names.length === 0 || names.includes(name);
+    if (keeping) {
+      kept.push(line);
+    }
+  }
+  return Buffer.from(`${kept.join('\r\n')}\r\n\r\n`);
+}
+
 function envelopeOf(raw: string): string {
   const subject = headerOf(raw, 'subject') ?? 'message';
   const from = headerOf(raw, 'from') ?? 'ada@example.com';
@@ -569,17 +615,21 @@ function imapQuote(value: string): string {
 
 function searchUids(args: string, messages: ScriptedMessage[]): number[] {
   const match = /(?:^|\s)UID\s+([0-9:,*]+)/i.exec(args);
-  if (!match?.[1] || match[1] === '*') {
+  if (!match?.[1] || match[1] === '*' || match[1] === '1:*') {
     return messages.map((message) => message.uid);
   }
   const wanted = new Set<number>();
   for (const part of match[1].split(',')) {
-    const range = /^(\d+):(\d+)$/.exec(part);
+    const range = /^(\d+|\*):(\d+|\*)$/.exec(part);
     if (range?.[1] && range[2]) {
-      const low = Math.min(Number(range[1]), Number(range[2]));
-      const high = Math.max(Number(range[1]), Number(range[2]));
-      for (let uid = low; uid <= high; uid += 1) {
-        wanted.add(uid);
+      const low = range[1] === '*' ? 1 : Number(range[1]);
+      const high = range[2] === '*' ? Number.POSITIVE_INFINITY : Number(range[2]);
+      const start = Math.min(low, high);
+      const end = Math.max(low, high);
+      for (const message of messages) {
+        if (message.uid >= start && message.uid <= end) {
+          wanted.add(message.uid);
+        }
       }
       continue;
     }

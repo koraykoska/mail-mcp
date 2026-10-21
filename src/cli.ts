@@ -3,7 +3,9 @@ import { realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { loadConfig } from './config/load.js';
+import { parseConnectAddress } from './net/connect.js';
 import { MailError, isMailError } from './errors.js';
+import { assertSupportedNode } from './runtime-check.js';
 import { startHttpServer } from './http.js';
 import { createLogger, parseLogLevel } from './log.js';
 import { redactText, redactValue } from './redact.js';
@@ -22,6 +24,8 @@ interface ParsedArgs {
   logLevel?: string;
   account?: string;
   httpToken?: string;
+  imapConnect?: string;
+  smtpConnect?: string;
 }
 
 export async function run(argv: string[], env: NodeJS.ProcessEnv = process.env): Promise<number> {
@@ -39,9 +43,15 @@ export async function run(argv: string[], env: NodeJS.ProcessEnv = process.env):
     process.stdout.write(`${SERVER_NAME} ${VERSION}\n`);
     return 0;
   }
+  try {
+    assertSupportedNode(process.versions.node, process.versions.bun);
+  } catch (error) {
+    return fail(error, env);
+  }
   let config;
   try {
     config = loadConfig({ configPath: args.config, env });
+    applyCliConnect(config, args);
   } catch (error) {
     return fail(error, env);
   }
@@ -208,6 +218,12 @@ export function parseArgs(argv: string[]): ParsedArgs {
     } else if (token === '--account') {
       args.account = requireValue(rest, index, token);
       index += 1;
+    } else if (token === '--imap-connect') {
+      args.imapConnect = requireValue(rest, index, token);
+      index += 1;
+    } else if (token === '--smtp-connect') {
+      args.smtpConnect = requireValue(rest, index, token);
+      index += 1;
     } else if (token?.startsWith('--config=')) {
       args.config = token.slice('--config='.length);
     } else {
@@ -244,19 +260,50 @@ Usage:
   mail-mcp [--config file.json] [--log-level info]
   mail-mcp --check [--account id] [--config file.json]
   mail-mcp --http [--port 3333] [--host 127.0.0.1]
+  mail-mcp --imap-connect 127.0.0.1:1993 --smtp-connect 127.0.0.1:1587
   mail-mcp --help
   mail-mcp --version
+
+Requires Node.js 22 or newer. With Bun, bunx --bun @koraykoska/mail-mcp runs on Bun's runtime.
 
 Stdio is the default transport. Logs go to stderr.
 
 Environment for a single account:
   MAIL_IMAP_HOST, MAIL_IMAP_PORT, MAIL_IMAP_SECURE, MAIL_IMAP_STARTTLS
   MAIL_SMTP_HOST, MAIL_SMTP_PORT, MAIL_SMTP_SECURE, MAIL_SMTP_STARTTLS
-  MAIL_USER, MAIL_PASSWORD, MAIL_FROM
+  MAIL_IMAP_CONNECT, MAIL_SMTP_CONNECT (host:port or [ipv6]:port)
+  MAIL_USER, MAIL_PASSWORD, MAIL_FROM, MAIL_ACCOUNT, MAIL_IDENTITIES
   MAIL_MCP_CONFIG, MAIL_LOG_LEVEL
+
+--imap-connect and --smtp-connect override the TCP address for the selected
+account (or the default account). TLS still verifies the configured host.
 
 See docs/CONFIGURATION.md and docs/PROVIDERS.md.
 `;
+}
+
+function applyCliConnect(config: ReturnType<typeof loadConfig>, args: ParsedArgs): void {
+  if (!args.imapConnect && !args.smtpConnect) {
+    return;
+  }
+  const id = args.account && config.accounts[args.account] ? args.account : config.defaultAccount;
+  const account = config.accounts[id];
+  if (!account) {
+    throw new MailError('CONFIG_ERROR', `Account "${id}" is not configured.`);
+  }
+  if (args.imapConnect) {
+    const parsed = parseConnectAddress(args.imapConnect);
+    account.imap.connectHost = parsed.host;
+    account.imap.connectPort = parsed.port;
+  }
+  if (args.smtpConnect) {
+    if (!account.smtp) {
+      throw new MailError('CONFIG_ERROR', `Account "${account.id}" has no SMTP server configured.`);
+    }
+    const parsed = parseConnectAddress(args.smtpConnect);
+    account.smtp.connectHost = parsed.host;
+    account.smtp.connectPort = parsed.port;
+  }
 }
 
 let activeShutdown: (() => Promise<void>) | undefined;

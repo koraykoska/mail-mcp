@@ -70,12 +70,12 @@ describe('GreenMail', () => {
     const created = await service.createMailbox(undefined, folder);
     expect(created.created).toBe(true);
     await service.subscribe(undefined, folder, true);
-    const subscribed = await service.listMailboxes(undefined, true);
+    const subscribed = await service.listMailboxes(undefined, true, { limit: 200 });
     expect(JSON.stringify(subscribed.mailboxes)).toContain(folder);
 
     const unicode = `Café-${stamp}`;
     await service.createMailbox(undefined, unicode);
-    const listed = await service.listMailboxes(undefined, false);
+    const listed = await service.listMailboxes(undefined, false, { limit: 200 });
     expect(JSON.stringify(listed.mailboxes)).toContain(unicode);
 
     await service.append({
@@ -390,5 +390,87 @@ describe('scripted IMAP fallbacks', () => {
     await expect(client.connect()).rejects.toThrow();
     client.close();
     await server.close();
+  });
+});
+
+describe('GreenMail folder scope', () => {
+  beforeAll(async () => {
+    greenmail = await ensureGreenMail();
+  }, 40_000);
+
+  it('pages a search across two folders without gaps', async () => {
+    const { service, close } = runtimeFor();
+    const stamp = `scope-${Date.now()}`;
+    const left = `L-${stamp}`;
+    const right = `R-${stamp}`;
+    await service.createMailbox(undefined, left);
+    await service.createMailbox(undefined, right);
+    await service.append({
+      mailbox: left,
+      rawBase64: simpleMessage({ subject: `Alpha ${stamp}`, messageId: `<a-${stamp}@e>` }).toString(
+        'base64',
+      ),
+    });
+    await service.append({
+      mailbox: right,
+      rawBase64: simpleMessage({ subject: `Beta ${stamp}`, messageId: `<b-${stamp}@e>` }).toString(
+        'base64',
+      ),
+    });
+    const seen = new Set<string>();
+    let cursor: string | undefined;
+    for (let page = 0; page < 5; page += 1) {
+      const listed = await service.searchMessages({
+        folders: [left, right],
+        search: { subject: stamp },
+        limit: 1,
+        includeSnippet: false,
+        ...(cursor ? { cursor } : {}),
+      });
+      const rows = listed.messages as Array<{ mailbox?: string; uid: number }>;
+      if (rows.length === 0) {
+        break;
+      }
+      const key = `${rows[0]?.mailbox}:${rows[0]?.uid}`;
+      expect(seen.has(key)).toBe(false);
+      seen.add(key);
+      cursor = listed.nextCursor ? String(listed.nextCursor) : undefined;
+      if (!cursor) {
+        break;
+      }
+    }
+    expect(seen.size).toBe(2);
+    await close();
+  });
+
+  it('selects the identity that the original was addressed to', async () => {
+    const { service, close } = runtimeFor({
+      identities: [
+        { id: 'personal', email: 'user@icloud.com', name: 'User', default: true },
+        { id: 'domain', email: greenmail.email, name: 'Work', default: false },
+      ],
+      email: 'user@icloud.com',
+    });
+    const stamp = `id-${Date.now()}`;
+    await service.append({
+      mailbox: 'INBOX',
+      rawBase64: simpleMessage({
+        from: 'Ada <ada@example.com>',
+        to: `Work <${greenmail.email}>`,
+        subject: `Ping ${stamp}`,
+        messageId: `<ping-${stamp}@e>`,
+      }).toString('base64'),
+    });
+    const found = await service.searchMessages({
+      mailbox: 'INBOX',
+      search: { subject: `Ping ${stamp}` },
+      limit: 5,
+      includeSnippet: false,
+    });
+    const uid = Number((found.messages as Array<{ uid: number }>)[0]?.uid);
+    const sent = await service.reply({ mailbox: 'INBOX', uid, text: 'Thanks', appendSent: false });
+    expect(sent.identityReason).toBe('single-match');
+    expect(sent.identity).toMatchObject({ email: greenmail.email });
+    await close();
   });
 });
