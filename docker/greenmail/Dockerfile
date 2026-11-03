@@ -1,1 +1,1 @@
-FROM greenmail/standalone:2.1.14
+FROM greenmail/standalone:2.1.15
